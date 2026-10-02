@@ -1497,34 +1497,48 @@ namespace UdonLuau {
         }
 
         std::optional<Compiler::Resolution> Compiler::TryResolve(const std::vector<const Method*>& methods, const std::vector<Value>& args, const Type* typeArg, bool& ambiguous) {
-            const Method* best = nullptr;
             int bestCost = std::numeric_limits<int>::max();
             ambiguous = false;
+            const Method* bestMethod = nullptr;
+            const Type* bestTypeArg = nullptr;
             for (const Method* m : methods) {
-                if (m->ext->isGeneric && !typeArg) continue;
                 std::vector<const Parameter*> inputs;
                 for (const Parameter& p : m->parameters)
                     if (!p.byRef) inputs.push_back(&p);
                 if (inputs.size() != args.size()) continue;
+
+                const Type* generic = m->ext->isGeneric ? typeArg : nullptr;
+                if (m->ext->isGeneric && !generic) {
+                    for (size_t i = 0; i < args.size() && !generic; ++i) {
+                        if (!inputs[i]->generic) continue;
+                        const Type* t = NaturalType(args[i]);
+                        if (!t) continue;
+                        if (!inputs[i]->genericArray) generic = t;
+                        else if (t->kind == TypeKind::Array) generic = t->element;
+                    }
+                    if (!generic) continue;
+                }
+
                 int total = 0;
                 bool ok = true;
                 for (size_t i = 0; i < args.size() && ok; ++i) {
-                    const Type* to = InputType(*inputs[i], m->ext->isGeneric ? typeArg : nullptr);
+                    const Type* to = InputType(*inputs[i], generic);
                     int c = to ? Cost(args[i], to) : -1;
                     if (c < 0) ok = false;
                     else total += c;
                 }
                 if (!ok) continue;
                 if (total < bestCost) {
-                    best = m;
+                    bestMethod = m;
+                    bestTypeArg = generic;
                     bestCost = total;
                     ambiguous = false;
                 } else if (total == bestCost) {
                     ambiguous = true;
                 }
             }
-            if (!best || ambiguous) return std::nullopt;
-            return Resolution{ best, best->ext->isGeneric ? typeArg : nullptr };
+            if (!bestMethod || ambiguous) return std::nullopt;
+            return Resolution{ bestMethod, bestTypeArg };
         }
 
         Compiler::Resolution Compiler::Resolve(const std::vector<const Method*>& methods, const std::vector<Value>& args, const Type* typeArg, const Location& location, std::string_view what) {
@@ -1562,7 +1576,7 @@ namespace UdonLuau {
                     pushes.push_back(inputs[inputIndex++]);
                 }
             }
-            if (m.ext->isGeneric) {
+            if (m.ext->hasTypeOperand) {
                 HeapValue tv;
                 tv.kind = ValueKind::Type;
                 tv.text = r.typeArgument->udonName;

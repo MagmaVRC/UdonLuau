@@ -40,7 +40,7 @@ namespace {
         void Extern(const std::string& signature, bool instance, Impl impl = {}) {
             ExternInfo info;
             ParseExternSignature(signature, info);
-            int count = static_cast<int>(info.parameters.size()) + (info.returnType == "SystemVoid" ? 0 : 1) + (info.isGeneric ? 1 : 0) + (instance ? 1 : 0);
+            int count = static_cast<int>(info.parameters.size()) + (info.returnType == "SystemVoid" ? 0 : 1) + (info.hasTypeOperand ? 1 : 0) + (instance ? 1 : 0);
             if (!catalog.AddExtern(signature, count)) std::printf("bad extern %s\n", signature.c_str());
             if (impl) impls[signature] = std::move(impl);
         }
@@ -143,6 +143,11 @@ namespace {
             Vec3 a = As<Vec3>(h, p[0]);
             float s = As<float>(h, p[1]);
             h[p[2]] = Vec3{ a.x * s, a.y * s, a.z * s };
+        });
+        f.Extern("SystemArray.__IndexOf__TArray_T__SystemInt32", false, [](auto& h, auto& p) {
+            auto& xs = As<std::vector<int32_t>>(h, p[0]);
+            auto it = std::ranges::find(xs, As<int32_t>(h, p[1]));
+            h[p[2]] = it == xs.end() ? -1 : static_cast<int32_t>(it - xs.begin());
         });
         f.Extern("UnityEngineComponent.__GetComponent__T", true);
         f.Extern("UnityEngineComponent.__GetComponent__SystemType__UnityEngineComponent", true);
@@ -345,7 +350,7 @@ function Start()
         sum += v * i
     end
     xs[0] = 10
-    count = #xs + xs[0]
+    count = #xs + xs[0] + Array.IndexOf(xs, 6) * 100
 end
 )");
         Check(p.has_value(), "compiles");
@@ -353,7 +358,11 @@ end
         Machine m(f, *p);
         m.Run("_start");
         Check(std::get<int32_t>(m.Var("sum")) == 17, "sum == 17");
-        Check(std::get<int32_t>(m.Var("count")) == 13, "count == 13");
+        Check(std::get<int32_t>(m.Var("count")) == 213, "count == 213 with inferred generic IndexOf");
+        const ExternInfo* indexOf = f.catalog.FindExtern("SystemArray.__IndexOf__TArray_T__SystemInt32");
+        const ExternInfo* getComponent = f.catalog.FindExtern("UnityEngineComponent.__GetComponent__T");
+        Check(indexOf && !indexOf->hasTypeOperand && indexOf->isStatic, "inferable generic has no type operand");
+        Check(getComponent && getComponent->hasTypeOperand && !getComponent->isStatic, "return-only generic takes a type operand");
     });
 
     Case("structs, interpolation and boolean logic", [] {

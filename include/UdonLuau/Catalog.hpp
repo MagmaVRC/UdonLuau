@@ -45,6 +45,7 @@ namespace UdonLuau {
         int                      parameterCount = 0;
         bool                     isStatic = true;
         bool                     isGeneric = false;
+        bool                     hasTypeOperand = false;
         bool                     isConstructor = false;
     };
 

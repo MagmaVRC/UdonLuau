@@ -179,7 +179,7 @@ namespace UdonLuau {
         ExternInfo info;
         if (!ParseExternSignature(signature, info)) return false;
 
-        int declared = static_cast<int>(info.parameters.size()) + (info.returnType == "SystemVoid" ? 0 : 1) + (info.isGeneric ? 1 : 0);
+        int declared = static_cast<int>(info.parameters.size()) + (info.returnType == "SystemVoid" ? 0 : 1) + (info.hasTypeOperand ? 1 : 0);
         int receiver = parameterCount - declared;
         if (receiver != 0 && receiver != 1) return false;
         info.isStatic = receiver == 0 || info.isConstructor;
@@ -309,7 +309,9 @@ namespace UdonLuau {
             out.returnType = "SystemVoid";
         }
         out.isConstructor = method == "ctor";
-        out.isGeneric = IsGenericName(ret) || std::ranges::any_of(out.parameters, [](const std::string& p) { return IsGenericName(p); });
+        bool genericParameter = std::ranges::any_of(out.parameters, [](const std::string& p) { return p == "T" || p == "TArray"; });
+        out.isGeneric = genericParameter || IsGenericName(out.returnType) || std::ranges::any_of(out.parameters, [](const std::string& p) { return IsGenericName(p); });
+        out.hasTypeOperand = out.isGeneric && !genericParameter;
         return std::ranges::none_of(out.parameters, [](const std::string& p) { return p.empty(); });
     }
 
