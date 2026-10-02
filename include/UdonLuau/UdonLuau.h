@@ -39,6 +39,7 @@ typedef enum ul_value_kind {
     UL_VALUE_THIS = 7,
     UL_VALUE_TYPE = 8,
     UL_VALUE_CONSTRUCT = 9,
+    UL_VALUE_ARRAY = 10,
 } ul_value_kind;
 
 typedef struct ul_heap_value {
@@ -116,6 +117,9 @@ UDONLUAU_API void ul_catalog_set_preferred_namespaces(ul_catalog* catalog, const
 /// <summary>Compiles Luau source against the catalog. Always returns a result.</summary>
 UDONLUAU_API ul_result* ul_compile(const ul_catalog* catalog, const char* source, size_t length);
 
+/// <summary>Compiles with compile-time defines given as ';'-separated NAME=value pairs, for example "DEBUG=true;LEVEL=3".</summary>
+UDONLUAU_API ul_result* ul_compile_with_defines(const ul_catalog* catalog, const char* source, size_t length, const char* defines);
+
 /// <summary>Destroys a result and every string it returned.</summary>
 UDONLUAU_API void ul_result_destroy(ul_result* result);
 
@@ -131,7 +135,8 @@ UDONLUAU_API const uint8_t* ul_result_bytecode(const ul_result* result, size_t* 
 UDONLUAU_API int32_t ul_result_heap_count(const ul_result* result);
 UDONLUAU_API int32_t ul_result_heap_slot(const ul_result* result, int32_t address, ul_heap_slot* out);
 
-/// <summary>Constant arguments of a UL_VALUE_CONSTRUCT slot, in constructor parameter order.</summary>
+/// <summary>Constant arguments of a UL_VALUE_CONSTRUCT slot in constructor parameter order, or the
+/// elements of a UL_VALUE_ARRAY slot.</summary>
 UDONLUAU_API int32_t ul_result_heap_argument_count(const ul_result* result, int32_t address);
 UDONLUAU_API int32_t ul_result_heap_argument(const ul_result* result, int32_t address, int32_t index, ul_heap_value* out);
 

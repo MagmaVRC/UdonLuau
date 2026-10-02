@@ -92,6 +92,15 @@ void ul_catalog_set_preferred_namespaces(ul_catalog* catalog, const char* namesp
 }
 
 ul_result* ul_compile(const ul_catalog* catalog, const char* source, size_t length) {
+    return ul_compile_with_defines(catalog, source, length, nullptr);
+}
+
+ul_result* ul_compile_with_defines(const ul_catalog* catalog, const char* source, size_t length, const char* defines) {
+    UdonLuau::CompileOptions options;
+    for (const std::string& pair : SplitList(defines)) {
+        size_t eq = pair.find('=');
+        options.defines[pair.substr(0, eq)] = eq == std::string::npos ? "true" : pair.substr(eq + 1);
+    }
     auto* r = new (std::nothrow) ul_result();
     if (!r) return nullptr;
     if (!catalog) {
@@ -99,7 +108,7 @@ ul_result* ul_compile(const ul_catalog* catalog, const char* source, size_t leng
         return r;
     }
     try {
-        r->result = UdonLuau::Compile(catalog->catalog, std::string_view(source ? source : "", source ? length : 0));
+        r->result = UdonLuau::Compile(catalog->catalog, std::string_view(source ? source : "", source ? length : 0), options);
     } catch (const std::exception& e) {
         r->result = {};
         r->result.diagnostics.push_back({ UdonLuau::Severity::Error, std::string("internal compiler error: ") + e.what() });
