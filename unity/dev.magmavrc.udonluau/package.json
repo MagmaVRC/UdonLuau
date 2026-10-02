@@ -1,0 +1,39 @@
+{
+  "name": "dev.magmavrc.udonluau",
+  "displayName": "UdonLuau",
+  "version": "0.1.0",
+  "unity": "2022.3",
+  "description": "Write VRChat Udon behaviours in Luau. Compiles .lua (and .luau) scripts to Udon programs against the externs the installed VRChat SDK exposes, with typed references between Luau and UdonSharp scripts, inspector annotations, network-callable methods and luau-lsp editor support.",
+  "license": "MIT",
+  "keywords": [
+    "vrchat",
+    "udon",
+    "luau",
+    "lua",
+    "compiler",
+    "scripting",
+    "udonsharp"
+  ],
+  "author": {
+    "name": "MagmaVRC",
+    "url": "https://github.com/MagmaVRC"
+  },
+  "documentationUrl": "https://github.com/MagmaVRC/UdonLuau#readme",
+  "changelogUrl": "https://github.com/MagmaVRC/UdonLuau/releases",
+  "licensesUrl": "https://github.com/MagmaVRC/UdonLuau/blob/master/LICENSE",
+  "vpmDependencies": {
+    "com.vrchat.worlds": ">=3.9.0"
+  },
+  "samples": [
+    {
+      "displayName": "Getting Started",
+      "description": "A spinning object, a door with public fields and network-callable methods, and a caller that holds a typed reference to the door.",
+      "path": "Samples~/Getting Started"
+    },
+    {
+      "displayName": "UdonSharp Interop",
+      "description": "An UdonSharp behaviour calling a Luau script, and a Luau script calling the UdonSharp behaviour back.",
+      "path": "Samples~/UdonSharp Interop"
+    }
+  ]
+}

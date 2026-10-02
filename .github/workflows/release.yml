@@ -18,7 +18,7 @@ jobs:
       - name: Check version
         shell: pwsh
         run: |
-          $version = (Get-Content unity/com.magma.vrc.udonluau/package.json -Raw | ConvertFrom-Json).version
+          $version = (Get-Content unity/dev.magmavrc.udonluau/package.json -Raw | ConvertFrom-Json).version
           if ("v$version" -ne "${{ github.ref_name }}") { throw "Tag ${{ github.ref_name }} does not match package version $version" }
 
       - name: Build, test and package

@@ -4,7 +4,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
-$packageName = "com.magma.vrc.udonluau"
+$packageName = "dev.magmavrc.udonluau"
 $package = Join-Path $root "unity\$packageName"
 $build = Join-Path $root "build\Release"
 $dist = Join-Path $root "dist"

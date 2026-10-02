@@ -13,8 +13,8 @@ Requirements: Windows, Unity 2022.3 or Unity 6, and the VRChat Worlds SDK.
 
 Download the latest release from [Releases](https://github.com/MagmaVRC/UdonLuau/releases) and use one of:
 
-- **`com.magma.vrc.udonluau-<version>.zip`:** in Unity, open Window > Package Manager, choose + > Add package from tarball/disk... and pick the extracted `package.json`. Alternatively, extract it into your project's `Packages/` folder.
-- **`UdonLuau-<version>.unitypackage`:** Assets > Import Package > Custom Package. It installs into `Packages/com.magma.vrc.udonluau`. Samples are only available from the `.zip` install.
+- **`dev.magmavrc.udonluau-<version>.zip`:** in Unity, open Window > Package Manager, choose + > Add package from tarball/disk... and pick the extracted `package.json`. Alternatively, extract it into your project's `Packages/` folder.
+- **`UdonLuau-<version>.unitypackage`:** Assets > Import Package > Custom Package. It installs into `Packages/dev.magmavrc.udonluau`. Samples are only available from the `.zip` install.
 
 Installing straight from the git URL is not supported: the native compiler DLL is a build output that only the release files contain.
 
@@ -59,7 +59,7 @@ Releases are published by pushing a `v<version>` tag that matches the package ve
 
 ## Unity package
 
-`unity/com.magma.vrc.udonluau` is the editor integration for VRChat world projects (Windows, Unity 2022.3 and Unity 6, VRChat Worlds SDK).
+`unity/dev.magmavrc.udonluau` is the editor integration for VRChat world projects (Windows, Unity 2022.3 and Unity 6, VRChat Worlds SDK).
 
 - Builds the catalog from the Udon wrapper modules, types and event definitions the editor has loaded.
 - Imports scripts as `.lua` files (`.luau` is accepted too). Assets > Create > VRChat > UdonLuau Script creates a script and its program asset.
