@@ -166,6 +166,10 @@ UDONLUAU_API int32_t ul_catalog_set_script_method_network_callable(ul_catalog* c
 /// <summary>Reads a module's public methods and fields without compiling function bodies. The result has no program.</summary>
 UDONLUAU_API ul_result* ul_extract_interface(const ul_catalog* catalog, const char* source, size_t length, const char* defines);
 
+/// <summary>A Luau definitions file (.d.luau) describing everything the catalog exposes, for luau-lsp and other Luau tooling.
+/// The string stays valid until the next call or until the catalog is destroyed.</summary>
+UDONLUAU_API const char* ul_catalog_definitions(ul_catalog* catalog);
+
 /// <summary>Compiles Luau source against the catalog. Always returns a result.</summary>
 UDONLUAU_API ul_result* ul_compile(const ul_catalog* catalog, const char* source, size_t length);
 

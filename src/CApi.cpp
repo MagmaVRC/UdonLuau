@@ -1,6 +1,7 @@
 #include "UdonLuau/UdonLuau.h"
 
 #include "UdonLuau/Compiler.hpp"
+#include "UdonLuau/Definitions.hpp"
 
 #include <algorithm>
 #include <new>
@@ -10,6 +11,7 @@
 
 struct ul_catalog {
     UdonLuau::Catalog catalog;
+    std::string       definitions;
 };
 
 struct ul_result {
@@ -94,6 +96,16 @@ void ul_catalog_add_event(ul_catalog* catalog, const char* name, const char* con
 
 void ul_catalog_add_standard_events(ul_catalog* catalog) {
     if (catalog) catalog->catalog.AddStandardEvents();
+}
+
+const char* ul_catalog_definitions(ul_catalog* catalog) {
+    if (!catalog) return "";
+    try {
+        catalog->definitions = UdonLuau::GenerateDefinitions(catalog->catalog);
+    } catch (const std::exception&) {
+        catalog->definitions.clear();
+    }
+    return catalog->definitions.c_str();
 }
 
 void ul_catalog_add_syncable_type(ul_catalog* catalog, const char* udon_name, int32_t linear, int32_t smooth) {
