@@ -112,6 +112,7 @@ end
   - Variables shadow type names, so a field called `Object` is just a field.
 - **Arrays:** `{T}`, built with `{a, b, c}` or iterated with `for i, v in array do`. Indices start at 0, as everywhere in Udon.
 - **Inference:** locals take the type of their initializer. Integer literals are `int` and other number literals are `float`, unless the context needs another numeric type.
+- **Constant structs:** a struct produced by a constructor with literal arguments is a shared constant, so changing one of its fields directly is an error. Copy it into a local first; a local that is later modified gets its own copy automatically.
 - **Conversions:** widening numeric conversions are implicit. Narrowing ones are written `value :: int`.
 
 ### Expressions
@@ -122,6 +123,26 @@ end
 - **Operators:** they map to the operator externs. `/` on integers divides as floats, `//` divides as integers, `..` and backtick strings concatenate, `#` gives `Length` or `Count`, and `and`, `or` and `not` short-circuit on booleans.
 - **Truthiness:** an object in a condition means "is not nil".
 - **Built-ins:** `print`, `warn` and `tostring`.
+
+### Compile time
+
+- `const NAME = value` declares a constant that takes no heap slot. Module-level constants must be known at compile time. Constants include literals, defines, arithmetic on them, and struct constructors with literal arguments (`const UP = Vector3.new(0, 1, 0)`).
+- Defines come from the host (`CompileOptions::defines`, or `ul_compile_with_defines`) or from `-- @define(NAME, value)` at the top of the file. A define is substituted wherever its name is used.
+- Conditions known at compile time remove code: in `if DEBUG then ... end`, the branch that is not taken is never compiled, like `#if`.
+- `assert(condition, "message")` with a constant condition is a compile-time check, like `static_assert`. Any other `assert` runs only when `DEBUG` is true and logs an error; otherwise it is removed with its arguments.
+- `-- @inline` and `-- @noinline` above a local function force or forbid inlining. Inlined calls with constant arguments are evaluated at compile time, so small helpers behave like `constexpr` functions.
+
+### Generated code
+
+Every optimization targets what costs time in VRChat's own Udon VM. In order of cost: extern calls, then `COPY`s (struct copies allocate), then jumps (each runs the VM's time-limit check).
+
+- Small local functions, and functions called once, are inlined. Parameters that are never assigned are bound directly to their arguments, so nothing is copied.
+- Results are written straight into their destination: assignments, `return` values of inlined calls, if-expressions and boolean expressions.
+- Locals that are never reassigned are not stored at all: they are replaced by their value.
+- Struct constructors with literal arguments become constants built when the program is created, so they cost no extern at run time.
+- Loops test their condition at the bottom, which saves one jump per iteration. Loops with constant bounds skip the first test.
+- An `if`/`elseif` chain comparing one `int` against eight or more constants becomes a jump table: two bounds checks, an array read and an indirect jump.
+- Events that no other code calls return with a single jump instead of the call/return trampoline.
 
 ### Not supported
 
