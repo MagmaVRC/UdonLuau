@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <format>
 #include <functional>
 #include <limits>
@@ -54,6 +55,65 @@ namespace UdonLuau {
             Label                    entry;
             Label                    epilogue;
             std::vector<Function*>   callees;
+            int                      calls = 0;
+            size_t                   size = 0;
+            bool                     forceInline = false;
+            bool                     noInline = false;
+            bool                     inlined = false;
+            bool                     trampoline = true;
+        };
+
+        constexpr size_t kInlineBudget = 40;
+        constexpr size_t kJumpTableMinimum = 8;
+
+        struct InlineFrame {
+            Function*               function = nullptr;
+            std::vector<Variable>   results;
+            Label                   end;
+            AstStat*                tail = nullptr;
+        };
+
+        class Analysis : public AstVisitor {
+        public:
+            std::unordered_set<AstLocal*>&                     assigned;
+            std::unordered_set<AstLocal*>&                     memberAssigned;
+            std::function<void(AstExpr*)>                      onCall;
+
+            Analysis(std::unordered_set<AstLocal*>& assigned, std::unordered_set<AstLocal*>& memberAssigned, std::function<void(AstExpr*)> onCall)
+                : assigned(assigned), memberAssigned(memberAssigned), onCall(std::move(onCall)) {}
+
+            void Target(AstExpr* e) {
+                while (auto* g = e->as<AstExprGroup>()) e = g->expr;
+                if (auto* l = e->as<AstExprLocal>()) assigned.insert(l->local);
+                AstExpr* owner = nullptr;
+                if (auto* n = e->as<AstExprIndexName>()) owner = n->expr;
+                if (auto* x = e->as<AstExprIndexExpr>()) owner = x->expr;
+                while (owner && owner->is<AstExprGroup>()) owner = owner->as<AstExprGroup>()->expr;
+                if (owner)
+                    if (auto* l = owner->as<AstExprLocal>()) memberAssigned.insert(l->local);
+            }
+
+            bool visit(AstStatAssign* s) override {
+                for (AstExpr* v : s->vars) Target(v);
+                return true;
+            }
+            bool visit(AstStatCompoundAssign* s) override {
+                Target(s->var);
+                return true;
+            }
+            bool visit(AstExprCall* c) override {
+                onCall(c->func);
+                return true;
+            }
+        };
+
+        class NodeCounter : public AstVisitor {
+        public:
+            size_t count = 0;
+            bool visit(AstNode*) override {
+                ++count;
+                return true;
+            }
         };
 
         struct Value {
@@ -293,8 +353,8 @@ namespace UdonLuau {
 
         class Compiler {
         public:
-            Compiler(const Catalog& catalog, std::string_view source)
-                : catalog_(catalog), types_(catalog), source_(source) {}
+            Compiler(const Catalog& catalog, std::string_view source, const CompileOptions& options)
+                : catalog_(catalog), types_(catalog), source_(source), options_(options) {}
 
             CompileResult Run();
 
@@ -329,7 +389,7 @@ namespace UdonLuau {
             std::vector<Value> EvaluateList(const AstArray<AstExpr*>& exprs, size_t want, const std::vector<const Type*>& expected);
             void AssignTo(AstExpr* target, const Value& value);
 
-            Value CompileExpr(AstExpr* expr, const Type* expected = nullptr);
+            Value CompileExpr(AstExpr* expr, const Type* expected = nullptr, const Variable* into = nullptr);
             Value CompileConstantNumber(AstExprConstantNumber* expr);
             Value CompileGlobal(AstExprGlobal* expr);
             Value CompileIndexName(AstExprIndexName* expr);
@@ -341,9 +401,9 @@ namespace UdonLuau {
             Value CompareValues(AstExprBinary::Op op, const Value& left, const Value& right, const Location& location);
             Value CompileConcat(AstExpr* expr);
             Value CompileInterpolated(AstExprInterpString* expr);
-            Value CompileIfElse(AstExprIfElse* expr, const Type* expected);
+            Value CompileIfElse(AstExprIfElse* expr, const Type* expected, const Variable* into);
             Value CompileTable(AstExprTable* expr, const Type* expected);
-            Value BooleanFromCondition(AstExpr* expr);
+            Value BooleanFromCondition(AstExpr* expr, const Variable* into = nullptr);
             Value ConcatValues(std::vector<Value> parts, const Location& location);
             Value ToStringValue(const Value& value, const Location& location);
             std::optional<Value> FoldArithmetic(AstExprBinary::Op op, const Value& left, const Value& right);
@@ -352,8 +412,8 @@ namespace UdonLuau {
             uint32_t TruthySlot(const Value& value, const Location& location);
             uint32_t NotSlot(uint32_t slot, const Location& location);
 
-            std::vector<Value> CompileCall(AstExprCall* call, size_t want);
-            std::vector<Value> CallFunction(Function* f, std::vector<Value> args, size_t want, const Location& location);
+            std::vector<Value> CompileCall(AstExprCall* call, size_t want, const Variable* into = nullptr);
+            std::vector<Value> CallFunction(Function* f, std::vector<Value> args, size_t want, const Location& location, const Variable* into = nullptr);
             std::vector<Value> CallBuiltin(std::string_view name, std::vector<Value> args, const Location& location, bool& handled);
             std::vector<Value> CallMember(const Value& receiver, std::string_view name, std::vector<Value> args, const Type* typeArg, const Location& location);
             std::vector<Value> CallStatic(const Type* owner, std::string_view name, std::vector<Value> args, const Type* typeArg, const Location& location);
@@ -388,10 +448,32 @@ namespace UdonLuau {
             Value SelfValue(std::string_view name);
             Variable LookupLocal(AstLocal* local, const Location& location);
 
+            void Analyze(AstStatBlock* root);
+            void DeclareDefines(AstStatBlock* root);
+            std::optional<Value> TryConstant(AstExpr* expr);
+            bool IsTruthy(const Value& value) const { return value.kind != Value::Kind::Nil && !(value.kind == Value::Kind::Boolean && !value.boolean); }
+            bool NegationIsFree(AstExpr* expr);
+            void CompileBody(AstStatBlock* body, AstStat*& tail);
+            std::vector<Value> Inline(Function* f, std::vector<Value> args, size_t want, const Location& location, const Variable* into);
+            bool TryJumpTable(AstStatIf* stat);
+            void CompileAssert(AstExprCall* call);
+            Value BindLocal(AstLocal* var, const Value& value, const Type* annotated, bool isConst, bool hasValue);
+            Value CoerceLiteral(const Value& value, const Type* type, const Location& location);
+
             const Catalog&                                 catalog_;
             TypeTable                                      types_;
             Emitter                                        emit_;
             std::string_view                               source_;
+            const CompileOptions&                          options_;
+            std::unordered_map<std::string, Value>         defines_;
+            std::unordered_set<AstLocal*>                  assigned_;
+            std::unordered_set<AstLocal*>                  memberAssigned_;
+            bool Immutable(AstLocal* local, const Type* type) const {
+                return !assigned_.contains(local) && (!memberAssigned_.contains(local) || (type && type->IsReference()));
+            }
+            std::unordered_set<uint32_t>                   fieldSlots_;
+            std::vector<InlineFrame>                       inlineStack_;
+            AstStat*                                       tail_ = nullptr;
             std::vector<size_t>                            lineStarts_;
             std::map<unsigned, std::vector<std::pair<FieldAttribute, Location>>> commentAttributes_;
             std::set<unsigned>                             commentLines_;
@@ -429,6 +511,7 @@ namespace UdonLuau {
             }
 
             IndexSource(parsed.commentLocations);
+            DeclareDefines(parsed.root);
 
             HeapValue halt;
             halt.kind = ValueKind::Unsigned;
@@ -437,6 +520,7 @@ namespace UdonLuau {
             returnJumpSlot_ = emit_.AddSlot("__intnl_returnJump_SystemUInt32_0", types_.UInt32);
 
             DeclareModule(parsed.root);
+            Analyze(parsed.root);
             for (auto& f : functions_) {
                 try {
                     CompileFunction(*f);
@@ -562,6 +646,53 @@ namespace UdonLuau {
             typeAliases_[alias->name.value] = ResolveType(alias->type);
         }
 
+        void Compiler::DeclareDefines(AstStatBlock* root) {
+            auto parse = [](std::string_view text) {
+                if (text == "true" || text == "false") return Value::OfBoolean(text == "true");
+                if (text == "nil") return Value::OfNil();
+                if (!text.empty()) {
+                    char* end = nullptr;
+                    std::string s(text);
+                    long long i = std::strtoll(s.c_str(), &end, 0);
+                    if (end && *end == '\0') return Value::OfInteger(i);
+                    double d = std::strtod(s.c_str(), &end);
+                    if (end && *end == '\0') return Value::OfReal(d);
+                }
+                return Value::OfString(std::string(text));
+            };
+            for (const FieldAttribute& a : ModuleAttributes(root))
+                if (a.name == "define" && !a.arguments.empty()) defines_[a.arguments[0]] = a.arguments.size() > 1 ? parse(a.arguments[1]) : Value::OfBoolean(true);
+            for (const auto& [name, value] : options_.defines) defines_[name] = parse(value);
+        }
+
+        void Compiler::Analyze(AstStatBlock* root) {
+            auto record = [&](AstExpr* func) {
+                while (auto* g = func->as<AstExprGroup>()) func = g->expr;
+                Function* f = nullptr;
+                if (auto* l = func->as<AstExprLocal>()) {
+                    if (auto it = localFunctions_.find(l->local); it != localFunctions_.end()) f = it->second;
+                } else if (auto* g = func->as<AstExprGlobal>()) {
+                    if (auto it = globalFunctions_.find(g->name.value); it != globalFunctions_.end()) f = it->second;
+                }
+                if (f) ++f->calls;
+            };
+            Analysis analysis(assigned_, memberAssigned_, record);
+            root->visit(&analysis);
+
+            for (auto& f : functions_) {
+                NodeCounter counter;
+                f->node->body->visit(&counter);
+                f->size = counter.count;
+                for (const FieldAttribute& a : AnnotationsFor(f->location).attributes) {
+                    if (a.name == "inline") f->forceInline = true;
+                    if (a.name == "noinline") f->noInline = true;
+                }
+                if (f->forceInline && f->noInline) Report(f->location, std::format("'{}' cannot be both @inline and @noinline", f->name));
+                f->inlined = !f->noInline && f->calls > 0 && (f->forceInline || f->size <= kInlineBudget || (f->calls == 1 && !f->exported));
+                f->trampoline = !f->exported || (f->calls > 0 && !f->inlined);
+            }
+        }
+
         void Compiler::CheckUserName(std::string_view name, const Location& location) {
             if (name.starts_with("__")) Fail(location, std::format("'{}': names starting with '__' are reserved", name));
             if (name == "this" || name == "gameObject" || name == "transform") Fail(location, std::format("'{}' is reserved", name));
@@ -613,6 +744,24 @@ namespace UdonLuau {
                         aliases_[var] = v;
                         continue;
                     }
+                    if (stat->isConst) {
+                        if (stat->isExported) Fail(var->location, "constants cannot be exported; use 'export local'");
+                        bool constant = v.IsLiteral() || (v.kind == Value::Kind::Slot && emit_.IsConstant(v.slot));
+                        if (!constant) Fail(init->location, "module constants need a value known at compile time");
+                        if (type && Cost(v, type) < 0) Fail(init->location, std::format("cannot initialize {} '{}' with {}", type->displayName, name, Describe(v)));
+                        aliases_[var] = type && v.IsLiteral() ? CoerceLiteral(v, type, init->location) : v;
+                        continue;
+                    }
+                    if (v.kind == Value::Kind::Slot && emit_.IsConstant(v.slot) && (!type || type == v.type)) {
+                        type = v.type;
+                        initial = emit_.Slot(v.slot).value;
+                        uint32_t slot = emit_.AddSlot(name, type, initial, stat->isExported);
+                        fieldSlots_.insert(slot);
+                        emit_.Slot(slot).attributes = annotations.attributes;
+                        variables_[var] = { slot, type };
+                        if (annotations.synced) sync_.push_back({ name, annotations.interpolation });
+                        continue;
+                    }
                     if (!v.IsLiteral()) Fail(init->location, "field initializers must be constants; assign other values in Start");
                     if (!type) type = NaturalType(v);
                     if (!type) Fail(var->location, std::format("'{}' needs a type annotation", name));
@@ -622,7 +771,9 @@ namespace UdonLuau {
                     Fail(var->location, std::format("'{}' needs a type annotation or an initializer", name));
                 }
 
+                if (stat->isConst) Fail(var->location, "constants need a value");
                 uint32_t slot = emit_.AddSlot(name, type, initial, stat->isExported);
+                fieldSlots_.insert(slot);
                 emit_.Slot(slot).attributes = annotations.attributes;
                 variables_[var] = { slot, type };
                 if (annotations.synced) sync_.push_back({ name, annotations.interpolation });
@@ -690,19 +841,38 @@ namespace UdonLuau {
         }
 
         void Compiler::CompileFunction(Function& f) {
+            if (!f.exported && (f.inlined || f.calls == 0)) return;
             current_ = &f;
+            for (size_t i = 0; i < f.parameters.size(); ++i) {
+                AstLocal* arg = f.node->args.data[i];
+                aliases_.erase(arg);
+                variables_[arg] = f.parameters[i];
+            }
             if (f.exported) {
                 emit_.Bind(f.exportedEntry);
                 entries_.push_back({ f.entryName, *emit_.AddressOf(f.exportedEntry) });
-                emit_.Push(haltSlot_);
+                if (f.trampoline) emit_.Push(haltSlot_);
             }
             emit_.Bind(f.entry);
-            CompileBlock(f.node->body);
+            AstStat* tail = nullptr;
+            CompileBody(f.node->body, tail);
             emit_.Bind(f.epilogue);
-            emit_.Push(returnJumpSlot_);
-            emit_.CopyFromStack();
-            emit_.JumpIndirect(returnJumpSlot_);
+            if (f.trampoline) {
+                emit_.Push(returnJumpSlot_);
+                emit_.CopyFromStack();
+                emit_.JumpIndirect(returnJumpSlot_);
+            } else {
+                emit_.JumpTo(0xFFFFFFFFu);
+            }
             current_ = nullptr;
+        }
+
+        void Compiler::CompileBody(AstStatBlock* body, AstStat*& tail) {
+            tail = body->body.size && body->body.data[body->body.size - 1]->is<AstStatReturn>() ? body->body.data[body->body.size - 1] : nullptr;
+            AstStat* saved = tail_;
+            tail_ = tail;
+            CompileBlock(body);
+            tail_ = saved;
         }
 
         void Compiler::CheckRecursion() {
@@ -784,16 +954,54 @@ namespace UdonLuau {
             for (size_t i = 0; i < stat->vars.size; ++i) {
                 AstLocal* var = stat->vars.data[i];
                 CheckUserName(var->name.value, var->location);
-                if (!expected[i] && (values[i].kind == Value::Kind::TypeRef || values[i].kind == Value::Kind::Namespace)) {
-                    aliases_[var] = values[i];
-                    continue;
-                }
-                const Type* type = expected[i] ? expected[i] : NaturalType(values[i]);
-                if (!type) Fail(var->location, std::format("cannot infer the type of '{}'; add a type annotation", var->name.value));
-                Variable v{ emit_.Local(var->name.value, type), type };
-                if (values[i].kind != Value::Kind::Nil || stat->values.size) Store(values[i], v, var->location);
-                variables_[var] = v;
+                BindLocal(var, values[i], expected[i], stat->isConst, stat->values.size > 0);
             }
+        }
+
+        Value Compiler::CoerceLiteral(const Value& value, const Type* type, const Location& location) {
+            if (NaturalType(value) == type || value.kind == Value::Kind::Nil) return value;
+            if (value.kind == Value::Kind::Integer && !value.type && type == types_.Single) return Value::OfReal(static_cast<double>(value.integer));
+            return Value::OfSlot(Materialize(value, type, location), type);
+        }
+
+        Value Compiler::BindLocal(AstLocal* var, const Value& value, const Type* annotated, bool isConst, bool hasValue) {
+            aliases_.erase(var);
+            variables_.erase(var);
+            if (!annotated && (value.kind == Value::Kind::TypeRef || value.kind == Value::Kind::Namespace)) {
+                aliases_[var] = value;
+                return value;
+            }
+            const Type* type = annotated ? annotated : NaturalType(value);
+            if (!type) Fail(var->location, std::format("cannot infer the type of '{}'; add a type annotation", var->name.value));
+            if (hasValue && Cost(value, type) < 0) Fail(var->location, std::format("cannot assign {} to {}", Describe(value), type->displayName));
+
+            bool immutable = isConst || Immutable(var, type);
+            if (hasValue && immutable) {
+                if (value.IsLiteral()) {
+                    Value bound = CoerceLiteral(value, type, var->location);
+                    aliases_[var] = bound;
+                    return bound;
+                }
+                if (value.kind == Value::Kind::Slot && value.type == type && emit_.IsConstant(value.slot)) {
+                    aliases_[var] = value;
+                    return value;
+                }
+            }
+            if (isConst && hasValue && value.kind == Value::Kind::Slot && value.type == type && !emit_.IsTemp(value.slot)) {
+                Variable v{ emit_.Local(var->name.value, type), type };
+                Store(value, v, var->location);
+                variables_[var] = v;
+                return Value::OfSlot(v.slot, type);
+            }
+            if (hasValue && value.kind == Value::Kind::Slot && value.type == type && emit_.IsTemp(value.slot)) {
+                emit_.Promote(value.slot);
+                variables_[var] = { value.slot, type };
+                return value;
+            }
+            Variable v{ emit_.Local(var->name.value, type), type };
+            if (hasValue) Store(value, v, var->location);
+            variables_[var] = v;
+            return Value::OfSlot(v.slot, type);
         }
 
         std::vector<Value> Compiler::EvaluateList(const AstArray<AstExpr*>& exprs, size_t want, const std::vector<const Type*>& expected) {
@@ -823,10 +1031,11 @@ namespace UdonLuau {
         void Compiler::CompileAssign(AstStatAssign* stat) {
             std::vector<Value> values;
             if (stat->vars.size == 1 && stat->values.size == 1) {
-                const Type* hint = nullptr;
+                const Variable* into = nullptr;
                 if (auto* local = Unwrap(stat->vars.data[0])->as<AstExprLocal>())
-                    if (auto it = variables_.find(local->local); it != variables_.end()) hint = it->second.type;
-                values.push_back(CompileExpr(stat->values.data[0], hint));
+                    if (auto it = variables_.find(local->local); it != variables_.end()) into = &it->second;
+                Variable target = into ? *into : Variable{};
+                values.push_back(CompileExpr(stat->values.data[0], into ? target.type : nullptr, into ? &target : nullptr));
             } else {
                 values = EvaluateList(stat->values, stat->vars.size, {});
             }
@@ -836,6 +1045,7 @@ namespace UdonLuau {
         void Compiler::AssignTo(AstExpr* target, const Value& value) {
             target = Unwrap(target);
             if (auto* local = target->as<AstExprLocal>()) {
+                if (aliases_.contains(local->local)) Fail(target->location, std::format("'{}' is a constant", local->local->name.value));
                 Store(value, LookupLocal(local->local, local->location), target->location);
                 return;
             }
@@ -847,6 +1057,8 @@ namespace UdonLuau {
                     return;
                 }
                 if (owner.kind != Value::Kind::Slot) Fail(target->location, "cannot assign to this expression");
+                if (owner.type->IsValueType() && emit_.IsConstant(owner.slot))
+                    Fail(target->location, std::format("cannot modify '{}' of a constant {}", index->index.value, owner.type->displayName));
                 if (owner.type->IsValueType() && emit_.IsTemp(owner.slot))
                     Fail(target->location, std::format("cannot modify '{}' of a {} copy; store it in a local, change it, then assign it back", index->index.value, owner.type->displayName));
                 CallMember(owner, setter, { value }, nullptr, target->location);
@@ -873,6 +1085,12 @@ namespace UdonLuau {
         }
 
         void Compiler::CompileIf(AstStatIf* stat) {
+            if (auto c = TryConstant(stat->condition)) {
+                if (IsTruthy(*c)) CompileBlock(stat->thenbody);
+                else if (stat->elsebody) CompileStatementGuarded(stat->elsebody);
+                return;
+            }
+            if (TryJumpTable(stat)) return;
             Label otherwise = emit_.NewLabel();
             Label end = emit_.NewLabel();
             CompileCondition(stat->condition, otherwise);
@@ -891,12 +1109,204 @@ namespace UdonLuau {
 
         void Compiler::CompileWhile(AstStatWhile* stat) {
             Label top = emit_.NewLabel();
+            Label test = emit_.NewLabel();
             Label end = emit_.NewLabel();
+            std::optional<Value> constant = TryConstant(stat->condition);
+            if (constant && !IsTruthy(*constant)) return;
+            if (constant) {
+                emit_.Bind(top);
+                CompileLoopBody(stat->body, { end, top });
+                emit_.Jump(top);
+                emit_.Bind(end);
+                return;
+            }
+            if (!NegationIsFree(stat->condition)) {
+                emit_.Bind(top);
+                CompileCondition(stat->condition, end);
+                CompileLoopBody(stat->body, { end, top });
+                emit_.Jump(top);
+                emit_.Bind(end);
+                return;
+            }
+            emit_.Jump(test);
             emit_.Bind(top);
-            CompileCondition(stat->condition, end);
-            CompileLoopBody(stat->body, { end, top });
-            emit_.Jump(top);
+            CompileLoopBody(stat->body, { end, test });
+            emit_.Bind(test);
+            CompileCondition(stat->condition, top, true);
             emit_.Bind(end);
+        }
+
+        std::optional<Value> Compiler::TryConstant(AstExpr* expr) {
+            expr = Unwrap(expr);
+            if (expr->is<AstExprConstantNil>()) return Value::OfNil();
+            if (auto* e = expr->as<AstExprConstantBool>()) return Value::OfBoolean(e->value);
+            if (auto* e = expr->as<AstExprConstantNumber>()) return CompileConstantNumber(e);
+            if (auto* e = expr->as<AstExprConstantInteger>()) return Value::OfInteger(e->value);
+            if (auto* e = expr->as<AstExprConstantString>()) return Value::OfString(std::string(e->value.data, e->value.size));
+            if (auto* e = expr->as<AstExprLocal>()) {
+                if (auto it = aliases_.find(e->local); it != aliases_.end() && it->second.IsLiteral()) return it->second;
+                return std::nullopt;
+            }
+            if (auto* e = expr->as<AstExprGlobal>()) {
+                if (globalFunctions_.contains(e->name.value)) return std::nullopt;
+                if (auto it = defines_.find(e->name.value); it != defines_.end()) return it->second;
+                return std::nullopt;
+            }
+            if (auto* e = expr->as<AstExprIfElse>()) {
+                auto c = e->hasElse ? TryConstant(e->condition) : std::nullopt;
+                if (!c) return std::nullopt;
+                return TryConstant(IsTruthy(*c) ? e->trueExpr : e->falseExpr);
+            }
+            if (auto* e = expr->as<AstExprUnary>()) {
+                auto v = TryConstant(e->expr);
+                if (!v) return std::nullopt;
+                switch (e->op) {
+                    case AstExprUnary::Op::Not: return Value::OfBoolean(!IsTruthy(*v));
+                    case AstExprUnary::Op::Minus:
+                        if (v->kind == Value::Kind::Integer && !v->type) return Value::OfInteger(-v->integer);
+                        if (v->kind == Value::Kind::Real) return Value::OfReal(-v->real);
+                        return std::nullopt;
+                    case AstExprUnary::Op::Len:
+                        if (v->kind == Value::Kind::String) return Value::OfInteger(static_cast<int64_t>(v->text.size()));
+                        return std::nullopt;
+                }
+                return std::nullopt;
+            }
+            auto* b = expr->as<AstExprBinary>();
+            if (!b) return std::nullopt;
+
+            auto left = TryConstant(b->left);
+            if (b->op == AstExprBinary::And || b->op == AstExprBinary::Or) {
+                if (!left) return std::nullopt;
+                bool l = IsTruthy(*left);
+                if (b->op == AstExprBinary::And && !l) return Value::OfBoolean(false);
+                if (b->op == AstExprBinary::Or && l) return Value::OfBoolean(true);
+                auto right = TryConstant(b->right);
+                if (!right) return std::nullopt;
+                return Value::OfBoolean(IsTruthy(*right));
+            }
+            auto right = TryConstant(b->right);
+            if (!left || !right) return std::nullopt;
+
+            if (b->op == AstExprBinary::Concat) {
+                auto text = [](const Value& v) -> std::optional<std::string> {
+                    if (v.kind == Value::Kind::String) return v.text;
+                    if (v.kind == Value::Kind::Integer && !v.type) return std::to_string(v.integer);
+                    if (v.kind == Value::Kind::Real) return std::format("{}", static_cast<float>(v.real));
+                    return std::nullopt;
+                };
+                auto l = text(*left);
+                auto r = text(*right);
+                if (!l || !r) return std::nullopt;
+                return Value::OfString(*l + *r);
+            }
+            if (IsComparison(b->op)) {
+                if (left->IsNumberLiteral() && right->IsNumberLiteral()) {
+                    double l = left->kind == Value::Kind::Integer ? static_cast<double>(left->integer) : left->real;
+                    double r = right->kind == Value::Kind::Integer ? static_cast<double>(right->integer) : right->real;
+                    switch (b->op) {
+                        case AstExprBinary::CompareEq: return Value::OfBoolean(l == r);
+                        case AstExprBinary::CompareNe: return Value::OfBoolean(l != r);
+                        case AstExprBinary::CompareLt: return Value::OfBoolean(l < r);
+                        case AstExprBinary::CompareLe: return Value::OfBoolean(l <= r);
+                        case AstExprBinary::CompareGt: return Value::OfBoolean(l > r);
+                        default: return Value::OfBoolean(l >= r);
+                    }
+                }
+                if (left->kind != right->kind || !left->IsLiteral()) return std::nullopt;
+                if (b->op != AstExprBinary::CompareEq && b->op != AstExprBinary::CompareNe) return std::nullopt;
+                bool same = left->kind == Value::Kind::Nil || (left->kind == Value::Kind::Boolean && left->boolean == right->boolean) ||
+                            (left->kind == Value::Kind::String && left->text == right->text) ||
+                            (left->kind == Value::Kind::Integer && left->integer == right->integer && left->type == right->type);
+                return Value::OfBoolean(b->op == AstExprBinary::CompareEq ? same : !same);
+            }
+            return FoldArithmetic(b->op, *left, *right);
+        }
+
+        bool Compiler::TryJumpTable(AstStatIf* stat) {
+            struct Case {
+                int64_t        value;
+                AstStatBlock*  body;
+            };
+            AstLocal* subject = nullptr;
+            std::vector<Case> cases;
+            AstStat* otherwiseBody = nullptr;
+            for (AstStatIf* s = stat; s;) {
+                auto* b = Unwrap(s->condition)->as<AstExprBinary>();
+                if (!b || b->op != AstExprBinary::CompareEq) return false;
+                AstExpr* l = Unwrap(b->left);
+                AstExpr* r = Unwrap(b->right);
+                auto* local = l->as<AstExprLocal>();
+                AstExpr* other = r;
+                if (!local) {
+                    local = r->as<AstExprLocal>();
+                    other = l;
+                }
+                if (!local || (subject && local->local != subject)) return false;
+                subject = local->local;
+                auto c = TryConstant(other);
+                if (!c || c->kind != Value::Kind::Integer || c->type) return false;
+                cases.push_back({ c->integer, s->thenbody });
+                if (!s->elsebody) break;
+                if (auto* next = s->elsebody->as<AstStatIf>()) {
+                    s = next;
+                    continue;
+                }
+                otherwiseBody = s->elsebody;
+                break;
+            }
+            if (cases.size() < kJumpTableMinimum || aliases_.contains(subject)) return false;
+            auto variable = variables_.find(subject);
+            if (variable == variables_.end() || variable->second.type != types_.Int32) return false;
+
+            auto [low, high] = std::ranges::minmax(cases, {}, &Case::value);
+            int64_t span = high.value - low.value + 1;
+            if (span > static_cast<int64_t>(cases.size()) * 3 || span > 1024) return false;
+            const Type* arrayType = types_.ArrayOf(types_.UInt32);
+            if (types_.Methods(arrayType, "Get", false, true).empty()) return false;
+
+            Label otherwise = emit_.NewLabel();
+            Label end = emit_.NewLabel();
+            std::vector<Label> labels;
+            std::vector<Label> table(static_cast<size_t>(span), otherwise);
+            std::vector<bool> filled(static_cast<size_t>(span), false);
+            for (const Case& c : cases) {
+                labels.push_back(emit_.NewLabel());
+                size_t index = static_cast<size_t>(c.value - low.value);
+                if (!filled[index]) {
+                    table[index] = labels.back();
+                    filled[index] = true;
+                }
+            }
+
+            Value x = Value::OfSlot(variable->second.slot, types_.Int32);
+            Location where = stat->condition->location;
+            emit_.JumpIfFalse(CompareValues(AstExprBinary::CompareGe, x, Value::OfInteger(low.value), where).slot, otherwise);
+            emit_.JumpIfFalse(CompareValues(AstExprBinary::CompareLe, x, Value::OfInteger(high.value), where).slot, otherwise);
+            Value index = low.value == 0 ? x : CompileArithmetic(AstExprBinary::Sub, x, Value::OfInteger(low.value), where);
+            uint32_t tableSlot = emit_.JumpTable(arrayType, types_.UInt32, table);
+            Value target = CallMember(Value::OfSlot(tableSlot, arrayType), "Get", { index }, nullptr, where).at(0);
+            emit_.JumpIndirect(target.slot);
+            for (size_t i = 0; i < cases.size(); ++i) {
+                emit_.Bind(labels[i]);
+                CompileBlock(cases[i].body);
+                emit_.Jump(end);
+            }
+            emit_.Bind(otherwise);
+            if (otherwiseBody) CompileStatementGuarded(otherwiseBody);
+            emit_.Bind(end);
+            return true;
+        }
+
+        bool Compiler::NegationIsFree(AstExpr* expr) {
+            expr = Unwrap(expr);
+            if (auto* b = expr->as<AstExprBinary>()) {
+                if (IsComparison(b->op)) return true;
+                if (b->op == AstExprBinary::And || b->op == AstExprBinary::Or) return NegationIsFree(b->left) && NegationIsFree(b->right);
+                return false;
+            }
+            if (auto* u = expr->as<AstExprUnary>(); u && u->op == AstExprUnary::Op::Not) return true;
+            return TryConstant(expr).has_value();
         }
 
         void Compiler::CompileRepeat(AstStatRepeat* stat) {
@@ -927,25 +1337,39 @@ namespace UdonLuau {
             }
             if (!type->IsNumeric()) Fail(stat->var->location, "loop variables must be numeric");
 
+            bool knownBounds = from.IsNumberLiteral() && to.IsNumberLiteral();
+            if (knownBounds) {
+                double a = from.kind == Value::Kind::Integer ? static_cast<double>(from.integer) : from.real;
+                double b = to.kind == Value::Kind::Integer ? static_cast<double>(to.integer) : to.real;
+                if (stepValue > 0 ? a > b : a < b) return;
+            }
+
             Variable counter{ emit_.Local(stat->var->name.value, type), type };
             variables_[stat->var] = counter;
             Store(from, counter, stat->from->location);
-            Variable limit{ emit_.Hidden(type), type };
-            Store(to, limit, stat->to->location);
+            Variable limit{};
+            if (to.IsLiteral()) {
+                limit = { Materialize(to, type, stat->to->location), type };
+            } else {
+                limit = { emit_.Hidden(type), type };
+                Store(to, limit, stat->to->location);
+            }
             uint32_t stepSlot = Materialize(step, type, stat->location);
 
             Label top = emit_.NewLabel();
             Label next = emit_.NewLabel();
             Label end = emit_.NewLabel();
+            Label increment = emit_.NewLabel();
+            if (!knownBounds) emit_.Jump(next);
             emit_.Bind(top);
-            Value test = CompareValues(stepValue > 0 ? AstExprBinary::CompareLe : AstExprBinary::CompareGe,
-                Value::OfSlot(counter.slot, type), Value::OfSlot(limit.slot, type), stat->location);
-            emit_.JumpIfFalse(test.slot, end);
-            CompileLoopBody(stat->body, { end, next });
-            emit_.Bind(next);
+            CompileLoopBody(stat->body, { end, increment });
+            emit_.Bind(increment);
             Value sum = CompileArithmetic(AstExprBinary::Add, Value::OfSlot(counter.slot, type), Value::OfSlot(stepSlot, type), stat->location);
             Store(sum, counter, stat->location);
-            emit_.Jump(top);
+            emit_.Bind(next);
+            Value done = CompareValues(stepValue > 0 ? AstExprBinary::CompareGt : AstExprBinary::CompareLt,
+                Value::OfSlot(counter.slot, type), Value::OfSlot(limit.slot, type), stat->location);
+            emit_.JumpIfFalse(done.slot, top);
             emit_.Bind(end);
         }
 
@@ -971,7 +1395,8 @@ namespace UdonLuau {
             Store(len.at(0), length, source->location);
 
             AstLocal* k = stat->vars.data[0];
-            Variable key{ emit_.Local(k->name.value, types_.Int32), types_.Int32 };
+            bool keyIsIndex = Immutable(k, types_.Int32);
+            Variable key = keyIsIndex ? index : Variable{ emit_.Local(k->name.value, types_.Int32), types_.Int32 };
             variables_[k] = key;
             Variable item{};
             if (stat->vars.size == 2) {
@@ -984,37 +1409,57 @@ namespace UdonLuau {
             }
 
             Label top = emit_.NewLabel();
-            Label next = emit_.NewLabel();
+            Label increment = emit_.NewLabel();
+            Label test = emit_.NewLabel();
             Label end = emit_.NewLabel();
+            emit_.Jump(test);
             emit_.Bind(top);
-            Value test = CompareValues(AstExprBinary::CompareLt, Value::OfSlot(index.slot, types_.Int32), Value::OfSlot(length.slot, types_.Int32), stat->location);
-            emit_.JumpIfFalse(test.slot, end);
-            emit_.Copy(index.slot, key.slot);
+            if (!keyIsIndex) emit_.Copy(index.slot, key.slot);
             if (item.type) {
                 std::vector<Value> got = CallMember(Value::OfSlot(array.slot, arrayType), "Get", { Value::OfSlot(index.slot, types_.Int32) }, nullptr, stat->location);
                 Store(got.at(0), item, stat->location);
             }
-            CompileLoopBody(stat->body, { end, next });
-            emit_.Bind(next);
+            CompileLoopBody(stat->body, { end, increment });
+            emit_.Bind(increment);
             Value sum = CompileArithmetic(AstExprBinary::Add, Value::OfSlot(index.slot, types_.Int32), Value::OfInteger(1), stat->location);
             Store(sum, index, stat->location);
-            emit_.Jump(top);
+            emit_.Bind(test);
+            Value done = CompareValues(AstExprBinary::CompareGe, Value::OfSlot(index.slot, types_.Int32), Value::OfSlot(length.slot, types_.Int32), stat->location);
+            emit_.JumpIfFalse(done.slot, top);
             emit_.Bind(end);
         }
 
         void Compiler::CompileReturn(AstStatReturn* stat) {
-            Function& f = *current_;
+            InlineFrame* frame = inlineStack_.empty() ? nullptr : &inlineStack_.back();
+            Function& f = frame ? *frame->function : *current_;
             if (stat->list.size && f.returns.empty()) {
                 if (f.exported) Fail(stat->location, "events cannot return values");
                 Fail(stat->location, std::format("'{}' has no return type annotation", f.name));
             }
             if (stat->list.size && stat->list.size != f.returns.size() && !(stat->list.size == 1 && Unwrap(stat->list.data[0])->is<AstExprCall>()))
                 Fail(stat->location, std::format("'{}' returns {} value(s)", f.name, f.returns.size()));
+
             if (stat->list.size) {
-                std::vector<Value> values = EvaluateList(stat->list, f.returns.size(), f.returns);
-                for (size_t i = 0; i < f.returns.size(); ++i) Store(values[i], { f.returnSlots[i], f.returns[i] }, stat->location);
+                std::vector<Variable> targets;
+                for (size_t i = 0; i < f.returns.size(); ++i)
+                    targets.push_back(frame ? (i < frame->results.size() ? frame->results[i] : Variable{}) : Variable{ f.returnSlots[i], f.returns[i] });
+                if (stat->list.size == 1 && f.returns.size() == 1) {
+                    Value v = CompileExpr(stat->list.data[0], f.returns[0], targets[0].type ? &targets[0] : nullptr);
+                    if (targets[0].type) Store(v, targets[0], stat->location);
+                } else {
+                    std::vector<Value> values = EvaluateList(stat->list, f.returns.size(), f.returns);
+                    for (size_t i = 0; i < f.returns.size(); ++i)
+                        if (targets[i].type) Store(values[i], targets[i], stat->location);
+                }
             }
-            emit_.Jump(f.epilogue);
+
+            if (frame) {
+                if (stat != frame->tail) emit_.Jump(frame->end);
+                return;
+            }
+            if (stat == tail_) return;
+            if (f.trampoline) emit_.Jump(f.epilogue);
+            else emit_.JumpTo(0xFFFFFFFFu);
         }
 
         Variable Compiler::LookupLocal(AstLocal* local, const Location& location) {
@@ -1023,8 +1468,10 @@ namespace UdonLuau {
             Fail(location, std::format("'{}' is not available here", local->name.value));
         }
 
-        Value Compiler::CompileExpr(AstExpr* expr, const Type* expected) {
+        Value Compiler::CompileExpr(AstExpr* expr, const Type* expected, const Variable* into) {
             expr = Unwrap(expr);
+            if (expr->is<AstExprBinary>() || expr->is<AstExprUnary>())
+                if (auto constant = TryConstant(expr)) return *constant;
             if (expr->is<AstExprConstantNil>()) return Value::OfNil();
             if (auto* e = expr->as<AstExprConstantBool>()) return Value::OfBoolean(e->value);
             if (auto* e = expr->as<AstExprConstantNumber>()) return CompileConstantNumber(e);
@@ -1040,14 +1487,17 @@ namespace UdonLuau {
             if (auto* e = expr->as<AstExprIndexName>()) return CompileIndexName(e);
             if (auto* e = expr->as<AstExprIndexExpr>()) return CompileIndexExpr(e);
             if (auto* e = expr->as<AstExprCall>()) {
-                std::vector<Value> results = CompileCall(e, 1);
+                std::vector<Value> results = CompileCall(e, 1, into);
                 if (results.empty() || results[0].kind == Value::Kind::Nil) Fail(e->location, "this call does not return a value");
                 return results[0];
             }
             if (auto* e = expr->as<AstExprUnary>()) return CompileUnary(e);
-            if (auto* e = expr->as<AstExprBinary>()) return CompileBinary(e, expected);
+            if (auto* e = expr->as<AstExprBinary>()) {
+                if (e->op == AstExprBinary::And || e->op == AstExprBinary::Or) return BooleanFromCondition(e, into);
+                return CompileBinary(e, expected);
+            }
             if (auto* e = expr->as<AstExprInterpString>()) return CompileInterpolated(e);
-            if (auto* e = expr->as<AstExprIfElse>()) return CompileIfElse(e, expected);
+            if (auto* e = expr->as<AstExprIfElse>()) return CompileIfElse(e, expected, into);
             if (auto* e = expr->as<AstExprTable>()) return CompileTable(e, expected);
             if (auto* e = expr->as<AstExprTypeAssertion>()) {
                 const Type* target = ResolveType(e->annotation);
@@ -1086,6 +1536,7 @@ namespace UdonLuau {
                 HeapValue v;
                 v.kind = ValueKind::This;
                 it = selfSlots_.emplace(typeName, emit_.AddSlot("__this_" + typeName + "_0", type, v)).first;
+                emit_.MarkConstant(it->second);
             }
             return Value::OfSlot(it->second, type);
         }
@@ -1094,6 +1545,7 @@ namespace UdonLuau {
             std::string_view name = expr->name.value;
             if (name == "this" || name == "gameObject" || name == "transform") return SelfValue(name);
             if (auto it = globalFunctions_.find(std::string(name)); it != globalFunctions_.end()) return Value::OfFunction(it->second);
+            if (auto it = defines_.find(std::string(name)); it != defines_.end()) return it->second;
 
             if (auto it = typeAliases_.find(std::string(name)); it != typeAliases_.end()) return Value::OfType(it->second);
             if (types_.IsNamespace(name) && types_.FindByShortName(name).empty()) return Value::OfNamespace(std::string(name));
@@ -1353,19 +1805,21 @@ namespace UdonLuau {
             return strings[0];
         }
 
-        Value Compiler::CompileIfElse(AstExprIfElse* expr, const Type* expected) {
+        Value Compiler::CompileIfElse(AstExprIfElse* expr, const Type* expected, const Variable* into) {
             if (!expr->hasElse) Fail(expr->location, "if-expressions need an else branch");
+            if (auto c = TryConstant(expr->condition)) return CompileExpr(IsTruthy(*c) ? expr->trueExpr : expr->falseExpr, expected, into);
             Label otherwise = emit_.NewLabel();
             Label end = emit_.NewLabel();
             CompileCondition(expr->condition, otherwise);
-            Value a = CompileExpr(expr->trueExpr, expected);
-            const Type* type = expected ? expected : NaturalType(a);
+            const Type* hint = expected ? expected : into ? into->type : nullptr;
+            Value a = CompileExpr(expr->trueExpr, hint, into);
+            const Type* type = hint ? hint : NaturalType(a);
             if (!type) Fail(expr->trueExpr->location, "cannot infer the type of this if-expression; add a type assertion");
-            Variable result{ emit_.Hidden(type), type };
+            Variable result = into && into->type == type ? *into : Variable{ emit_.Temp(type), type };
             Store(a, result, expr->trueExpr->location);
             emit_.Jump(end);
             emit_.Bind(otherwise);
-            Store(CompileExpr(expr->falseExpr, type), result, expr->falseExpr->location);
+            Store(CompileExpr(expr->falseExpr, type, &result), result, expr->falseExpr->location);
             emit_.Bind(end);
             return Value::OfSlot(result.slot, type);
         }
@@ -1385,8 +1839,9 @@ namespace UdonLuau {
             return array;
         }
 
-        Value Compiler::BooleanFromCondition(AstExpr* expr) {
-            uint32_t result = emit_.Temp(types_.Boolean);
+        Value Compiler::BooleanFromCondition(AstExpr* expr, const Variable* into) {
+            if (auto c = TryConstant(expr)) return Value::OfBoolean(IsTruthy(*c));
+            uint32_t result = into && into->type == types_.Boolean ? into->slot : emit_.Temp(types_.Boolean);
             Label otherwise = emit_.NewLabel();
             Label end = emit_.NewLabel();
             CompileCondition(expr, otherwise);
@@ -1475,8 +1930,12 @@ namespace UdonLuau {
             return CompareValues(AstExprBinary::CompareEq, v, Value::OfBoolean(false), location).slot;
         }
 
-        std::vector<Value> Compiler::CompileCall(AstExprCall* call, size_t want) {
+        std::vector<Value> Compiler::CompileCall(AstExprCall* call, size_t want, const Variable* into) {
             AstExpr* func = Unwrap(call->func);
+            if (auto* g = func->as<AstExprGlobal>(); g && g->name == "assert" && !globalFunctions_.contains("assert")) {
+                CompileAssert(call);
+                return {};
+            }
             const Type* typeArg = nullptr;
             if (call->typeArguments.size) {
                 if (!call->typeArguments.data[0].type) Fail(call->location, "type packs are not supported");
@@ -1517,8 +1976,26 @@ namespace UdonLuau {
             }
 
             Value callee = CompileExpr(func);
-            if (callee.kind == Value::Kind::Function) return CallFunction(callee.function, std::move(args), want, call->location);
+            if (callee.kind == Value::Kind::Function) return CallFunction(callee.function, std::move(args), want, call->location, into);
             Fail(call->location, "this expression cannot be called");
+        }
+
+        void Compiler::CompileAssert(AstExprCall* call) {
+            if (call->args.size < 1 || call->args.size > 2) Fail(call->location, "assert takes a condition and an optional message");
+            AstExpr* condition = call->args.data[0];
+            AstExpr* message = call->args.size > 1 ? call->args.data[1] : nullptr;
+            if (auto c = TryConstant(condition)) {
+                if (IsTruthy(*c)) return;
+                std::optional<Value> text = message ? TryConstant(message) : std::nullopt;
+                Fail(call->location, text && text->kind == Value::Kind::String ? text->text : "assertion failed");
+            }
+            auto debug = defines_.find("DEBUG");
+            if (debug == defines_.end() || !IsTruthy(debug->second)) return;
+            Label pass = emit_.NewLabel();
+            CompileCondition(condition, pass, true);
+            Value text = message ? CompileExpr(message) : Value::OfString(std::format("assertion failed at line {}", call->location.begin.line + 1));
+            CallStatic(types_.Get("UnityEngineDebug"), "LogError", { text }, nullptr, call->location);
+            emit_.Bind(pass);
         }
 
         std::vector<Value> Compiler::CallBuiltin(std::string_view name, std::vector<Value> args, const Location& location, bool& handled) {
@@ -1543,9 +2020,78 @@ namespace UdonLuau {
             return {};
         }
 
-        std::vector<Value> Compiler::CallFunction(Function* f, std::vector<Value> args, size_t want, const Location& location) {
+        std::vector<Value> Compiler::Inline(Function* f, std::vector<Value> args, size_t want, const Location& location, const Variable* into) {
+            for (const InlineFrame& frame : inlineStack_)
+                if (frame.function == f) Fail(location, std::format("recursion is not supported: '{}' calls itself", f->name));
+            if (current_) current_->callees.push_back(f);
+
+            for (size_t i = 0; i < args.size(); ++i) {
+                AstLocal* param = f->node->args.data[i];
+                const Type* type = f->parameters[i].type;
+                Value a = args[i];
+                aliases_.erase(param);
+                variables_.erase(param);
+
+                bool callerOwned = a.kind != Value::Kind::Slot || !fieldSlots_.contains(a.slot);
+                if (Immutable(param, type) && callerOwned) {
+                    if (a.IsLiteral()) {
+                        aliases_[param] = CoerceLiteral(a, type, location);
+                        continue;
+                    }
+                    if (a.kind == Value::Kind::Slot) {
+                        aliases_[param] = Value::OfSlot(Materialize(a, type, location), type);
+                        continue;
+                    }
+                }
+                if (a.kind == Value::Kind::Slot && a.type == type && emit_.IsTemp(a.slot)) {
+                    variables_[param] = { a.slot, type };
+                    continue;
+                }
+                Variable local{ emit_.Local(param->name.value, type), type };
+                Store(a, local, location);
+                variables_[param] = local;
+            }
+
+            InlineFrame frame;
+            frame.function = f;
+            frame.end = emit_.NewLabel();
+            for (size_t i = 0; i < f->returns.size(); ++i) {
+                if (i >= std::max<size_t>(want, 1)) break;
+                if (i == 0 && into && into->type == f->returns[0]) frame.results.push_back(*into);
+                else frame.results.push_back({ emit_.Temp(f->returns[i]), f->returns[i] });
+            }
+
+            std::vector<LoopLabels> savedLoops = std::move(loops_);
+            loops_.clear();
+            inlineStack_.push_back(frame);
+            try {
+                AstStat* tail = nullptr;
+                AstStatBlock* body = f->node->body;
+                tail = body->body.size && body->body.data[body->body.size - 1]->is<AstStatReturn>() ? body->body.data[body->body.size - 1] : nullptr;
+                inlineStack_.back().tail = tail;
+                CompileBlock(body);
+            } catch (...) {
+                inlineStack_.pop_back();
+                loops_ = std::move(savedLoops);
+                throw;
+            }
+            emit_.Bind(inlineStack_.back().end);
+            std::vector<Variable> results = std::move(inlineStack_.back().results);
+            inlineStack_.pop_back();
+            loops_ = std::move(savedLoops);
+
+            std::vector<Value> out;
+            for (size_t i = 0; i < std::min(want, results.size()); ++i) out.push_back(Value::OfSlot(results[i].slot, results[i].type));
+            return out;
+        }
+
+        std::vector<Value> Compiler::CallFunction(Function* f, std::vector<Value> args, size_t want, const Location& location, const Variable* into) {
             if (args.size() != f->parameters.size())
                 Fail(location, std::format("'{}' takes {} argument(s), got {}", f->name, f->parameters.size(), args.size()));
+            for (size_t i = 0; i < args.size(); ++i)
+                if (Cost(args[i], f->parameters[i].type) < 0)
+                    Fail(location, std::format("argument {} of '{}' must be {}, got {}", i + 1, f->name, f->parameters[i].type->displayName, Describe(args[i])));
+            if (f->inlined) return Inline(f, std::move(args), want, location, into);
             std::vector<uint32_t> slots;
             for (size_t i = 0; i < args.size(); ++i) {
                 if (Cost(args[i], f->parameters[i].type) < 0)
@@ -1562,7 +2108,7 @@ namespace UdonLuau {
 
             std::vector<Value> results;
             for (size_t i = 0; i < std::min(want, f->returns.size()); ++i) {
-                uint32_t t = emit_.Temp(f->returns[i]);
+                uint32_t t = i == 0 && into && into->type == f->returns[0] ? into->slot : emit_.Temp(f->returns[i]);
                 emit_.Copy(f->returnSlots[i], t);
                 results.push_back(Value::OfSlot(t, f->returns[i]));
             }
@@ -1690,6 +2236,18 @@ namespace UdonLuau {
 
         std::vector<Value> Compiler::Invoke(const Resolution& r, const std::optional<Value>& receiver, const std::vector<Value>& args, const Location& location) {
             const Method& m = *r.method;
+            if (m.ext->isConstructor && !m.ext->isGeneric && !receiver) {
+                const Type* constructed = types_.Get(m.ext->returnType);
+                bool literals = constructed->IsValueType() && std::ranges::all_of(args, [](const Value& a) { return a.IsLiteral() && a.kind != Value::Kind::Nil; }) &&
+                                std::ranges::none_of(m.parameters, [](const Parameter& p) { return p.byRef || p.generic; });
+                if (literals) {
+                    HeapValue value;
+                    value.kind = ValueKind::Construct;
+                    value.text = m.ext->signature;
+                    for (size_t i = 0; i < args.size(); ++i) value.arguments.push_back(Literal(args[i], m.parameters[i].type, location));
+                    return { Value::OfSlot(emit_.Constant(constructed, value), constructed) };
+                }
+            }
             std::vector<uint32_t> inputs;
             size_t argIndex = 0;
             for (const Parameter& p : m.parameters) {
@@ -1911,7 +2469,7 @@ namespace UdonLuau {
             if (value.kind == Value::Kind::Function || value.kind == Value::Kind::Namespace || value.kind == Value::Kind::None)
                 Fail(location, std::format("cannot store {} in a variable", Describe(value)));
             if (Cost(value, destination.type) < 0) {
-                bool explicitNumeric = value.kind == Value::Kind::Slot && value.type->IsNumeric() && destination.type->IsNumeric();
+                bool explicitNumeric = ((value.kind == Value::Kind::Slot && value.type->IsNumeric()) || value.IsNumberLiteral()) && destination.type->IsNumeric();
                 Fail(location, std::format("cannot assign {} to {}{}", Describe(value), destination.type->displayName,
                     explicitNumeric ? std::format("; convert explicitly with '(value :: {})'", destination.type->displayName) : ""));
             }
@@ -1976,8 +2534,8 @@ namespace UdonLuau {
 
     } // namespace
 
-    CompileResult Compile(const Catalog& catalog, std::string_view source) {
-        Compiler compiler(catalog, source);
+    CompileResult Compile(const Catalog& catalog, std::string_view source, const CompileOptions& options) {
+        Compiler compiler(catalog, source, options);
         return compiler.Run();
     }
 
