@@ -140,6 +140,10 @@ UDONLUAU_API void ul_catalog_add_standard_events(ul_catalog* catalog);
 /// <summary>Sets the ';'-separated namespaces that decide an ambiguous short type name, highest priority first.</summary>
 UDONLUAU_API void ul_catalog_set_preferred_namespaces(ul_catalog* catalog, const char* namespaces);
 
+/// <summary>Declares a type Udon can sync and whether it supports linear and smooth interpolation.
+/// When none are declared, synced variable types are not checked.</summary>
+UDONLUAU_API void ul_catalog_add_syncable_type(ul_catalog* catalog, const char* udon_name, int32_t linear, int32_t smooth);
+
 /// <summary>Adds a behaviour script that Luau code can hold typed references to, replacing any earlier one with the same name.</summary>
 UDONLUAU_API void ul_catalog_add_script(ul_catalog* catalog, const char* name);
 
@@ -201,6 +205,10 @@ UDONLUAU_API int32_t ul_result_sync_count(const ul_result* result);
 UDONLUAU_API int32_t ul_result_sync(const ul_result* result, int32_t index, ul_sync_variable* out);
 
 UDONLUAU_API int32_t ul_result_update_order(const ul_result* result);
+
+/// <summary>The sync mode the script requires: 0 any (the user picks on the behaviour), 1 none,
+/// 2 no variable sync, 3 continuous, 4 manual. Matches UdonSharp's BehaviourSyncMode.</summary>
+UDONLUAU_API int32_t ul_result_sync_mode(const ul_result* result);
 
 /// <summary>Whether the result carries the module's public interface, which it does whenever its declarations were valid.</summary>
 UDONLUAU_API int32_t ul_result_has_interface(const ul_result* result);

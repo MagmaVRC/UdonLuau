@@ -96,6 +96,10 @@ void ul_catalog_add_standard_events(ul_catalog* catalog) {
     if (catalog) catalog->catalog.AddStandardEvents();
 }
 
+void ul_catalog_add_syncable_type(ul_catalog* catalog, const char* udon_name, int32_t linear, int32_t smooth) {
+    if (catalog && udon_name && *udon_name) catalog->catalog.AddSyncableType(udon_name, linear != 0, smooth != 0);
+}
+
 void ul_catalog_add_script(ul_catalog* catalog, const char* name) {
     if (!catalog || !name || !*name) return;
     UdonLuau::ScriptInfo script;
@@ -306,6 +310,10 @@ int32_t ul_result_sync(const ul_result* result, int32_t index, ul_sync_variable*
 
 int32_t ul_result_update_order(const ul_result* result) {
     return result && result->result.program ? result->result.program->updateOrder : 0;
+}
+
+int32_t ul_result_sync_mode(const ul_result* result) {
+    return result && result->result.program ? static_cast<int32_t>(result->result.program->syncMode) : 0;
 }
 
 int32_t ul_result_has_interface(const ul_result* result) {
