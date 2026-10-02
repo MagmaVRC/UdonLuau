@@ -19,7 +19,7 @@ namespace {
         float x = 0, y = 0, z = 0;
     };
 
-    using Cell = std::variant<std::monostate, bool, int32_t, uint32_t, int64_t, float, double, std::string, Vec3, std::vector<int32_t>>;
+    using Cell = std::variant<std::monostate, bool, int32_t, uint32_t, int64_t, float, double, std::string, Vec3, std::vector<int32_t>, std::vector<uint32_t>>;
     using Impl = std::function<void(std::vector<Cell>&, const std::vector<uint32_t>&)>;
 
     struct Fixture {
@@ -121,6 +121,10 @@ namespace {
         f.Extern("UnityEngineObject.__op_Inequality__UnityEngineObject_UnityEngineObject__SystemBoolean", false);
         f.Extern("UnityEngineDebug.__Log__SystemObject__SystemVoid", false, [&log = f.log](auto& h, auto& p) { log.push_back(Text(h[p[0]])); });
         f.Extern("UnityEngineDebug.__LogWarning__SystemObject__SystemVoid", false);
+        f.Extern("UnityEngineDebug.__LogError__SystemObject__SystemVoid", false, [&log = f.log](auto& h, auto& p) { log.push_back("error: " + Text(h[p[0]])); });
+        f.Extern("SystemUInt32Array.__Get__SystemInt32__SystemUInt32", true, [](auto& h, auto& p) {
+            h[p[2]] = As<std::vector<uint32_t>>(h, p[0]).at(static_cast<size_t>(As<int32_t>(h, p[1])));
+        });
         f.Extern("UnityEngineMathf.__Floor__SystemSingle__SystemSingle", false, [](auto& h, auto& p) { h[p[1]] = std::floor(As<float>(h, p[0])); });
         f.Extern("UnityEngineMathf.__Pow__SystemSingle_SystemSingle__SystemSingle", false, [](auto& h, auto& p) { h[p[2]] = std::pow(As<float>(h, p[0]), As<float>(h, p[1])); });
         f.Extern("SystemMath.__Pow__SystemDouble_SystemDouble__SystemDouble", false);
@@ -155,10 +159,27 @@ namespace {
         return f;
     }
 
-    Cell Initial(const HeapSlot& slot) {
-        const HeapValue& v = slot.value;
-        const std::string& t = slot.type;
+    Cell Initial(Fixture& f, const HeapValue& v, const std::string& t) {
         switch (v.kind) {
+            case ValueKind::Construct: {
+                ExternInfo info;
+                ParseExternSignature(v.text, info);
+                std::vector<Cell> scratch;
+                std::vector<uint32_t> addresses;
+                for (size_t i = 0; i < v.arguments.size(); ++i) {
+                    scratch.push_back(Initial(f, v.arguments[i], info.parameters[i]));
+                    addresses.push_back(static_cast<uint32_t>(i));
+                }
+                scratch.emplace_back();
+                addresses.push_back(static_cast<uint32_t>(scratch.size() - 1));
+                f.impls.at(v.text)(scratch, addresses);
+                return scratch.back();
+            }
+            case ValueKind::Array: {
+                std::vector<uint32_t> elements;
+                for (const HeapValue& e : v.arguments) elements.push_back(static_cast<uint32_t>(e.unsignedInteger));
+                return elements;
+            }
             case ValueKind::Boolean: return v.boolean;
             case ValueKind::String: return v.text;
             case ValueKind::Unsigned: return static_cast<uint32_t>(v.unsignedInteger);
@@ -175,13 +196,23 @@ namespace {
         }
     }
 
+    struct Counters {
+        int externs = 0;
+        int copies = 0;
+        int jumps = 0;
+        int branches = 0;
+        int indirect = 0;
+        int instructions = 0;
+    };
+
     struct Machine {
         Fixture&            fixture;
         const Program&      program;
         std::vector<Cell>   heap;
+        Counters            counters;
 
         Machine(Fixture& f, const Program& p) : fixture(f), program(p) {
-            for (const HeapSlot& s : p.heap) heap.push_back(Initial(s));
+            for (const HeapSlot& s : p.heap) heap.push_back(Initial(f, s.value, s.type));
         }
 
         Cell& Var(std::string_view symbol) {
@@ -196,6 +227,7 @@ namespace {
                 if (e.name == entry) pc = e.address;
             if (pc == 0xFFFFFFFFu) throw std::runtime_error(std::format("no entry {}", entry));
 
+            counters = {};
             std::vector<uint32_t> stack;
             auto pop = [&] {
                 if (stack.empty()) throw std::runtime_error("stack underflow");
@@ -208,6 +240,12 @@ namespace {
                 auto op = static_cast<OpCode>(program.code[pc / 4]);
                 uint32_t arg = OperandCount(op) ? program.code[pc / 4 + 1] : 0;
                 uint32_t next = pc + (OperandCount(op) ? 8 : 4);
+                ++counters.instructions;
+                if (op == OpCode::Extern) ++counters.externs;
+                if (op == OpCode::Copy) ++counters.copies;
+                if (op == OpCode::Jump) ++counters.jumps;
+                if (op == OpCode::JumpIfFalse) ++counters.branches;
+                if (op == OpCode::JumpIndirect) ++counters.indirect;
                 switch (op) {
                     case OpCode::Push: stack.push_back(arg); break;
                     case OpCode::Pop: pop(); break;
@@ -222,6 +260,8 @@ namespace {
                         break;
                     case OpCode::Jump: next = arg; break;
                     case OpCode::JumpIndirect: next = std::get<uint32_t>(heap[arg]); break;
+                    case OpCode::Nop:
+                    case OpCode::Annotation: break;
                     case OpCode::Extern: {
                         const std::string& sig = program.heap[arg].value.text;
                         const ExternInfo* info = fixture.catalog.FindExtern(sig);
@@ -248,14 +288,14 @@ namespace {
         if (!ok) ++failures;
     }
 
-    std::optional<Program> Build(Fixture& f, std::string_view source) {
-        CompileResult r = Compile(f.catalog, source);
+    std::optional<Program> Build(Fixture& f, std::string_view source, const CompileOptions& options = {}) {
+        CompileResult r = Compile(f.catalog, source, options);
         for (const Diagnostic& d : r.diagnostics) std::printf("    %d:%d %s\n", d.line + 1, d.column + 1, d.message.c_str());
         return r.program;
     }
 
-    bool HasError(Fixture& f, std::string_view source, std::string_view fragment) {
-        CompileResult r = Compile(f.catalog, source);
+    bool HasError(Fixture& f, std::string_view source, std::string_view fragment, const CompileOptions& options = {}) {
+        CompileResult r = Compile(f.catalog, source, options);
         for (const Diagnostic& d : r.diagnostics)
             if (d.message.find(fragment) != std::string::npos) return !r.Succeeded();
         for (const Diagnostic& d : r.diagnostics) std::printf("    got: %s\n", d.message.c_str());
@@ -466,6 +506,202 @@ end
         Check(!slot("SDKBase") && !slot("V3"), "aliases take no heap slots");
         Check(HasError(f, "local t: Thing", "ambiguous"), "ambiguous name outside preferred namespaces");
         Check(HasError(f, "-- @sync(fast)\nlocal x = 1", "unknown sync mode"), "bad sync mode");
+    });
+
+    Case("inlining and constant folding", [] {
+        Fixture f = MakeFixture();
+        auto p = Build(f, R"(
+local result = 0
+local function add(a: int, b: int): int
+    return a + b
+end
+local function clamp(v: int, lo: int, hi: int): int
+    if v < lo then
+        return lo
+    elseif v > hi then
+        return hi
+    end
+    return v
+end
+function Start()
+    result = add(2, 3)
+end
+function Clamp()
+    result = clamp(result + 100, 0, 50)
+end
+)");
+        Check(p.has_value(), "compiles");
+        if (!p) return;
+        Machine m(f, *p);
+        m.Run("_start");
+        Check(std::get<int32_t>(m.Var("result")) == 5 && m.counters.externs == 0 && m.counters.indirect == 0,
+            std::format("add(2, 3) folded to a constant ({} externs)", m.counters.externs));
+        m.Run("Clamp");
+        Check(std::get<int32_t>(m.Var("result")) == 50 && m.counters.indirect == 0, "clamp inlined without call overhead");
+    });
+
+    Case("noinline keeps real calls", [] {
+        Fixture f = MakeFixture();
+        auto p = Build(f, R"(
+local n = 0
+-- @noinline
+local function bump(): int
+    n += 1
+    return n
+end
+function Start()
+    local a = bump()
+    local b = bump()
+    n = a + b
+end
+)");
+        Check(p.has_value(), "compiles");
+        if (!p) return;
+        Machine m(f, *p);
+        m.Run("_start");
+        Check(std::get<int32_t>(m.Var("n")) == 3, "results correct");
+        Check(m.counters.indirect == 2, std::format("two returns through the trampoline (got {})", m.counters.indirect));
+    });
+
+    Case("events skip the return trampoline", [] {
+        Fixture f = MakeFixture();
+        auto p = Build(f, R"(
+local n = 0
+-- @noinline
+function Reset()
+    n = 0
+end
+function Update()
+    n += 1
+    if n > 100 then
+        Reset()
+    end
+end
+)");
+        Check(p.has_value(), "compiles");
+        if (!p) return;
+        Machine m(f, *p);
+        m.Run("_update");
+        Check(m.counters.indirect == 0 && m.counters.copies == 0, std::format("Update: {} indirect, {} copies", m.counters.indirect, m.counters.copies));
+        m.Run("Reset");
+        Check(m.counters.indirect == 1, "an event that is also called keeps its trampoline");
+    });
+
+    Case("rotated loops", [] {
+        Fixture f = MakeFixture();
+        auto p = Build(f, R"(
+local sum = 0
+local k = 0
+function Start()
+    for i = 1, 10 do
+        sum += i
+    end
+end
+function Count()
+    while k < 5 do
+        k += 1
+    end
+end
+)");
+        Check(p.has_value(), "compiles");
+        if (!p) return;
+        Machine m(f, *p);
+        m.Run("_start");
+        Check(std::get<int32_t>(m.Var("sum")) == 55, "for result");
+        Check(m.counters.jumps == 1 && m.counters.branches == 10, std::format("for: {} jumps, {} branches", m.counters.jumps, m.counters.branches));
+        m.Run("Count");
+        Check(std::get<int32_t>(m.Var("k")) == 5, "while result");
+        Check(m.counters.jumps == 2 && m.counters.branches == 6, std::format("while: {} jumps, {} branches", m.counters.jumps, m.counters.branches));
+    });
+
+    Case("constant structs", [] {
+        Fixture f = MakeFixture();
+        auto p = Build(f, R"(
+local y: number = 0
+local up = Vector3.new(0, 1, 0)
+function Start()
+    local v = Vector3.new(0, 2, 0)
+    y = v.y + up.y
+end
+)");
+        Check(p.has_value(), "compiles");
+        if (!p) return;
+        Machine m(f, *p);
+        m.Run("_start");
+        Check(std::get<float>(m.Var("y")) == 3.0f, "value");
+        Check(m.counters.externs == 3, std::format("no constructor at run time ({} externs)", m.counters.externs));
+        Check(std::ranges::any_of(p->heap, [](const HeapSlot& s) { return s.symbol == "up" && s.value.kind == ValueKind::Construct; }), "struct field initialized at build time");
+    });
+
+    Case("switch-style chains become jump tables", [] {
+        Fixture f = MakeFixture();
+        auto p = Build(f, R"(
+export local x: int = 0
+local r = 0
+function Pick()
+    if x == 0 then r = 10
+    elseif x == 1 then r = 11
+    elseif x == 2 then r = 12
+    elseif x == 3 then r = 13
+    elseif x == 4 then r = 14
+    elseif x == 5 then r = 15
+    elseif x == 6 then r = 16
+    elseif x == 7 then r = 17
+    else r = -1
+    end
+end
+)");
+        Check(p.has_value(), "compiles");
+        if (!p) return;
+        Machine m(f, *p);
+        bool all = true;
+        int maxExterns = 0;
+        for (int32_t value : { 0, 3, 7, 8, -2 }) {
+            m.Var("x") = value;
+            m.Run("Pick");
+            int32_t expected = value >= 0 && value <= 7 ? 10 + value : -1;
+            all = all && std::get<int32_t>(m.Var("r")) == expected;
+            maxExterns = std::max(maxExterns, m.counters.externs);
+        }
+        Check(all, "every case dispatches correctly");
+        Check(maxExterns <= 3, std::format("at most 3 externs per dispatch (got {})", maxExterns));
+    });
+
+    Case("compile-time defines, const and assert", [] {
+        Fixture f = MakeFixture();
+        CompileOptions options;
+        options.defines = { { "DEBUG", "false" }, { "LEVEL", "3" } };
+        auto p = Build(f, R"(-- @define(FEATURE, true)
+
+const LIMIT = LEVEL * 2
+local r = 0
+function Start()
+    if DEBUG then
+        print("debug")
+    end
+    if FEATURE then
+        r = LIMIT
+    end
+    assert(LIMIT == 6, "limit")
+    assert(r >= 0)
+end
+)", options);
+        Check(p.has_value(), "compiles");
+        if (!p) return;
+        Machine m(f, *p);
+        m.Run("_start");
+        Check(std::get<int32_t>(m.Var("r")) == 6 && m.counters.externs == 0 && f.log.empty(), "dead branches and release asserts removed");
+        Check(std::ranges::none_of(p->heap, [](const HeapSlot& s) { return s.symbol == "LIMIT"; }), "constants take no heap slot");
+        Check(HasError(f, "const L = 2\nfunction Start()\n assert(L == 3, \"L must be 3\")\nend", "L must be 3"), "failed constant assert is a compile error");
+
+        CompileOptions debug;
+        debug.defines = { { "DEBUG", "true" } };
+        auto d = Build(f, "local r = 0\nfunction Start()\n assert(r > 0, \"r positive\")\nend", debug);
+        Check(d.has_value(), "debug build compiles");
+        if (!d) return;
+        Machine dm(f, *d);
+        dm.Run("_start");
+        Check(f.log.size() == 1 && f.log[0] == "error: r positive", "debug assert logs at run time");
     });
 
     Case("diagnostics", [] {
