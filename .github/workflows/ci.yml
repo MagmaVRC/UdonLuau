@@ -1,0 +1,18 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build and test
+        shell: pwsh
+        run: ./tools/build.ps1 -Configuration Release
