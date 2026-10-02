@@ -281,15 +281,25 @@ namespace UdonLuau {
                 return da != db ? da < db : ClassName(a) < ClassName(b);
             });
 
+            std::vector<const ScriptInfo*> scripts;
+            std::set<std::string> scriptNames;
+            for (const ScriptInfo* script : catalog_.Scripts()) {
+                if (!IsIdentifier(script->name) || script->name == ClassName(behaviour)) continue;
+                scripts.push_back(script);
+                scriptNames.insert(script->name);
+            }
+            std::ranges::sort(scripts, {}, &ScriptInfo::name);
+
             std::set<std::string> names;
             for (const Type* t : classes)
-                if (names.insert(ClassName(t)).second) Declare(t);
+                if (!scriptNames.contains(ClassName(t)) && names.insert(ClassName(t)).second) Declare(t);
 
-            for (const ScriptInfo* script : catalog_.Scripts()) {
+            for (const ScriptInfo* script : scripts) {
                 out_ += std::format("declare extern type {} extends {} with\n", script->name, ClassName(behaviour));
                 auto variableType = [&](const ScriptVariable& v) {
                     if (v.script.empty()) return Name(types_.Get(v.type));
-                    return v.type.ends_with("Array") ? "{" + v.script + "}" : v.script;
+                    std::string target = scriptNames.contains(v.script) ? v.script : ClassName(behaviour);
+                    return v.type.ends_with("Array") ? "{" + target + "}" : target;
                 };
                 for (const ScriptVariable& f : script->fields)
                     if (IsIdentifier(f.name)) out_ += std::format("    {}: {}\n", f.name, variableType(f));
@@ -310,8 +320,9 @@ namespace UdonLuau {
             }
 
             for (const Type* t : classes)
-                if (HasShortName(t) && IsIdentifier(t->displayName)) out_ += std::format("declare {}: {}\n\n", t->displayName, Statics(t));
-            for (const ScriptInfo* script : catalog_.Scripts()) out_ += std::format("declare {}: {{}}\n", script->name);
+                if (HasShortName(t) && IsIdentifier(t->displayName) && !scriptNames.contains(t->displayName))
+                    out_ += std::format("declare {}: {}\n\n", t->displayName, Statics(t));
+            for (const ScriptInfo* script : scripts) out_ += std::format("declare {}: {{}}\n", script->name);
 
             std::map<std::string, std::vector<const Type*>> qualified;
             for (const Type* t : classes) {
