@@ -46,7 +46,17 @@ Open `UdonLuau.slnx`, choose `Release|x64` and build.
 - Applies the script's sync mode to the UdonBehaviour, and shows a sync method picker when the mode is `any`.
 - Holds project-wide defines in Project Settings > UdonLuau.
 
-Build `UdonLuau.Native` and copy `UdonLuau.dll` to `Editor/Plugins/x86_64/` in the package. Unity locks native plugins once loaded, so restart the editor to pick up a new build.
+Build `UdonLuau.Native` and copy `UdonLuau.dll` to `Editor/Plugins/x86_64/` in the package. The editor loads a private copy of it from `Library/UdonLuau/`, so a new build is picked up on the next domain reload, or through Tools > UdonLuau > Reload Native Compiler, without restarting Unity.
+
+Each script also gets:
+
+- a program asset next to it, created automatically;
+- a generated component class named after it, which the inspector shows instead of a raw UdonBehaviour. This component lists the exported variables, the sync method picker when the mode is `any`, and a Methods foldout showing each public method's entry point and whether it is network callable;
+- an abstract UdonSharp class with the same name, so UdonSharp code can call it directly (`GetComponent<Door>()`, `door.speed`, `door.Open()`).
+
+These generated C# files change only when a script's public interface changes. Other edits recompile just the Luau program, and in play mode the running behaviours are hot-swapped.
+
+Dragging a script onto a GameObject in the Hierarchy, Scene view or Inspector adds it. `.lua` files are treated as UdonLuau scripts unless that is turned off in Project Settings > UdonLuau.
 
 ## Usage
 
@@ -123,7 +133,8 @@ end
 - Any other `-- @name(args)` annotation directly above a variable is kept on its heap slot for the host, for example `@range(0, 10)`, `@header("Motion")` or `@tooltip("...")`. The compiler does not interpret these; the editor decides what they mean.
 - Functions:
   - A global function named after a VRChat event (`Start`, `Update`, `Interact`, `OnPlayerJoined`, ...) receives that event, with its parameters.
-  - `export function Name(...)` is a public method that other behaviours can call. Its parameters and results go through the heap symbols `__Name_param__param` and `__Name__ret`. Its entry point is `_Name`, and VRChat never runs entry points starting with `_` for network events, so a public method cannot be triggered by other clients unless marked as below.
+  - `export function Name(...)` is a public method that other behaviours can call. Its entry point is `_Name`, or `__0__Name` when it takes parameters. VRChat never runs entry points starting with `_` for network events, so a public method cannot be triggered by other clients unless marked as below.
+  - Entry points, parameter symbols (`__0_value__param`) and result symbols (`__0___0__Name__ret`) follow UdonSharp's naming rules exactly, so UdonSharp code can call Luau methods natively.
   - `-- @networkcallable` above an `export function` makes it callable over the network. `-- @networkcallable(10)` also sets the rate limit in events per second.
     - The entry point is then `Name`, and the program carries VRChat's network-calling metadata.
     - It may take up to 8 parameters, which arrive with the event, and cannot return values.
