@@ -9,6 +9,7 @@
 #include <format>
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <variant>
@@ -26,7 +27,8 @@ namespace {
         int id = 0;
     };
 
-    using Cell = std::variant<std::monostate, bool, int32_t, uint32_t, int64_t, float, double, std::string, Vec3, std::vector<int32_t>, std::vector<uint32_t>, BehaviourRef>;
+    using IntArray = std::shared_ptr<std::vector<int32_t>>;
+    using Cell = std::variant<std::monostate, bool, int32_t, uint32_t, int64_t, float, double, std::string, Vec3, IntArray, std::vector<uint32_t>, BehaviourRef>;
     using Impl = std::function<void(std::vector<Cell>&, const std::vector<uint32_t>&)>;
 
     void RunOn(const Cell& behaviour, const std::string& entry);
@@ -143,14 +145,17 @@ namespace {
         f.Extern("UnityEngineMathf.__Floor__SystemSingle__SystemSingle", false, [](auto& h, auto& p) { h[p[1]] = std::floor(As<float>(h, p[0])); });
         f.Extern("UnityEngineMathf.__Pow__SystemSingle_SystemSingle__SystemSingle", false, [](auto& h, auto& p) { h[p[2]] = std::pow(As<float>(h, p[0]), As<float>(h, p[1])); });
         f.Extern("SystemMath.__Pow__SystemDouble_SystemDouble__SystemDouble", false);
-        f.Extern("SystemInt32Array.__ctor__SystemInt32__SystemInt32Array", false, [](auto& h, auto& p) { h[p[1]] = std::vector<int32_t>(static_cast<size_t>(As<int32_t>(h, p[0]))); });
-        f.Extern("SystemInt32Array.__Get__SystemInt32__SystemInt32", true, [](auto& h, auto& p) { h[p[2]] = As<std::vector<int32_t>>(h, p[0]).at(static_cast<size_t>(As<int32_t>(h, p[1]))); });
+        f.Extern("SystemInt32Array.__ctor__SystemInt32__SystemInt32Array", false, [](auto& h, auto& p) { h[p[1]] = std::make_shared<std::vector<int32_t>>(static_cast<size_t>(As<int32_t>(h, p[0]))); });
+        f.Extern("SystemInt32Array.__Get__SystemInt32__SystemInt32", true, [](auto& h, auto& p) { h[p[2]] = As<IntArray>(h, p[0])->at(static_cast<size_t>(As<int32_t>(h, p[1]))); });
         f.Extern("SystemInt32Array.__Set__SystemInt32_SystemInt32__SystemVoid", true, [](auto& h, auto& p) {
-            As<std::vector<int32_t>>(h, p[0]).at(static_cast<size_t>(As<int32_t>(h, p[1]))) = As<int32_t>(h, p[2]);
+            As<IntArray>(h, p[0])->at(static_cast<size_t>(As<int32_t>(h, p[1]))) = As<int32_t>(h, p[2]);
         });
-        f.Extern("SystemInt32Array.__get_Length__SystemInt32", true, [](auto& h, auto& p) { h[p[1]] = static_cast<int32_t>(As<std::vector<int32_t>>(h, p[0]).size()); });
+        f.Extern("SystemInt32Array.__get_Length__SystemInt32", true, [](auto& h, auto& p) { h[p[1]] = static_cast<int32_t>(As<IntArray>(h, p[0])->size()); });
         f.Extern("UnityEngineVector3.__ctor__SystemSingle_SystemSingle_SystemSingle__UnityEngineVector3", false, [](auto& h, auto& p) {
             h[p[3]] = Vec3{ As<float>(h, p[0]), As<float>(h, p[1]), As<float>(h, p[2]) };
+        });
+        f.Extern("UnityEngineVector3.__Set__SystemSingle_SystemSingle_SystemSingle__SystemVoid", true, [](auto& h, auto& p) {
+            h[p[0]] = Vec3{ As<float>(h, p[1]), As<float>(h, p[2]), As<float>(h, p[3]) };
         });
         f.Extern("UnityEngineVector3.__get_y__SystemSingle", true, [](auto& h, auto& p) { h[p[1]] = As<Vec3>(h, p[0]).y; });
         f.Extern("UnityEngineVector3.__set_y__SystemSingle", true, [](auto& h, auto& p) { As<Vec3>(h, p[0]).y = As<float>(h, p[1]); });
@@ -164,7 +169,7 @@ namespace {
             h[p[2]] = Vec3{ a.x * s, a.y * s, a.z * s };
         });
         f.Extern("SystemArray.__IndexOf__TArray_T__SystemInt32", false, [](auto& h, auto& p) {
-            auto& xs = As<std::vector<int32_t>>(h, p[0]);
+            auto& xs = *As<IntArray>(h, p[0]);
             auto it = std::ranges::find(xs, As<int32_t>(h, p[1]));
             h[p[2]] = it == xs.end() ? -1 : static_cast<int32_t>(it - xs.begin());
         });
@@ -949,6 +954,153 @@ end
         Check(HasError(f, "-- @syncmode(fast)\n\nlocal x = 0", "unknown sync mode"), "unknown mode");
         Check(HasError(f, "-- @sync(linear)\nlocal b = false", "cannot use linear"), "interpolation needs a type that supports it");
         Check(HasError(f, "-- @sync\nexport local t: Transform", "Udon does not sync"), "unsyncable type");
+    });
+
+    Case("review regressions", [] {
+        Fixture f = MakeFixture();
+        auto check =[&](std::string_view what, std::string_view source, auto verify) {
+            auto p = Build(f, source);
+            if (!p) {
+                Check(false, std::format("{} (compile)", what));
+                return;
+            }
+            Machine m(f, *p);
+            m.Run("_start");
+            Check(verify(m), what);
+        };
+        auto num = [](Machine& m, std::string_view v) { return std::get<float>(m.Var(v)); };
+        auto integer = [](Machine& m, std::string_view v) { return std::get<int32_t>(m.Var(v)); };
+
+        check("real calls keep the caller's temps", R"(
+local k: number = 5
+local out: number = 0
+-- @noinline
+local function g(): number
+    return k * 2 + 1
+end
+function Start()
+    out = (k + 1) + g()
+end
+)", [&](Machine& m) { return num(m, "out") == 17.0f; });
+
+        check("inlined parameters bound to temps are not retargeted", R"(
+local k: number = 4
+local last: number = 0
+local total: number = 0
+local function f(x: number)
+    last = x
+    total = total + x
+end
+function Start()
+    f(k + 1)
+end
+)", [&](Machine& m) { return num(m, "last") == 5.0f && num(m, "total") == 5.0f; });
+
+        check("a local copied from a parameter does not change it", R"(
+local v: number = 3
+local out: number = 0
+local function f(x: number): number
+    local y = x
+    y = y * 2
+    return x + y
+end
+function Start()
+    out = f(v + 0.5)
+end
+)", [&](Machine& m) { return num(m, "out") == 10.5f; });
+
+        check("struct methods do not change shared constants", R"(
+local a: number = 0
+function Start()
+    local v = Vector3.new(0, 0, 0)
+    v:Set(1, 2, 3)
+    local w = Vector3.new(0, 0, 0)
+    a = w.y + v.y
+end
+)", [&](Machine& m) { return num(m, "a") == 2.0f; });
+
+        check("decimal literals converted to int round", R"(
+local a = 0
+local b = 0
+function Start()
+    a = (2.5 :: int)
+    b = (3.5 :: int)
+end
+)", [&](Machine& m) { return integer(m, "a") == 2 && integer(m, "b") == 4; });
+        Check(HasError(f, "function Start()\n for i: int = 0, 10.5 do end\nend", "loop bound or step"), "fractional bounds for int loops are rejected");
+
+        check("// and % agree between constants and run time", R"(
+local n: int = -7
+local d: int = 0
+local r: int = 0
+local fd: int = 0
+local fr: int = 0
+function Start()
+    d = n // 2
+    r = n % 3
+    fd = -7 // 2
+    fr = -7 % 3
+end
+)", [&](Machine& m) { return integer(m, "d") == integer(m, "fd") && integer(m, "r") == integer(m, "fr") && integer(m, "d") == -3 && integer(m, "r") == -1; });
+
+        check("locals without a value reset each time", R"(
+local out = 0
+function Start()
+    for i = 1, 3 do
+        local x: int
+        if i == 1 then
+            x = 5
+        end
+        out += x
+    end
+end
+)", [&](Machine& m) { return integer(m, "out") == 5; });
+
+        check("operands are read before later calls run", R"(
+local n: int = 1
+local out = 0
+local function bump(): int
+    n += 10
+    return 1
+end
+function Start()
+    out = n + bump()
+end
+)", [&](Machine& m) { return integer(m, "out") == 2; });
+
+        check("compound assignment evaluates its target once", R"(
+local calls = 0
+local out = 0
+local function index(): int
+    calls += 1
+    return 0
+end
+function Start()
+    local xs: {int} = {1, 2}
+    xs[index()] += 5
+    out = xs[0]
+end
+)", [&](Machine& m) { return integer(m, "calls") == 1 && integer(m, "out") == 6; });
+
+        check("assigning the loop variable does not change the iteration", R"(
+local count = 0
+function Start()
+    for i = 1, 5 do
+        count += 1
+        i = i + 10
+    end
+end
+)", [&](Machine& m) { return integer(m, "count") == 5; });
+
+        Check(HasError(f, "function Start()\n local x = (nil).y\nend", "cannot read 'y' of nil"), "member of nil is a diagnostic");
+        Check(HasError(f, "const A = 5\nlocal x: A.B", "not a type or namespace"), "literal alias as a type prefix is a diagnostic");
+        bool threw = false;
+        try {
+            Compile(f.catalog, "local function g(): number\n return 1\nend\nfunction Start()\n print(g<<number>>())\nend");
+        } catch (...) {
+            threw = true;
+        }
+        Check(!threw, "explicit type arguments on a local function do not crash");
     });
 
     Case("diagnostics", [] {
