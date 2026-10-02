@@ -25,6 +25,10 @@ namespace Magma.VRC.UdonLuau
         private static readonly Dictionary<Type, (string key, ScriptInterface script)> Cache = new Dictionary<Type, (string, ScriptInterface)>();
         private static Dictionary<string, Type[]> _events;
 
+        internal static HashSet<string> RegisteredNames { get; set; }
+
+        internal static void ClearCache() => Cache.Clear();
+
         private sealed class Layout
         {
             public string ExportName;
@@ -177,7 +181,7 @@ namespace Magma.VRC.UdonLuau
             {
                 Name = name,
                 UdonType = UdonTypeNames.Get(symbols.GetSymbolType(symbol)),
-                Script = typeof(UdonSharpBehaviour).IsAssignableFrom(element) && element != typeof(UdonSharpBehaviour) ? element.Name : null,
+                Script = Assets.ContainsKey(element) && (RegisteredNames == null || RegisteredNames.Contains(element.Name)) ? element.Name : null,
                 Symbol = symbol,
             };
         }

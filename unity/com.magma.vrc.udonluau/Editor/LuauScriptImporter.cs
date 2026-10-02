@@ -4,7 +4,7 @@ using UnityEngine;
 
 namespace Magma.VRC.UdonLuau
 {
-    /// <summary>Imports .luau files, and .lua files when enabled in Project Settings, as text assets.</summary>
+    /// <summary>Imports UdonLuau scripts (.lua, unless turned off in Project Settings, and .luau) as text assets.</summary>
     [ScriptedImporter(2, new[] { "luau" }, new[] { "lua" })]
     public sealed class LuauScriptImporter : ScriptedImporter
     {

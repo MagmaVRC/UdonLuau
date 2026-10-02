@@ -143,6 +143,9 @@ namespace Magma.VRC.UdonLuau
 
             var names = owners.Where(o => o.Value.Count == 1).Select(o => o.Key).OrderBy(n => n, StringComparer.Ordinal).ToList();
             foreach (string name in names) Native.ul_catalog_add_script(catalog.Handle, Native.Utf8(name));
+            var registered = new HashSet<string>(names, StringComparer.Ordinal);
+            if (UdonSharpScripts.RegisteredNames == null || !UdonSharpScripts.RegisteredNames.SetEquals(registered)) UdonSharpScripts.ClearCache();
+            UdonSharpScripts.RegisteredNames = registered;
 
             string defines = LuauSettings.instance.Defines ?? "";
             string context = defines + "|" + string.Join(",", names);
@@ -173,7 +176,9 @@ namespace Magma.VRC.UdonLuau
 
             string fingerprint = string.Join("\n", interfaces.Select(i => i.ToString()).OrderBy(s => s, StringComparer.Ordinal));
             bool changed = _fingerprint != null && _fingerprint != fingerprint;
+            bool first = _fingerprint == null;
             _fingerprint = fingerprint;
+            if (first || changed) EditorSetup.Write();
             if (changed && !CompilingAll && !_recompileScheduled)
             {
                 _recompileScheduled = true;

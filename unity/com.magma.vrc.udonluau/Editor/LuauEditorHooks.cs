@@ -153,7 +153,8 @@ namespace Magma.VRC.UdonLuau
                 if (!string.IsNullOrEmpty(selected)) folder = AssetDatabase.IsValidFolder(selected) ? selected : Path.GetDirectoryName(selected).Replace('\\', '/');
             }
 
-            string scriptPath = AssetDatabase.GenerateUniqueAssetPath($"{folder}/NewLuauScript.luau");
+            string extension = LuauSettings.instance.TreatLuaAsLuau ? "lua" : "luau";
+            string scriptPath = AssetDatabase.GenerateUniqueAssetPath($"{folder}/NewLuauScript.{extension}");
             File.WriteAllText(scriptPath, Template);
             AssetDatabase.ImportAsset(scriptPath);
 

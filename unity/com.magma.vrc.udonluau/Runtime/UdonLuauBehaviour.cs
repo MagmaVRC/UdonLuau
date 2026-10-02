@@ -10,10 +10,10 @@ namespace Magma.VRC.UdonLuau
     [AttributeUsage(AttributeTargets.Class, Inherited = false)]
     public sealed class UdonLuauScriptAttribute : Attribute
     {
-        /// <summary>The asset GUID of the .luau script.</summary>
+        /// <summary>The asset GUID of the .lua or .luau script.</summary>
         public string ScriptGuid { get; }
 
-        /// <param name="scriptGuid">The asset GUID of the .luau script.</param>
+        /// <param name="scriptGuid">The asset GUID of the .lua or .luau script.</param>
         public UdonLuauScriptAttribute(string scriptGuid) => ScriptGuid = scriptGuid;
     }
 

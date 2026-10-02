@@ -214,6 +214,7 @@ namespace Magma.VRC.UdonLuau
         public static AddScriptMethodValue ul_catalog_add_script_method_value;
         public static SetScriptMethodFlag ul_catalog_set_script_method_network_callable;
         public static AddSyncableType ul_catalog_add_syncable_type;
+        public static ResultText ul_catalog_definitions;
         public static ResultInt ul_result_sync_mode;
         public static ResultAt ul_result_interface_method_network_callable;
         public static ResultInt ul_result_network_count;

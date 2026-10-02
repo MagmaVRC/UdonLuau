@@ -22,7 +22,8 @@
         "VRCSDKBase.dll",
         "VRCSDKBase-Editor.dll",
         "VRCSDK3.dll",
-        "System.Collections.Immutable.dll"
+        "System.Collections.Immutable.dll",
+        "Newtonsoft.Json.dll"
     ],
     "autoReferenced": false,
     "defineConstraints": [],

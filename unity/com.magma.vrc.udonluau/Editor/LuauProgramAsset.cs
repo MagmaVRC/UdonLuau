@@ -28,7 +28,7 @@ namespace Magma.VRC.UdonLuau
         public int maxEventsPerSecond;
     }
 
-    /// <summary>An Udon program source compiled from a .luau script.</summary>
+    /// <summary>An Udon program source compiled from a .lua or .luau script.</summary>
     [CreateAssetMenu(menuName = "VRChat/Udon/UdonLuau Program Asset", fileName = "New UdonLuau Program Asset")]
     public class LuauProgramAsset : UdonProgramAsset
     {
@@ -68,7 +68,7 @@ namespace Magma.VRC.UdonLuau
         public static bool IsProgramOf(AbstractUdonProgramSource source, string script) =>
             source is LuauProgramAsset luau ? luau.ScriptName == script : UdonSharpScripts.IsProgramOf(source, script);
 
-        /// <summary>The .luau script this program is compiled from.</summary>
+        /// <summary>The .lua or .luau script this program is compiled from.</summary>
         public TextAsset SourceScript
         {
             get => sourceScript;
