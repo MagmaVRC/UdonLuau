@@ -135,6 +135,18 @@ int32_t ul_catalog_add_script_method_value(ul_catalog* catalog, const char* scri
     return 1;
 }
 
+int32_t ul_catalog_set_script_method_network_callable(ul_catalog* catalog, const char* script, const char* method, int32_t network_callable) {
+    if (!catalog || !script || !method) return 0;
+    const UdonLuau::ScriptInfo* existing = catalog->catalog.FindScript(script);
+    if (!existing) return 0;
+    UdonLuau::ScriptInfo copy = *existing;
+    auto it = std::find_if(copy.methods.begin(), copy.methods.end(), [&](const UdonLuau::ScriptMethod& m) { return m.name == method; });
+    if (it == copy.methods.end()) return 0;
+    it->networkCallable = network_callable != 0;
+    catalog->catalog.AddScript(std::move(copy));
+    return 1;
+}
+
 ul_result* ul_extract_interface(const ul_catalog* catalog, const char* source, size_t length, const char* defines) {
     auto* r = new (std::nothrow) ul_result();
     if (!r) return nullptr;
@@ -318,6 +330,31 @@ int32_t ul_result_interface_method(const ul_result* result, int32_t index, ul_sc
     if (!ul_result_has_interface(result) || !out || !InRange(index, result->result.scriptInterface->methods.size())) return 0;
     const UdonLuau::ScriptMethod& m = result->result.scriptInterface->methods[static_cast<size_t>(index)];
     *out = { m.name.c_str(), m.entryPoint.c_str(), static_cast<int32_t>(m.parameters.size()), static_cast<int32_t>(m.returns.size()) };
+    return 1;
+}
+
+int32_t ul_result_interface_method_network_callable(const ul_result* result, int32_t index) {
+    if (!ul_result_has_interface(result) || !InRange(index, result->result.scriptInterface->methods.size())) return 0;
+    return result->result.scriptInterface->methods[static_cast<size_t>(index)].networkCallable ? 1 : 0;
+}
+
+int32_t ul_result_network_count(const ul_result* result) {
+    return result && result->result.program ? static_cast<int32_t>(result->result.program->networkCallables.size()) : 0;
+}
+
+int32_t ul_result_network(const ul_result* result, int32_t index, ul_network_callable* out) {
+    if (!result || !out || !result->result.program || !InRange(index, result->result.program->networkCallables.size())) return 0;
+    const UdonLuau::NetworkCallable& n = result->result.program->networkCallables[static_cast<size_t>(index)];
+    *out = { n.entryPoint.c_str(), n.maxEventsPerSecond, static_cast<int32_t>(n.parameters.size()) };
+    return 1;
+}
+
+int32_t ul_result_network_parameter(const ul_result* result, int32_t index, int32_t parameter, ul_network_parameter* out) {
+    if (!result || !out || !result->result.program || !InRange(index, result->result.program->networkCallables.size())) return 0;
+    const UdonLuau::NetworkCallable& n = result->result.program->networkCallables[static_cast<size_t>(index)];
+    if (!InRange(parameter, n.parameters.size())) return 0;
+    const UdonLuau::NetworkParameter& p = n.parameters[static_cast<size_t>(parameter)];
+    *out = { p.symbol.c_str(), p.type.c_str() };
     return 1;
 }
 

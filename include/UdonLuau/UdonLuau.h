@@ -93,6 +93,17 @@ typedef struct ul_script_method {
     int32_t     return_count;
 } ul_script_method;
 
+typedef struct ul_network_callable {
+    const char* entry_point;
+    int32_t     max_events_per_second;
+    int32_t     parameter_count;
+} ul_network_callable;
+
+typedef struct ul_network_parameter {
+    const char* symbol;
+    const char* type;
+} ul_network_parameter;
+
 typedef struct ul_entry_point {
     const char* name;
     uint32_t    address;
@@ -144,6 +155,10 @@ UDONLUAU_API int32_t ul_catalog_add_script_method(ul_catalog* catalog, const cha
 /// <returns>0 when the script or method is unknown.</returns>
 UDONLUAU_API int32_t ul_catalog_add_script_method_value(ul_catalog* catalog, const char* script, const char* method, int32_t is_return, const char* name, const char* udon_type, const char* script_type, const char* symbol);
 
+/// <summary>Marks a method added earlier as callable by other clients over the network.</summary>
+/// <returns>0 when the script or method is unknown.</returns>
+UDONLUAU_API int32_t ul_catalog_set_script_method_network_callable(ul_catalog* catalog, const char* script, const char* method, int32_t network_callable);
+
 /// <summary>Reads a module's public methods and fields without compiling function bodies. The result has no program.</summary>
 UDONLUAU_API ul_result* ul_extract_interface(const ul_catalog* catalog, const char* source, size_t length, const char* defines);
 
@@ -193,6 +208,15 @@ UDONLUAU_API int32_t ul_result_interface_field_count(const ul_result* result);
 UDONLUAU_API int32_t ul_result_interface_field(const ul_result* result, int32_t index, ul_script_variable* out);
 UDONLUAU_API int32_t ul_result_interface_method_count(const ul_result* result);
 UDONLUAU_API int32_t ul_result_interface_method(const ul_result* result, int32_t index, ul_script_method* out);
+
+/// <summary>Whether a public method is marked @networkcallable.</summary>
+UDONLUAU_API int32_t ul_result_interface_method_network_callable(const ul_result* result, int32_t index);
+
+/// <summary>Entry points other clients may run over the network, with the heap symbols their arguments are written to.
+/// max_events_per_second is 0 for the SDK default.</summary>
+UDONLUAU_API int32_t ul_result_network_count(const ul_result* result);
+UDONLUAU_API int32_t ul_result_network(const ul_result* result, int32_t index, ul_network_callable* out);
+UDONLUAU_API int32_t ul_result_network_parameter(const ul_result* result, int32_t index, int32_t parameter, ul_network_parameter* out);
 
 /// <summary>A parameter (is_return 0) or return value (is_return 1) of a public method.</summary>
 UDONLUAU_API int32_t ul_result_interface_method_value(const ul_result* result, int32_t method, int32_t is_return, int32_t index, ul_script_variable* out);
