@@ -114,9 +114,20 @@ namespace UdonLuau {
         /// cannot enumerate them.</summary>
         void AddStandardEvents();
 
+        /// <summary>Declares a type Udon can sync, and whether it supports linear and smooth
+        /// interpolation. When no syncable types are declared, synced variable types are not checked.</summary>
+        void AddSyncableType(std::string_view udonName, bool linear, bool smooth);
+
         /// <summary>Adds or replaces a behaviour script that Luau code can hold typed references to.</summary>
         void AddScript(ScriptInfo script);
         [[nodiscard]] const ScriptInfo* FindScript(std::string_view name) const;
+
+        struct SyncSupport {
+            bool linear = false;
+            bool smooth = false;
+        };
+        [[nodiscard]] bool HasSyncableTypes() const;
+        [[nodiscard]] const SyncSupport* FindSyncableType(std::string_view udonName) const;
 
         /// <summary>Sets the namespaces that decide an ambiguous short type name, highest
         /// priority first.</summary>

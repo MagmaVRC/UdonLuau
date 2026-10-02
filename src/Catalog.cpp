@@ -144,6 +144,7 @@ namespace UdonLuau {
         StringMap<StringMap<std::vector<const ExternInfo*>>> methods;
         StringMap<std::unique_ptr<EventInfo>>               events;
         StringMap<std::unique_ptr<ScriptInfo>>              scripts;
+        StringMap<SyncSupport>                              syncable;
         std::vector<std::string> preferredNamespaces = { "UnityEngine", "VRC.SDKBase", "VRC.SDK3.Components", "VRC.SDK3.Data", "VRC.Udon", "System" };
 
         void Unindex(const TypeInfo& type) {
@@ -217,6 +218,19 @@ namespace UdonLuau {
             }
             if (!FindEvent(event.name)) AddEvent(std::move(event));
         }
+    }
+
+    void Catalog::AddSyncableType(std::string_view udonName, bool linear, bool smooth) {
+        impl_->syncable[std::string(udonName)] = { linear, smooth };
+    }
+
+    bool Catalog::HasSyncableTypes() const {
+        return !impl_->syncable.empty();
+    }
+
+    const Catalog::SyncSupport* Catalog::FindSyncableType(std::string_view udonName) const {
+        auto it = impl_->syncable.find(udonName);
+        return it == impl_->syncable.end() ? nullptr : &it->second;
     }
 
     void Catalog::AddScript(ScriptInfo script) {

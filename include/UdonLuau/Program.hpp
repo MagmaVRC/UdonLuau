@@ -73,6 +73,15 @@ namespace UdonLuau {
         Smooth,
     };
 
+    /// <summary>The behaviour sync mode a script requires, matching UdonSharp's BehaviourSyncMode.</summary>
+    enum class BehaviourSyncMode : uint8_t {
+        Any,
+        None,
+        NoVariableSync,
+        Continuous,
+        Manual,
+    };
+
     struct SyncVariable {
         std::string       symbol;
         SyncInterpolation interpolation = SyncInterpolation::None;
@@ -99,6 +108,7 @@ namespace UdonLuau {
         std::vector<HeapSlot>     heap;
         std::vector<EntryPoint>   entryPoints;
         std::vector<SyncVariable> sync;
+        BehaviourSyncMode         syncMode = BehaviourSyncMode::Any;
         std::vector<NetworkCallable> networkCallables;
         std::vector<FieldAttribute> attributes;
         int                       updateOrder = 0;

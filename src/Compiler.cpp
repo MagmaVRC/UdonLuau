@@ -460,6 +460,8 @@ namespace UdonLuau {
 
             void Analyze(AstStatBlock* root);
             void DeclareDefines(AstStatBlock* root);
+            void DeclareSyncMode(AstStatBlock* root);
+            void CheckSynced(const std::string& name, const Type* type, SyncInterpolation interpolation, const Location& location);
             std::optional<Value> TryConstant(AstExpr* expr);
             bool IsTruthy(const Value& value) const { return value.kind != Value::Kind::Nil && !(value.kind == Value::Kind::Boolean && !value.boolean); }
             bool NegationIsFree(AstExpr* expr);
@@ -485,6 +487,7 @@ namespace UdonLuau {
             std::vector<InlineFrame>                       inlineStack_;
             std::vector<std::pair<std::string, const Type*>> exportedFields_;
             bool                                           interfaceOnly_ = false;
+            BehaviourSyncMode                              syncMode_ = BehaviourSyncMode::Any;
             AstStat*                                       tail_ = nullptr;
             std::vector<size_t>                            lineStarts_;
             std::map<unsigned, std::vector<std::pair<FieldAttribute, Location>>> commentAttributes_;
@@ -524,6 +527,11 @@ namespace UdonLuau {
 
             IndexSource(parsed.commentLocations);
             DeclareDefines(parsed.root);
+            try {
+                DeclareSyncMode(parsed.root);
+            } catch (const CompileError& e) {
+                Report(e.location, e.message);
+            }
 
             HeapValue halt;
             halt.kind = ValueKind::Unsigned;
@@ -552,6 +560,7 @@ namespace UdonLuau {
             if (!failed) {
                 result.program = emit_.Finish(std::move(entries_), std::move(sync_));
                 result.program->attributes = ModuleAttributes(parsed.root);
+                result.program->syncMode = syncMode_;
                 for (const auto& f : functions_) {
                     if (!f->networkCallable) continue;
                     NetworkCallable n{ f->entryName, f->maxEventsPerSecond, {} };
@@ -760,6 +769,42 @@ namespace UdonLuau {
             return v;
         }
 
+        void Compiler::DeclareSyncMode(AstStatBlock* root) {
+            std::vector<FieldAttribute> module = ModuleAttributes(root);
+            auto attribute = std::ranges::find(module, "syncmode", &FieldAttribute::name);
+            if (attribute == module.end()) return;
+            Location location;
+            for (const auto& [line, entries] : commentAttributes_)
+                for (const auto& entry : entries)
+                    if (entry.first.name == "syncmode") location = entry.second;
+
+            std::string mode = attribute->arguments.empty() ? std::string() : attribute->arguments[0];
+            std::ranges::transform(mode, mode.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (mode == "any") syncMode_ = BehaviourSyncMode::Any;
+            else if (mode == "none") syncMode_ = BehaviourSyncMode::None;
+            else if (mode == "novariablesync") syncMode_ = BehaviourSyncMode::NoVariableSync;
+            else if (mode == "continuous") syncMode_ = BehaviourSyncMode::Continuous;
+            else if (mode == "manual") syncMode_ = BehaviourSyncMode::Manual;
+            else Fail(location, std::format("unknown sync mode '{}'; use any, none, novariablesync, continuous or manual", mode));
+        }
+
+        void Compiler::CheckSynced(const std::string& name, const Type* type, SyncInterpolation interpolation, const Location& location) {
+            if (syncMode_ == BehaviourSyncMode::None || syncMode_ == BehaviourSyncMode::NoVariableSync)
+                Fail(location, std::format("'{}' cannot be synced: the script's sync mode is {}", name, syncMode_ == BehaviourSyncMode::None ? "none" : "novariablesync"));
+            if (syncMode_ == BehaviourSyncMode::Continuous && type->kind == TypeKind::Array)
+                Fail(location, std::format("'{}' is an array, which continuous sync does not support; use '-- @syncmode(manual)'", name));
+            if (syncMode_ == BehaviourSyncMode::Manual && interpolation != SyncInterpolation::None)
+                Fail(location, std::format("'{}' uses {} interpolation, which manual sync does not support; use '-- @syncmode(continuous)'", name,
+                    interpolation == SyncInterpolation::Linear ? "linear" : "smooth"));
+            if (!catalog_.HasSyncableTypes()) return;
+            const Catalog::SyncSupport* support = type->script ? nullptr : catalog_.FindSyncableType(type->udonName);
+            if (!support) Fail(location, std::format("'{}' cannot be synced: Udon does not sync {}", name, type->displayName));
+            if (interpolation == SyncInterpolation::Linear && !support->linear)
+                Fail(location, std::format("'{}' cannot use linear interpolation: {} does not support it", name, type->displayName));
+            if (interpolation == SyncInterpolation::Smooth && !support->smooth)
+                Fail(location, std::format("'{}' cannot use smooth interpolation: {} does not support it", name, type->displayName));
+        }
+
         void Compiler::DeclareDefines(AstStatBlock* root) {
             auto parse = [](std::string_view text) {
                 if (text == "true" || text == "false") return Value::OfBoolean(text == "true");
@@ -877,7 +922,10 @@ namespace UdonLuau {
                         if (stat->isExported) exportedFields_.emplace_back(name, type);
                         emit_.Slot(slot).attributes = annotations.attributes;
                         variables_[var] = { slot, type };
-                        if (annotations.synced) sync_.push_back({ name, annotations.interpolation });
+                        if (annotations.synced) {
+                            CheckSynced(name, type, annotations.interpolation, var->location);
+                            sync_.push_back({ name, annotations.interpolation });
+                        }
                         continue;
                     }
                     if (!v.IsLiteral()) Fail(init->location, "field initializers must be constants; assign other values in Start");
@@ -895,7 +943,10 @@ namespace UdonLuau {
                 if (stat->isExported) exportedFields_.emplace_back(name, type);
                 emit_.Slot(slot).attributes = annotations.attributes;
                 variables_[var] = { slot, type };
-                if (annotations.synced) sync_.push_back({ name, annotations.interpolation });
+                if (annotations.synced) {
+                    CheckSynced(name, type, annotations.interpolation, var->location);
+                    sync_.push_back({ name, annotations.interpolation });
+                }
             }
         }
 
@@ -937,6 +988,8 @@ namespace UdonLuau {
                         Fail(location, std::format("'{}' would share its entry point with the {} event; rename it", name, e->name));
             }
             if (f->networkCallable) {
+                if (syncMode_ == BehaviourSyncMode::None)
+                    Fail(location, "sync mode none disables network events; use '-- @syncmode(novariablesync)' to keep them without synced variables");
                 if (node->args.size > 8) Fail(location, "network callable methods take at most 8 parameters");
                 if (node->returnAnnotation) Fail(node->returnAnnotation->location, "network callable methods cannot return values");
             }
