@@ -34,6 +34,7 @@ namespace UdonLuau::Detail {
         std::vector<const Type*> interfaces;
         const Type*              element = nullptr;
         const TypeInfo*          info = nullptr;
+        const ScriptInfo*        script = nullptr;
         Numeric                  numeric = Numeric::None;
 
         [[nodiscard]] bool IsValueType() const { return kind == TypeKind::Struct || kind == TypeKind::Enum; }
@@ -65,6 +66,8 @@ namespace UdonLuau::Detail {
 
         [[nodiscard]] const Type* Get(std::string_view udonName);
         [[nodiscard]] const Type* ArrayOf(const Type* element);
+        [[nodiscard]] const Type* Script(const ScriptInfo* script);
+        [[nodiscard]] const Type* Behaviour() { return Get("VRCUdonUdonBehaviour"); }
         [[nodiscard]] const Type* FindByFullName(std::string_view fullName);
         [[nodiscard]] std::vector<const Type*> FindByShortName(std::string_view shortName);
         [[nodiscard]] bool IsNamespace(std::string_view path) const { return catalog_.IsNamespace(path); }
@@ -97,6 +100,7 @@ namespace UdonLuau::Detail {
         std::deque<Type>                                   storage_;
         std::unordered_map<std::string, const Type*>       byName_;
         std::unordered_map<const ExternInfo*, Method>      methods_;
+        std::unordered_map<const ScriptInfo*, const Type*> scripts_;
     };
 
 } // namespace UdonLuau::Detail

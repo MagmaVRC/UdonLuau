@@ -132,8 +132,31 @@ namespace UdonLuau::Detail {
         return &type;
     }
 
+    const Type* TypeTable::Script(const ScriptInfo* script) {
+        if (auto it = scripts_.find(script); it != scripts_.end()) return it->second;
+        const Type* behaviour = Behaviour();
+        Type& type = storage_.emplace_back();
+        type.udonName = behaviour->udonName;
+        type.fullName = script->name;
+        type.displayName = script->name;
+        type.kind = TypeKind::Class;
+        type.base = behaviour;
+        type.script = script;
+        scripts_.emplace(script, &type);
+        return &type;
+    }
+
     const Type* TypeTable::ArrayOf(const Type* element) {
-        return Get(element->udonName + std::string(kArraySuffix));
+        const Type* plain = Get(element->udonName + std::string(kArraySuffix));
+        if (!element->script) return plain;
+        auto key = reinterpret_cast<const ScriptInfo*>(reinterpret_cast<uintptr_t>(element->script) | 1);
+        if (auto it = scripts_.find(key); it != scripts_.end()) return it->second;
+        Type& type = storage_.emplace_back(*plain);
+        type.element = element;
+        type.base = plain;
+        type.displayName = "{" + element->displayName + "}";
+        scripts_.emplace(key, &type);
+        return &type;
     }
 
     const Type* TypeTable::FindByFullName(std::string_view fullName) {

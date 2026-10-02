@@ -60,6 +60,32 @@ namespace UdonLuau {
         std::vector<EventParameter> parameters;
     };
 
+    /// <summary>A variable of another behaviour's program: a public field, a method parameter or a
+    /// return value. type is the Udon type name; script names the behaviour script when the value
+    /// is a typed reference to one.</summary>
+    struct ScriptVariable {
+        std::string name;
+        std::string type;
+        std::string script;
+        std::string symbol;
+    };
+
+    /// <summary>A public method of a behaviour script: the entry point SendCustomEvent runs and the
+    /// heap symbols its arguments and results are passed through.</summary>
+    struct ScriptMethod {
+        std::string                 name;
+        std::string                 entryPoint;
+        std::vector<ScriptVariable> parameters;
+        std::vector<ScriptVariable> returns;
+    };
+
+    /// <summary>The public surface of a behaviour script, Luau or UdonSharp.</summary>
+    struct ScriptInfo {
+        std::string                 name;
+        std::vector<ScriptMethod>   methods;
+        std::vector<ScriptVariable> fields;
+    };
+
     /// <summary>Everything the host exposes to Udon: types, extern signatures and events.
     /// Filled by the host from the live wrapper modules, so newly exposed externs need no
     /// compiler change.</summary>
@@ -85,6 +111,10 @@ namespace UdonLuau {
         /// <summary>Adds the events VRChat dispatches to every UdonBehaviour, for hosts that
         /// cannot enumerate them.</summary>
         void AddStandardEvents();
+
+        /// <summary>Adds or replaces a behaviour script that Luau code can hold typed references to.</summary>
+        void AddScript(ScriptInfo script);
+        [[nodiscard]] const ScriptInfo* FindScript(std::string_view name) const;
 
         /// <summary>Sets the namespaces that decide an ambiguous short type name, highest
         /// priority first.</summary>

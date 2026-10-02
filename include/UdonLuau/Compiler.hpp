@@ -34,14 +34,20 @@ namespace UdonLuau {
     };
 
     struct CompileResult {
-        std::optional<Program>  program;
-        std::vector<Diagnostic> diagnostics;
+        std::optional<Program>    program;
+        std::optional<ScriptInfo> scriptInterface;
+        std::vector<Diagnostic>   diagnostics;
 
         [[nodiscard]] bool Succeeded() const { return program.has_value(); }
     };
 
-    /// <summary>Compiles one Luau module into one Udon program against the externs the
-    /// catalog exposes.</summary>
+    /// <summary>Compiles one Luau module into one Udon program against the externs and scripts
+    /// the catalog exposes. The result also carries the module's public interface.</summary>
     CompileResult Compile(const Catalog& catalog, std::string_view source, const CompileOptions& options = {});
+
+    /// <summary>Reads a module's public methods and fields without compiling function bodies, so
+    /// scripts that reference each other can be registered before any of them is compiled. Script
+    /// names it refers to must already be in the catalog, interfaces may still be empty.</summary>
+    CompileResult ExtractInterface(const Catalog& catalog, std::string_view source, const CompileOptions& options = {});
 
 } // namespace UdonLuau

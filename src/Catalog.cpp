@@ -143,6 +143,7 @@ namespace UdonLuau {
         StringMap<std::unique_ptr<ExternInfo>>              externs;
         StringMap<StringMap<std::vector<const ExternInfo*>>> methods;
         StringMap<std::unique_ptr<EventInfo>>               events;
+        StringMap<std::unique_ptr<ScriptInfo>>              scripts;
         std::vector<std::string> preferredNamespaces = { "UnityEngine", "VRC.SDKBase", "VRC.SDK3.Components", "VRC.SDK3.Data", "VRC.Udon", "System" };
 
         void Unindex(const TypeInfo& type) {
@@ -216,6 +217,19 @@ namespace UdonLuau {
             }
             if (!FindEvent(event.name)) AddEvent(std::move(event));
         }
+    }
+
+    void Catalog::AddScript(ScriptInfo script) {
+        if (script.name.empty()) return;
+        std::string key = script.name;
+        auto& slot = impl_->scripts[key];
+        if (slot) *slot = std::move(script);
+        else slot = std::make_unique<ScriptInfo>(std::move(script));
+    }
+
+    const ScriptInfo* Catalog::FindScript(std::string_view name) const {
+        auto it = impl_->scripts.find(name);
+        return it == impl_->scripts.end() ? nullptr : it->second.get();
     }
 
     void Catalog::SetPreferredNamespaces(std::vector<std::string> namespaces) {

@@ -117,7 +117,7 @@ namespace UdonLuau {
         };
 
         struct Value {
-            enum class Kind { None, Slot, Integer, Real, Boolean, String, Nil, TypeRef, Namespace, Function };
+            enum class Kind { None, Slot, Integer, Real, Boolean, String, Nil, TypeRef, Namespace, Function, Network };
 
             Kind        kind = Kind::None;
             const Type* type = nullptr;
@@ -127,6 +127,7 @@ namespace UdonLuau {
             bool        boolean = false;
             std::string text;
             Function*   function = nullptr;
+            const Type* targetType = nullptr;
 
             static Value OfSlot(uint32_t slot, const Type* type) {
                 Value v;
@@ -353,8 +354,8 @@ namespace UdonLuau {
 
         class Compiler {
         public:
-            Compiler(const Catalog& catalog, std::string_view source, const CompileOptions& options)
-                : catalog_(catalog), types_(catalog), source_(source), options_(options) {}
+            Compiler(const Catalog& catalog, std::string_view source, const CompileOptions& options, bool interfaceOnly)
+                : catalog_(catalog), types_(catalog), source_(source), options_(options), interfaceOnly_(interfaceOnly) {}
 
             CompileResult Run();
 
@@ -448,6 +449,13 @@ namespace UdonLuau {
             Value SelfValue(std::string_view name);
             Variable LookupLocal(AstLocal* local, const Location& location);
 
+            const Type* VariableType(const ScriptVariable& v);
+            ScriptVariable MakeVariable(std::string name, const Type* type, std::string symbol);
+            ScriptInfo BuildInterface();
+            std::vector<Value> CallScriptMethod(const Value& receiver, const ScriptMethod& method, const std::vector<Value>& args, size_t want, const Location& location);
+            std::optional<Value> TryNetworkTarget(AstExprCall* call);
+            Value ReadScriptField(const Value& receiver, const ScriptVariable& field, const Location& location);
+
             void Analyze(AstStatBlock* root);
             void DeclareDefines(AstStatBlock* root);
             std::optional<Value> TryConstant(AstExpr* expr);
@@ -473,6 +481,8 @@ namespace UdonLuau {
             }
             std::unordered_set<uint32_t>                   fieldSlots_;
             std::vector<InlineFrame>                       inlineStack_;
+            std::vector<std::pair<std::string, const Type*>> exportedFields_;
+            bool                                           interfaceOnly_ = false;
             AstStat*                                       tail_ = nullptr;
             std::vector<size_t>                            lineStarts_;
             std::map<unsigned, std::vector<std::pair<FieldAttribute, Location>>> commentAttributes_;
@@ -520,6 +530,12 @@ namespace UdonLuau {
             returnJumpSlot_ = emit_.AddSlot("__intnl_returnJump_SystemUInt32_0", types_.UInt32);
 
             DeclareModule(parsed.root);
+            bool declared = std::ranges::none_of(diagnostics_, [](const Diagnostic& d) { return d.severity == Severity::Error; });
+            if (declared) result.scriptInterface = BuildInterface();
+            if (interfaceOnly_) {
+                result.diagnostics = std::move(diagnostics_);
+                return result;
+            }
             Analyze(parsed.root);
             for (auto& f : functions_) {
                 try {
@@ -646,6 +662,95 @@ namespace UdonLuau {
             typeAliases_[alias->name.value] = ResolveType(alias->type);
         }
 
+        const Type* Compiler::VariableType(const ScriptVariable& v) {
+            if (v.script.empty()) return types_.Get(v.type);
+            const ScriptInfo* script = catalog_.FindScript(v.script);
+            const Type* element = script ? types_.Script(script) : types_.Behaviour();
+            return v.type.ends_with("Array") ? types_.ArrayOf(element) : element;
+        }
+
+        ScriptVariable Compiler::MakeVariable(std::string name, const Type* type, std::string symbol) {
+            ScriptVariable v;
+            v.name = std::move(name);
+            v.symbol = std::move(symbol);
+            v.type = type->udonName;
+            const Type* element = type->kind == TypeKind::Array ? type->element : type;
+            if (element && element->script) v.script = element->script->name;
+            return v;
+        }
+
+        ScriptInfo Compiler::BuildInterface() {
+            ScriptInfo info;
+            for (const auto& [name, type] : exportedFields_) info.fields.push_back(MakeVariable(name, type, name));
+            for (const auto& f : functions_) {
+                if (!f->exported || f->event) continue;
+                ScriptMethod m;
+                m.name = f->name;
+                m.entryPoint = f->entryName;
+                for (size_t i = 0; i < f->parameters.size(); ++i)
+                    m.parameters.push_back(MakeVariable(f->node->args.data[i]->name.value, f->parameters[i].type, emit_.Slot(f->parameters[i].slot).symbol));
+                for (size_t i = 0; i < f->returns.size(); ++i)
+                    m.returns.push_back(MakeVariable(i ? std::format("result{}", i) : "result", f->returns[i], emit_.Slot(f->returnSlots[i]).symbol));
+                info.methods.push_back(std::move(m));
+            }
+            return info;
+        }
+
+        std::vector<Value> Compiler::CallScriptMethod(const Value& receiver, const ScriptMethod& method, const std::vector<Value>& args, size_t want, const Location& location) {
+            Value self = Value::OfSlot(receiver.slot, types_.Behaviour());
+            if (args.size() != method.parameters.size())
+                Fail(location, std::format("'{}' takes {} argument(s), got {}", method.name, method.parameters.size(), args.size()));
+            for (size_t i = 0; i < args.size(); ++i) {
+                const Type* type = VariableType(method.parameters[i]);
+                if (Cost(args[i], type) < 0)
+                    Fail(location, std::format("argument {} of '{}' must be {}, got {}", i + 1, method.name, type->displayName, Describe(args[i])));
+                Value arg = args[i].IsLiteral() ? Value::OfSlot(Materialize(args[i], type, location), type) : args[i];
+                if (arg.kind == Value::Kind::Slot && arg.type != type && arg.type->IsNumeric() && type->IsNumeric())
+                    arg = Value::OfSlot(Convert(arg.slot, arg.type, type, location), type);
+                CallMember(self, "SetProgramVariable", { Value::OfString(method.parameters[i].symbol), arg }, nullptr, location);
+            }
+            CallMember(self, "SendCustomEvent", { Value::OfString(method.entryPoint) }, nullptr, location);
+            std::vector<Value> results;
+            for (size_t i = 0; i < std::min(want, method.returns.size()); ++i) {
+                Value raw = CallMember(self, "GetProgramVariable", { Value::OfString(method.returns[i].symbol) }, nullptr, location).at(0);
+                results.push_back(Value::OfSlot(raw.slot, VariableType(method.returns[i])));
+            }
+            return results;
+        }
+
+        Value Compiler::ReadScriptField(const Value& receiver, const ScriptVariable& field, const Location& location) {
+            Value self = Value::OfSlot(receiver.slot, types_.Behaviour());
+            Value raw = CallMember(self, "GetProgramVariable", { Value::OfString(field.symbol) }, nullptr, location).at(0);
+            return Value::OfSlot(raw.slot, VariableType(field));
+        }
+
+        std::optional<Value> Compiler::TryNetworkTarget(AstExprCall* call) {
+            auto* index = Unwrap(call->func)->as<AstExprIndexName>();
+            if (!index || call->self || call->args.size != 1) return std::nullopt;
+            auto* global = Unwrap(index->expr)->as<AstExprGlobal>();
+            if (!global || global->name != "Network" || globalFunctions_.contains("Network") || defines_.contains("Network") || !types_.FindByShortName("Network").empty())
+                return std::nullopt;
+            std::vector<const Type*> targets = types_.FindByShortName("NetworkEventTarget");
+            const Type* target = targets.empty() ? nullptr : PreferredType(targets) ? PreferredType(targets) : targets[0];
+            if (!target || !target->info) Fail(call->location, "VRC.Udon.Common.Interfaces.NetworkEventTarget is not in the catalog");
+            const EnumMember* member = nullptr;
+            for (const EnumMember& m : target->info->enumMembers)
+                if (m.name == index->index.value) member = &m;
+            if (!member) {
+                std::string names;
+                for (const EnumMember& m : target->info->enumMembers) names += (names.empty() ? "" : ", ") + m.name;
+                Fail(index->location, std::format("unknown network target '{}'; use one of: {}", index->index.value, names));
+            }
+            Value receiver = CompileExpr(call->args.data[0]);
+            if (receiver.kind != Value::Kind::Slot || types_.ReferenceDistance(receiver.type, types_.Behaviour()) < 0)
+                Fail(call->args.data[0]->location, std::format("Network.{} needs an UdonBehaviour, got {}", member->name, Describe(receiver)));
+            Value v = Value::OfSlot(receiver.slot, receiver.type);
+            v.kind = Value::Kind::Network;
+            v.integer = member->value;
+            v.targetType = target;
+            return v;
+        }
+
         void Compiler::DeclareDefines(AstStatBlock* root) {
             auto parse = [](std::string_view text) {
                 if (text == "true" || text == "false") return Value::OfBoolean(text == "true");
@@ -715,6 +820,9 @@ namespace UdonLuau {
                     } else if (auto* gf = stat->as<AstStatFunction>()) {
                         auto* global = gf->name->as<AstExprGlobal>();
                         if (!global) Fail(gf->name->location, "only plain global functions can be declared; methods on tables are not supported");
+                        if (!catalog_.FindEvent(global->name.value))
+                            Fail(gf->location, std::format("'{}' is not an Udon event; declare it 'export function {}' to make it public or 'local function {}' to keep it private",
+                                global->name.value, global->name.value, global->name.value));
                         DeclareFunction(global->name.value, gf->func, gf->location, nullptr);
                     } else if (stat->is<AstStatTypeAlias>() || stat->is<AstStatTypeFunction>()) {
                     } else {
@@ -757,6 +865,7 @@ namespace UdonLuau {
                         initial = emit_.Slot(v.slot).value;
                         uint32_t slot = emit_.AddSlot(name, type, initial, stat->isExported);
                         fieldSlots_.insert(slot);
+                        if (stat->isExported) exportedFields_.emplace_back(name, type);
                         emit_.Slot(slot).attributes = annotations.attributes;
                         variables_[var] = { slot, type };
                         if (annotations.synced) sync_.push_back({ name, annotations.interpolation });
@@ -774,6 +883,7 @@ namespace UdonLuau {
                 if (stat->isConst) Fail(var->location, "constants need a value");
                 uint32_t slot = emit_.AddSlot(name, type, initial, stat->isExported);
                 fieldSlots_.insert(slot);
+                if (stat->isExported) exportedFields_.emplace_back(name, type);
                 emit_.Slot(slot).attributes = annotations.attributes;
                 variables_[var] = { slot, type };
                 if (annotations.synced) sync_.push_back({ name, annotations.interpolation });
@@ -793,8 +903,9 @@ namespace UdonLuau {
             f->entry = emit_.NewLabel();
             f->epilogue = emit_.NewLabel();
 
-            if (!local) {
-                if (globalFunctions_.contains(name)) Fail(location, std::format("function '{}' is already defined", name));
+            if (!local || local->isExported) {
+                if (globalFunctions_.contains(name) || std::ranges::any_of(functions_, [&](const auto& g) { return g->exported && g->name == name; }))
+                    Fail(location, std::format("function '{}' is already defined", name));
                 f->exported = true;
                 f->event = catalog_.FindEvent(name);
                 f->entryName = f->event ? "_" + LowerFirst(name) : name;
@@ -813,10 +924,9 @@ namespace UdonLuau {
                         Fail(arg->location, std::format("parameter '{}' of event '{}' is {}", arg->name.value, name, type->displayName));
                     slot = emit_.AddSlot(LowerFirst(name) + UpperFirst(p.name), type);
                 } else {
-                    if (f->exported) Fail(arg->location, "custom events cannot take parameters; declare a local function instead");
                     if (!arg->annotation) Fail(arg->location, std::format("parameter '{}' needs a type annotation", arg->name.value));
                     type = ResolveType(arg->annotation);
-                    slot = emit_.Local(arg->name.value, type);
+                    slot = f->exported ? emit_.AddSlot(std::format("__{}_{}__param", name, arg->name.value), type) : emit_.Local(arg->name.value, type);
                 }
                 variables_[arg] = { slot, type };
                 f->parameters.push_back({ slot, type });
@@ -826,13 +936,14 @@ namespace UdonLuau {
                 if (pack->typeList.tailType) Fail(pack->location, "variadic returns are not supported");
                 for (AstType* t : pack->typeList.types) {
                     const Type* type = ResolveType(t);
+                    std::string symbol = f->returns.empty() ? std::format("__{}__ret", name) : std::format("__{}__ret{}", name, f->returns.size());
                     f->returns.push_back(type);
-                    f->returnSlots.push_back(emit_.Hidden(type));
+                    f->returnSlots.push_back(f->exported ? emit_.AddSlot(symbol, type) : emit_.Hidden(type));
                 }
             } else if (node->returnAnnotation) {
                 Fail(node->returnAnnotation->location, "unsupported return annotation");
             }
-            if (f->exported && !f->returns.empty()) Fail(location, "events cannot return values");
+            if (f->event && !f->returns.empty()) Fail(location, "events cannot return values");
 
             Function* raw = f.get();
             functions_.push_back(std::move(f));
@@ -1057,6 +1168,18 @@ namespace UdonLuau {
                     return;
                 }
                 if (owner.kind != Value::Kind::Slot) Fail(target->location, "cannot assign to this expression");
+                if (const ScriptInfo* script = owner.type->script) {
+                    auto field = std::ranges::find(script->fields, std::string_view(index->index.value), &ScriptVariable::name);
+                    if (field != script->fields.end()) {
+                        const Type* type = VariableType(*field);
+                        if (Cost(value, type) < 0) Fail(target->location, std::format("cannot assign {} to {}.{} ({})", Describe(value), script->name, field->name, type->displayName));
+                        Value v = value.IsLiteral() ? Value::OfSlot(Materialize(value, type, target->location), type) : value;
+                        if (v.kind == Value::Kind::Slot && v.type != type && v.type->IsNumeric() && type->IsNumeric())
+                            v = Value::OfSlot(Convert(v.slot, v.type, type, target->location), type);
+                        CallMember(Value::OfSlot(owner.slot, types_.Behaviour()), "SetProgramVariable", { Value::OfString(field->symbol), v }, nullptr, target->location);
+                        return;
+                    }
+                }
                 if (owner.type->IsValueType() && emit_.IsConstant(owner.slot))
                     Fail(target->location, std::format("cannot modify '{}' of a constant {}", index->index.value, owner.type->displayName));
                 if (owner.type->IsValueType() && emit_.IsTemp(owner.slot))
@@ -1417,6 +1540,7 @@ namespace UdonLuau {
             if (!keyIsIndex) emit_.Copy(index.slot, key.slot);
             if (item.type) {
                 std::vector<Value> got = CallMember(Value::OfSlot(array.slot, arrayType), "Get", { Value::OfSlot(index.slot, types_.Int32) }, nullptr, stat->location);
+                if (item.type->script) got.at(0).type = item.type;
                 Store(got.at(0), item, stat->location);
             }
             CompileLoopBody(stat->body, { end, increment });
@@ -1433,7 +1557,7 @@ namespace UdonLuau {
             InlineFrame* frame = inlineStack_.empty() ? nullptr : &inlineStack_.back();
             Function& f = frame ? *frame->function : *current_;
             if (stat->list.size && f.returns.empty()) {
-                if (f.exported) Fail(stat->location, "events cannot return values");
+                if (f.event) Fail(stat->location, "events cannot return values");
                 Fail(stat->location, std::format("'{}' has no return type annotation", f.name));
             }
             if (stat->list.size && stat->list.size != f.returns.size() && !(stat->list.size == 1 && Unwrap(stat->list.data[0])->is<AstExprCall>()))
@@ -1487,6 +1611,7 @@ namespace UdonLuau {
             if (auto* e = expr->as<AstExprIndexName>()) return CompileIndexName(e);
             if (auto* e = expr->as<AstExprIndexExpr>()) return CompileIndexExpr(e);
             if (auto* e = expr->as<AstExprCall>()) {
+                if (auto network = TryNetworkTarget(e)) return *network;
                 std::vector<Value> results = CompileCall(e, 1, into);
                 if (results.empty() || results[0].kind == Value::Kind::Nil) Fail(e->location, "this call does not return a value");
                 return results[0];
@@ -1548,6 +1673,7 @@ namespace UdonLuau {
             if (auto it = defines_.find(std::string(name)); it != defines_.end()) return it->second;
 
             if (auto it = typeAliases_.find(std::string(name)); it != typeAliases_.end()) return Value::OfType(it->second);
+            if (const ScriptInfo* script = catalog_.FindScript(name)) return Value::OfType(types_.Script(script));
             if (types_.IsNamespace(name) && types_.FindByShortName(name).empty()) return Value::OfNamespace(std::string(name));
             if (const Type* t = ShortType(name, expr->location)) return Value::OfType(t);
             if (types_.IsNamespace(name)) return Value::OfNamespace(std::string(name));
@@ -1577,6 +1703,14 @@ namespace UdonLuau {
             }
 
             if (owner.kind == Value::Kind::Function) Fail(expr->location, "functions have no members");
+            if (owner.kind == Value::Kind::Network) Fail(expr->location, "use ':' to call a method through Network");
+            if (owner.kind == Value::Kind::Slot && owner.type->script) {
+                const ScriptInfo* script = owner.type->script;
+                auto field = std::ranges::find(script->fields, name, &ScriptVariable::name);
+                if (field != script->fields.end()) return ReadScriptField(owner, *field, expr->location);
+                if (std::ranges::find(script->methods, name, &ScriptMethod::name) != script->methods.end())
+                    Fail(expr->location, std::format("'{}' is a method; call it with '{}:{}()'", name, "value", name));
+            }
             Value receiver = owner.kind == Value::Kind::Slot ? owner : Value::OfSlot(Materialize(owner, nullptr, expr->location), NaturalType(owner));
             return CallMember(receiver, "get_" + std::string(name), {}, nullptr, expr->location).at(0);
         }
@@ -1586,7 +1720,9 @@ namespace UdonLuau {
             if (owner.kind != Value::Kind::Slot) Fail(expr->location, std::format("cannot index {}", Describe(owner)));
             Value key = CompileExpr(expr->index);
             std::string_view method = owner.type->kind == TypeKind::Array ? "Get" : "get_Item";
-            return CallMember(owner, method, { key }, nullptr, expr->location).at(0);
+            Value item = CallMember(owner, method, { key }, nullptr, expr->location).at(0);
+            if (owner.type->kind == TypeKind::Array && owner.type->element && owner.type->element->script) item.type = owner.type->element;
+            return item;
         }
 
         Value Compiler::CompileUnary(AstExprUnary* expr) {
@@ -1952,6 +2088,24 @@ namespace UdonLuau {
             if (call->self) {
                 auto* index = func->as<AstExprIndexName>();
                 Value receiver = CompileExpr(index->expr);
+                std::string_view name = index->index.value;
+                if (receiver.kind == Value::Kind::Network) {
+                    std::string entry(name);
+                    if (const ScriptInfo* script = receiver.type->script) {
+                        auto method = std::ranges::find(script->methods, name, &ScriptMethod::name);
+                        if (method == script->methods.end()) Fail(call->location, std::format("{} has no public method '{}'", script->name, name));
+                        if (!method->parameters.empty()) Fail(call->location, std::format("'{}' takes parameters; networked calls cannot pass arguments", name));
+                        entry = method->entryPoint;
+                    }
+                    if (!args.empty()) Fail(call->location, "networked calls cannot pass arguments");
+                    Value self = Value::OfSlot(receiver.slot, types_.Behaviour());
+                    return CallMember(self, "SendCustomNetworkEvent", { Value::OfInteger(receiver.integer, receiver.targetType), Value::OfString(entry) }, nullptr, call->location);
+                }
+                if (receiver.kind == Value::Kind::Slot && receiver.type->script) {
+                    const ScriptInfo* script = receiver.type->script;
+                    auto method = std::ranges::find(script->methods, name, &ScriptMethod::name);
+                    if (method != script->methods.end()) return CallScriptMethod(receiver, *method, args, want, call->location);
+                }
                 if (receiver.kind == Value::Kind::TypeRef || receiver.kind == Value::Kind::Namespace)
                     Fail(call->location, "use '.' to call static methods");
                 if (receiver.kind != Value::Kind::Slot) receiver = Value::OfSlot(Materialize(receiver, nullptr, call->location), NaturalType(receiver));
@@ -2507,6 +2661,7 @@ namespace UdonLuau {
             };
             if (auto it = typeAliases_.find(std::string(name)); it != typeAliases_.end()) return it->second;
             if (auto it = aliases.find(name); it != aliases.end()) return types_.Get(it->second);
+            if (const ScriptInfo* script = catalog_.FindScript(name)) return types_.Script(script);
             if (const Type* t = ShortType(name, location)) return t;
             Fail(location, std::format("unknown type '{}'", name));
         }
@@ -2546,7 +2701,12 @@ namespace UdonLuau {
     } // namespace
 
     CompileResult Compile(const Catalog& catalog, std::string_view source, const CompileOptions& options) {
-        Compiler compiler(catalog, source, options);
+        Compiler compiler(catalog, source, options, false);
+        return compiler.Run();
+    }
+
+    CompileResult ExtractInterface(const Catalog& catalog, std::string_view source, const CompileOptions& options) {
+        Compiler compiler(catalog, source, options, true);
         return compiler.Run();
     }
 
