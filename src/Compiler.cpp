@@ -371,6 +371,19 @@ namespace UdonLuau {
             }
         }
 
+        bool IsConstantGetter(const ExternInfo& e) {
+            static const std::set<std::string, std::less<>> vectors{ "get_zero", "get_one", "get_up", "get_down", "get_left", "get_right", "get_forward", "get_back",
+                                                                     "get_positiveInfinity", "get_negativeInfinity" };
+            static const std::set<std::string, std::less<>> colors{ "get_red", "get_green", "get_blue", "get_white", "get_black", "get_yellow", "get_cyan",
+                                                                    "get_magenta", "get_gray", "get_grey", "get_clear" };
+            static const std::set<std::string, std::less<>> vectorTypes{ "UnityEngineVector2", "UnityEngineVector3", "UnityEngineVector4", "UnityEngineVector2Int",
+                                                                         "UnityEngineVector3Int" };
+            if (!e.isStatic || !e.parameters.empty() || !e.method.starts_with("get_") || e.returnType != e.module) return false;
+            if (vectorTypes.contains(e.module)) return vectors.contains(e.method);
+            if (e.module == "UnityEngineColor") return colors.contains(e.method);
+            return e.module == "UnityEngineQuaternion" && e.method == "get_identity";
+        }
+
         bool IsComparison(AstExprBinary::Op op) {
             return op == AstExprBinary::CompareEq || op == AstExprBinary::CompareNe || op == AstExprBinary::CompareLt ||
                    op == AstExprBinary::CompareLe || op == AstExprBinary::CompareGt || op == AstExprBinary::CompareGe;
@@ -2239,8 +2252,14 @@ namespace UdonLuau {
                 return;
             }
             uint32_t slot = TruthySlot(v, expr->location);
-            if (negate) slot = NotSlot(slot, expr->location);
-            emit_.JumpIfFalse(slot, whenFalse);
+            if (!negate) {
+                emit_.JumpIfFalse(slot, whenFalse);
+                return;
+            }
+            Label skip = emit_.NewLabel();
+            emit_.JumpIfFalse(slot, skip);
+            emit_.Jump(whenFalse);
+            emit_.Bind(skip);
         }
 
         uint32_t Compiler::TruthySlot(const Value& value, const Location& location) {
@@ -2677,6 +2696,13 @@ namespace UdonLuau {
                     for (size_t i = 0; i < args.size(); ++i) value.arguments.push_back(Literal(args[i], m.parameters[i].type, location));
                     return { Value::OfSlot(emit_.Constant(constructed, value), constructed) };
                 }
+            }
+            if (!receiver && args.empty() && IsConstantGetter(*m.ext)) {
+                const Type* t = types_.Get(m.ext->returnType);
+                HeapValue value;
+                value.kind = ValueKind::Construct;
+                value.text = m.ext->signature;
+                return { Value::OfSlot(emit_.Constant(t, value), t) };
             }
             std::vector<uint32_t> inputs;
             size_t argIndex = 0;

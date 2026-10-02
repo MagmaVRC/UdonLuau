@@ -157,6 +157,7 @@ namespace {
         f.Extern("UnityEngineVector3.__Set__SystemSingle_SystemSingle_SystemSingle__SystemVoid", true, [](auto& h, auto& p) {
             h[p[0]] = Vec3{ As<float>(h, p[1]), As<float>(h, p[2]), As<float>(h, p[3]) };
         });
+        f.Extern("UnityEngineVector3.__get_up__UnityEngineVector3", false, [](auto& h, auto& p) { h[p[0]] = Vec3{ 0.0f, 1.0f, 0.0f }; });
         f.Extern("UnityEngineVector3.__get_y__SystemSingle", true, [](auto& h, auto& p) { h[p[1]] = As<Vec3>(h, p[0]).y; });
         f.Extern("UnityEngineVector3.__set_y__SystemSingle", true, [](auto& h, auto& p) { As<Vec3>(h, p[0]).y = As<float>(h, p[1]); });
         f.Extern("UnityEngineVector3.__op_Addition__UnityEngineVector3_UnityEngineVector3__UnityEngineVector3", false, [](auto& h, auto& p) {
@@ -694,6 +695,50 @@ end
         Check(std::ranges::any_of(p->heap, [](const HeapSlot& s) { return s.symbol == "up" && s.value.kind == ValueKind::Construct; }), "struct field initialized at build time");
     });
 
+    Case("static constants are built into the heap", [] {
+        Fixture f = MakeFixture();
+        auto p = Build(f, R"(
+local y: number = 0
+function Start()
+    y = Vector3.up.y
+end
+)");
+        Check(p.has_value(), "compiles");
+        if (!p) return;
+        Machine m(f, *p);
+        m.Run("_start");
+        Check(std::get<float>(m.Var("y")) == 1.0f, "value");
+        Check(m.counters.externs == 1, std::format("Vector3.up read without an extern ({} externs)", m.counters.externs));
+    });
+
+    Case("negated conditions branch without an extern", [] {
+        Fixture f = MakeFixture();
+        auto p = Build(f, R"(
+export local flag = false
+local n = 0
+function Start()
+    if not flag then
+        n += 1
+    end
+    while not flag do
+        n += 1
+        flag = n > 3
+    end
+    local more = true
+    repeat
+        n += 1
+        more = n < 6
+    until not more
+end
+)");
+        Check(p.has_value(), "compiles");
+        if (!p) return;
+        Machine m(f, *p);
+        m.Run("_start");
+        Check(std::get<int32_t>(m.Var("n")) == 6, std::format("result ({})", std::get<int32_t>(m.Var("n"))));
+        Check(std::ranges::none_of(p->heap, [](const HeapSlot& s) { return s.value.text.find("op_UnaryNegation") != std::string::npos; }), "no negation extern");
+    });
+
     Case("switch-style chains become jump tables", [] {
         Fixture f = MakeFixture();
         auto p = Build(f, R"(
@@ -915,7 +960,7 @@ end
 
         auto has = [&](std::string_view text) { return defs.find(text) != std::string::npos; };
         Check(has("declare extern type Vector3 with\n") && has("    y: number\n") && has("    function __add(self, p1: Vector3): Vector3\n"), "struct with fields and operators");
-        Check(has("declare Vector3: {\n    new: (number, number, number) -> Vector3,"), "constructor on the global");
+        Check(has("declare Vector3: {\n") && has("\n    new: (number, number, number) -> Vector3,"), "constructor on the global");
         Check(has("declare extern type Transform extends Component with\n"), "inheritance");
         Check(has("declare extern type UdonBehaviour extends MonoBehaviour with\n") && has("function SendCustomEvent(self, p1: string): ()"), "interface members folded into the class");
         Check(has("declare KeyCode: {\n    Space: KeyCode,\n    Return: KeyCode,\n}"), "enum members");
