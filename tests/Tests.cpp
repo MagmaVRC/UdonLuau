@@ -812,9 +812,10 @@ end
         auto add = std::ranges::find(door.methods, "Add", &ScriptMethod::name);
         auto open = std::ranges::find(door.methods, "Open", &ScriptMethod::name);
         Check(open != door.methods.end() && open->entryPoint == "Open" && open->networkCallable, "network callable method keeps its name");
-        Check(add != door.methods.end() && !add->networkCallable && add->entryPoint == "_Add" && add->parameters.size() == 2 && add->parameters[0].symbol == "__Add_a__param" &&
-                  add->returns.size() == 1 && add->returns[0].symbol == "__Add__ret" && add->returns[0].type == "SystemInt32",
-            "method layout");
+        Check(add != door.methods.end() && !add->networkCallable && add->entryPoint == "__0__Add" && add->parameters.size() == 2 && add->parameters[0].symbol == "__0_a__param" &&
+                  add->parameters[1].symbol == "__0_b__param" && add->returns.size() == 1 && add->returns[0].symbol == "__0___0__Add__ret" &&
+                  add->returns[0].type == "SystemInt32",
+            "method layout matches UdonSharp's naming");
         Check(door.fields.size() == 2 && door.fields[1].name == "speed" && door.fields[1].type == "SystemSingle", "public fields");
         f.catalog.AddScript(door);
 
@@ -845,7 +846,7 @@ end
         for (const NetworkCallable& n : doorProgram->networkCallables)
             if (n.entryPoint == "Hit") hit = &n;
         Check(doorProgram->networkCallables.size() == 2 && hit && hit->maxEventsPerSecond == 10 && hit->parameters.size() == 1 &&
-                  hit->parameters[0].symbol == "__Hit_damage__param" && hit->parameters[0].type == "SystemInt32",
+                  hit->parameters[0].symbol == "__0_damage__param" && hit->parameters[0].type == "SystemInt32",
             "network calling metadata");
         Check(std::get<int32_t>(caller.Var("result")) == 42, "arguments in, result out");
         Check(std::get<float>(doorMachine.Var("speed")) == 5.0f && std::get<float>(caller.Var("speedSeen")) == 5.0f, "fields written and read");
@@ -855,6 +856,34 @@ end
         Check(HasError(f, "-- @networkcallable\nexport function Get(): int\n return 1\nend", "cannot return values"), "network callable methods cannot return");
         Check(HasError(f, "-- @networkcallable\nlocal function Hidden()\nend", "only 'export function'"), "network callable must be public");
         g_machines.clear();
+    });
+
+    Case("UdonSharp-compatible export layout", [] {
+        Fixture f = MakeFixture();
+        CompileResult r = ExtractInterface(f.catalog, R"(
+export function Close(): int
+    return 1
+end
+export function Twice(value: int): int
+    return value * 2
+end
+export function Again(value: int, other: int)
+end
+-- @networkcallable
+export function Ping(value: int)
+end
+)");
+        Check(r.scriptInterface.has_value(), "interface");
+        if (!r.scriptInterface) return;
+        auto method = [&](std::string_view n) { return &*std::ranges::find(r.scriptInterface->methods, n, &ScriptMethod::name); };
+        Check(method("Close")->entryPoint == "_Close" && method("Close")->returns[0].symbol == "__0__Close__ret", "no parameters: _Name, __0__Name__ret");
+        Check(method("Twice")->entryPoint == "__0__Twice" && method("Twice")->parameters[0].symbol == "__0_value__param" &&
+                  method("Twice")->returns[0].symbol == "__0___0__Twice__ret",
+            "parameters: mangled entry");
+        Check(method("Again")->entryPoint == "__0__Again" && method("Again")->parameters[0].symbol == "__1_value__param" &&
+                  method("Again")->parameters[1].symbol == "__0_other__param",
+            "parameter counters are shared across the class in declaration order");
+        Check(method("Ping")->entryPoint == "Ping" && method("Ping")->parameters[0].symbol == "__2_value__param", "network callable keeps its name");
     });
 
     Case("Unity 6 member names", [] {

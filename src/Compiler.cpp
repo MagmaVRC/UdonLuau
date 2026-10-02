@@ -472,6 +472,11 @@ namespace UdonLuau {
             void CompileAssert(AstExprCall* call);
             Value BindLocal(AstLocal* var, const Value& value, const Type* annotated, bool isConst, bool hasValue);
             Value CoerceLiteral(const Value& value, const Type* type, const Location& location);
+            std::string ExportId(const std::string& id) {
+                int& count = exportIds_[id];
+                return std::format("__{}_{}", count++, id);
+            }
+            std::unordered_map<std::string, int> exportIds_;
 
             const Catalog&                                 catalog_;
             TypeTable                                      types_;
@@ -983,7 +988,9 @@ namespace UdonLuau {
                 }
             }
             if (f->exported) {
-                f->entryName = f->event ? "_" + LowerFirst(name) : f->networkCallable ? name : "_" + name;
+                if (f->event) f->entryName = "_" + LowerFirst(name);
+                else if (f->networkCallable) f->entryName = name;
+                else f->entryName = node->args.size ? ExportId("_" + name) : "_" + name;
                 for (const EventInfo* e : catalog_.Events())
                     if (!f->event && "_" + LowerFirst(e->name) == f->entryName)
                         Fail(location, std::format("'{}' would share its entry point with the {} event; rename it", name, e->name));
@@ -1010,7 +1017,7 @@ namespace UdonLuau {
                 } else {
                     if (!arg->annotation) Fail(arg->location, std::format("parameter '{}' needs a type annotation", arg->name.value));
                     type = ResolveType(arg->annotation);
-                    slot = f->exported ? emit_.AddSlot(std::format("__{}_{}__param", name, arg->name.value), type) : emit_.Local(arg->name.value, type);
+                    slot = f->exported ? emit_.AddSlot(ExportId(std::string(arg->name.value) + "__param"), type) : emit_.Local(arg->name.value, type);
                 }
                 variables_[arg] = { slot, type };
                 f->parameters.push_back({ slot, type });
@@ -1020,7 +1027,7 @@ namespace UdonLuau {
                 if (pack->typeList.tailType) Fail(pack->location, "variadic returns are not supported");
                 for (AstType* t : pack->typeList.types) {
                     const Type* type = ResolveType(t);
-                    std::string symbol = f->returns.empty() ? std::format("__{}__ret", name) : std::format("__{}__ret{}", name, f->returns.size());
+                    std::string symbol = f->exported ? ExportId(f->entryName + (f->returns.empty() ? std::string("__ret") : std::format("__ret{}", f->returns.size()))) : std::string();
                     f->returns.push_back(type);
                     f->returnSlots.push_back(f->exported ? emit_.AddSlot(symbol, type) : emit_.Hidden(type));
                 }
