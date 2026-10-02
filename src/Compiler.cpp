@@ -2116,9 +2116,20 @@ namespace UdonLuau {
         }
 
         std::vector<const Method*> Compiler::StaticMethods(const std::vector<const Type*>& owners, std::string_view name) {
+            static constexpr std::pair<std::string_view, std::string_view> kSpellings[] = {
+                { "op_Multiply", "op_Multiplication" },
+                { "op_Modulus", "op_Remainder" },
+                { "op_UnaryNegation", "op_UnaryMinus" },
+            };
+            std::vector<std::string_view> names{ name };
+            for (auto [a, b] : kSpellings) {
+                if (name == a) names.push_back(b);
+                if (name == b) names.push_back(a);
+            }
             std::vector<const Method*> out;
+            for (std::string_view spelling : names)
             for (const Type* owner : owners)
-                for (const Method* m : types_.Methods(owner, name, true, true))
+                for (const Method* m : types_.Methods(owner, spelling, true, true))
                     if (std::ranges::find(out, m) == out.end() &&
                         std::ranges::none_of(out, [&](const Method* o) { return o->ext->parameterText == m->ext->parameterText && o->ext->returnType == m->ext->returnType; }))
                         out.push_back(m);

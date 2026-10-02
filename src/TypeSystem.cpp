@@ -208,6 +208,10 @@ namespace UdonLuau::Detail {
         } else if (ext.returnType != "SystemVoid") {
             method.returnType = Get(ext.returnType);
         }
+        int declared = static_cast<int>(method.parameters.size()) + (ext.returnType == "SystemVoid" ? 0 : 1) + (ext.hasTypeOperand ? 1 : 0);
+        int receiver = ext.parameterCount - declared;
+        if (receiver != 0 && receiver != 1) method.supported = false;
+        method.isStatic = receiver == 0 || ext.isConstructor;
         return methods_.emplace(&ext, std::move(method)).first->second;
     }
 
@@ -224,10 +228,10 @@ namespace UdonLuau::Detail {
             if (!t || !visited.insert(t).second) continue;
 
             for (const ExternInfo* ext : catalog_.FindMethods(t->udonName, name)) {
-                if (ext->isStatic != wantStatic) continue;
-                if (!seen.insert(ext->parameterText + "|" + ext->returnType).second) continue;
                 const Method& m = Describe(*ext);
-                if (m.supported) out.push_back(&m);
+                if (!m.supported || m.isStatic != wantStatic) continue;
+                if (!seen.insert(ext->parameterText + "|" + ext->returnType).second) continue;
+                out.push_back(&m);
             }
 
             if (!inherit) break;

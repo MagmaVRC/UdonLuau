@@ -55,6 +55,7 @@ namespace UdonLuau::Detail {
         const Type*            returnType = nullptr;
         bool                   returnGeneric = false;
         bool                   returnGenericArray = false;
+        bool                   isStatic = true;
         bool                   supported = true;
     };
 

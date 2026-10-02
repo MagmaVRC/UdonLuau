@@ -182,7 +182,9 @@ namespace UdonLuau {
 
         int declared = static_cast<int>(info.parameters.size()) + (info.returnType == "SystemVoid" ? 0 : 1) + (info.hasTypeOperand ? 1 : 0);
         int receiver = parameterCount - declared;
-        if (receiver != 0 && receiver != 1) return false;
+        bool ambiguousSplit = info.parameterText.find('_') != std::string::npos;
+        if (receiver != 0 && receiver != 1 && !ambiguousSplit) return false;
+        if (receiver < 0 || receiver > 1) receiver = 0;
         info.isStatic = receiver == 0 || info.isConstructor;
         if (info.isConstructor && receiver != 0) return false;
         info.parameterCount = parameterCount;

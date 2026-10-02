@@ -62,7 +62,7 @@ namespace {
     void Numeric(Fixture& f, const std::string& name) {
         Binary<T>(f, name, "op_Addition", name, name, [](T a, T b) { return a + b; });
         Binary<T>(f, name, "op_Subtraction", name, name, [](T a, T b) { return a - b; });
-        Binary<T>(f, name, "op_Multiply", name, name, [](T a, T b) { return a * b; });
+        Binary<T>(f, name, "op_Multiplication", name, name, [](T a, T b) { return a * b; });
         Binary<T>(f, name, "op_Division", name, name, [](T a, T b) { return a / b; });
         Binary<T>(f, name, "op_LessThan", name, "SystemBoolean", [](T a, T b) { return a < b; });
         Binary<T>(f, name, "op_LessThanOrEqual", name, "SystemBoolean", [](T a, T b) { return a <= b; });
@@ -70,7 +70,7 @@ namespace {
         Binary<T>(f, name, "op_GreaterThanOrEqual", name, "SystemBoolean", [](T a, T b) { return a >= b; });
         Binary<T>(f, name, "op_Equality", name, "SystemBoolean", [](T a, T b) { return a == b; });
         Binary<T>(f, name, "op_Inequality", name, "SystemBoolean", [](T a, T b) { return a != b; });
-        f.Extern(std::format("{}.__op_UnaryNegation__{}__{}", name, name, name), false, [](std::vector<Cell>& h, const std::vector<uint32_t>& p) { h[p[1]] = static_cast<T>(-As<T>(h, p[0])); });
+        f.Extern(std::format("{}.__op_UnaryMinus__{}__{}", name, name, name), false, [](std::vector<Cell>& h, const std::vector<uint32_t>& p) { h[p[1]] = static_cast<T>(-As<T>(h, p[0])); });
         f.Extern(std::format("{}.__ToString__SystemString", name), true, [](std::vector<Cell>& h, const std::vector<uint32_t>& p) {
             h[p[1]] = std::format("{}", As<T>(h, p[0]));
         });
@@ -105,7 +105,7 @@ namespace {
 
         Numeric<int32_t>(f, "SystemInt32");
         Numeric<float>(f, "SystemSingle");
-        f.Extern("SystemInt32.__op_Modulus__SystemInt32_SystemInt32__SystemInt32", false, [](auto& h, auto& p) { h[p[2]] = As<int32_t>(h, p[0]) % As<int32_t>(h, p[1]); });
+        f.Extern("SystemInt32.__op_Remainder__SystemInt32_SystemInt32__SystemInt32", false, [](auto& h, auto& p) { h[p[2]] = As<int32_t>(h, p[0]) % As<int32_t>(h, p[1]); });
         f.Extern("SystemBoolean.__op_UnaryNegation__SystemBoolean__SystemBoolean", false, [](auto& h, auto& p) { h[p[1]] = !As<bool>(h, p[0]); });
         f.Extern("SystemBoolean.__op_Equality__SystemBoolean_SystemBoolean__SystemBoolean", false, [](auto& h, auto& p) { h[p[2]] = As<bool>(h, p[0]) == As<bool>(h, p[1]); });
         f.Extern("SystemConvert.__ToSingle__SystemInt32__SystemSingle", false, [](auto& h, auto& p) { h[p[1]] = static_cast<float>(As<int32_t>(h, p[0])); });
@@ -702,6 +702,36 @@ end
         Machine dm(f, *d);
         dm.Run("_start");
         Check(f.log.size() == 1 && f.log[0] == "error: r positive", "debug assert logs at run time");
+    });
+
+    Case("real operator spellings and underscored type names", [] {
+        Fixture f = MakeFixture();
+        f.Type("VRC.SDKBase.VRC_Pickup", TypeKind::Class, "UnityEngineComponent");
+        f.Type("TMPro.TMP_Text", TypeKind::Class, "UnityEngineComponent");
+        f.Type("TMPro.TMP_TextInfo", TypeKind::Class);
+        Check(f.catalog.AddExtern("UnityEngineComponent.__Grab__VRCSDKBaseVRC_Pickup__SystemVoid", 2), "underscored parameter accepted");
+        Check(f.catalog.AddExtern("TMProTMP_TextInfo.__ctor__TMProTMP_Text__TMProTMP_TextInfo", 2), "count that only fits after merging accepted");
+        auto p = Build(f, R"(
+export local speed: number = 2
+export local a: int = 17
+export local pickup: VRC_Pickup
+export local label: TMP_Text
+local out: number = 0
+local m = 0
+function Start()
+    out = 10 * speed * speed - -speed
+    m = a % 5
+end
+function Other()
+    transform:Grab(pickup)
+    local info = TMP_TextInfo.new(label)
+end
+)");
+        Check(p.has_value(), "compiles");
+        if (!p) return;
+        Machine m(f, *p);
+        m.Run("_start");
+        Check(std::get<float>(m.Var("out")) == 42.0f && std::get<int32_t>(m.Var("m")) == 2, "op_Multiplication, op_UnaryMinus and op_Remainder used");
     });
 
     Case("diagnostics", [] {
