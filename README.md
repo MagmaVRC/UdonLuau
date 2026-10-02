@@ -43,7 +43,7 @@ Open `UdonLuau.slnx`, choose `Release|x64` and build.
 - Recompiles when a script changes, after a domain reload, and before a world build. A build with script errors is blocked.
 - Reports errors in the console with file and line, so double-clicking opens the script.
 - Draws exported variables with `@header`, `@space`, `@tooltip`, `@range`, `@hideininspector` and `@multiline`.
-- Applies `-- @syncmode(none|manual|continuous)` to the UdonBehaviour.
+- Applies the script's sync mode to the UdonBehaviour, and shows a sync method picker when the mode is `any`.
 - Holds project-wide defines in Project Settings > UdonLuau.
 
 Build `UdonLuau.Native` and copy `UdonLuau.dll` to `Editor/Plugins/x86_64/` in the package. Unity locks native plugins once loaded, so restart the editor to pick up a new build.
@@ -109,6 +109,17 @@ end
 - Module-level `local`s are behaviour variables; their initializers must be constants.
 - `export local` exposes a variable in the inspector, using Luau's export syntax.
 - `-- @sync`, `-- @sync(linear)` and `-- @sync(smooth)` add sync metadata.
+- `-- @syncmode(mode)` at the top of the file sets the behaviour sync mode. It uses UdonSharp's five modes and enforces the same rules at compile time:
+
+  | mode | behaviour | rules |
+  |---|---|---|
+  | `any` (default) | The sync method is picked on the UdonBehaviour | Synced types and interpolation must be supported |
+  | `none` | Sync method None | No synced variables, no `@networkcallable` methods |
+  | `novariablesync` | Follows the other behaviours on the GameObject | No synced variables; network events still work |
+  | `continuous` | Sync method Continuous | No synced arrays |
+  | `manual` | Sync method Manual | No `linear`/`smooth` interpolation |
+
+  Which types can be synced, and which support interpolation, comes from the SDK through the host (`Catalog::AddSyncableType`).
 - Any other `-- @name(args)` annotation directly above a variable is kept on its heap slot for the host, for example `@range(0, 10)`, `@header("Motion")` or `@tooltip("...")`. The compiler does not interpret these; the editor decides what they mean.
 - Functions:
   - A global function named after a VRChat event (`Start`, `Update`, `Interact`, `OnPlayerJoined`, ...) receives that event, with its parameters.

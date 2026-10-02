@@ -95,6 +95,10 @@ namespace {
     Fixture MakeFixture() {
         Fixture f;
         f.catalog.AddStandardEvents();
+        for (auto [type, linear, smooth] : std::initializer_list<std::tuple<const char*, bool, bool>>{
+                 { "SystemInt32", true, true }, { "SystemSingle", true, true }, { "SystemBoolean", false, false },
+                 { "SystemString", false, false }, { "SystemInt32Array", false, false }, { "UnityEngineVector3", true, true } })
+            f.catalog.AddSyncableType(type, linear, smooth);
         f.Type("UnityEngine.Object", TypeKind::Class);
         f.Type("UnityEngine.GameObject", TypeKind::Class, "UnityEngineObject");
         f.Type("UnityEngine.Component", TypeKind::Class, "UnityEngineObject");
@@ -510,7 +514,7 @@ end
         Fixture f = MakeFixture();
         f.Type("Foo.Thing", TypeKind::Class);
         f.Type("Bar.Thing", TypeKind::Class);
-        auto p = Build(f, R"(-- @syncmode(manual)
+        auto p = Build(f, R"(-- @syncmode(continuous)
 
 type UObject = UnityEngine.Object
 local SDKBase = VRC.SDKBase
@@ -546,7 +550,7 @@ end
                      speed->attributes[1].name == "range" && speed->attributes[1].arguments == std::vector<std::string>{ "0", "10" } &&
                      speed->attributes[2].name == "tooltip" && speed->attributes[2].arguments == std::vector<std::string>{ "Degrees, per second" };
         Check(attrs, "attributes passed through in order with parsed arguments");
-        Check(p->attributes.size() == 1 && p->attributes[0].name == "syncmode" && p->attributes[0].arguments == std::vector<std::string>{ "manual" }, "module annotations");
+        Check(p->attributes.size() == 1 && p->attributes[0].name == "syncmode" && p->attributes[0].arguments == std::vector<std::string>{ "continuous" }, "module annotations");
         Check(p->sync.size() == 1 && p->sync[0].symbol == "speed" && p->sync[0].interpolation == SyncInterpolation::Linear, "sync(linear)");
         Check(slot("Object") && slot("Object")->type == "UnityEngineTransform", "variable named Object");
         Check(slot("anyObject") && slot("anyObject")->type == "UnityEngineObject", "Object prefers UnityEngine");
@@ -851,6 +855,26 @@ end
         Check(HasError(f, "-- @networkcallable\nexport function Get(): int\n return 1\nend", "cannot return values"), "network callable methods cannot return");
         Check(HasError(f, "-- @networkcallable\nlocal function Hidden()\nend", "only 'export function'"), "network callable must be public");
         g_machines.clear();
+    });
+
+    Case("behaviour sync modes", [] {
+        Fixture f = MakeFixture();
+        auto mode = [&](std::string_view source) {
+            CompileResult r = Compile(f.catalog, source);
+            return r.program ? static_cast<int>(r.program->syncMode) : -1;
+        };
+        Check(mode("-- @sync(linear)\nexport local f: number = 0") == static_cast<int>(BehaviourSyncMode::Any), "no annotation means any");
+        Check(mode("-- @syncmode(Manual)\n\n-- @sync\nlocal xs: {int} = nil") == static_cast<int>(BehaviourSyncMode::Manual), "manual allows synced arrays");
+        Check(mode("-- @syncmode(novariablesync)\n\n-- @networkcallable\nexport function Ping()\nend") == static_cast<int>(BehaviourSyncMode::NoVariableSync),
+            "novariablesync keeps network events");
+        Check(HasError(f, "-- @syncmode(manual)\n\n-- @sync(linear)\nlocal f: number = 0", "manual sync does not support"), "manual rejects interpolation");
+        Check(HasError(f, "-- @syncmode(continuous)\n\n-- @sync\nlocal xs: {int} = nil", "continuous sync does not support"), "continuous rejects arrays");
+        Check(HasError(f, "-- @syncmode(none)\n\n-- @sync\nlocal x = 0", "sync mode is none"), "none rejects synced variables");
+        Check(HasError(f, "-- @syncmode(novariablesync)\n\n-- @sync\nlocal x = 0", "sync mode is novariablesync"), "novariablesync rejects synced variables");
+        Check(HasError(f, "-- @syncmode(none)\n\n-- @networkcallable\nexport function Ping()\nend", "disables network events"), "none rejects network callable methods");
+        Check(HasError(f, "-- @syncmode(fast)\n\nlocal x = 0", "unknown sync mode"), "unknown mode");
+        Check(HasError(f, "-- @sync(linear)\nlocal b = false", "cannot use linear"), "interpolation needs a type that supports it");
+        Check(HasError(f, "-- @sync\nexport local t: Transform", "Udon does not sync"), "unsyncable type");
     });
 
     Case("diagnostics", [] {
