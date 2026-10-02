@@ -61,6 +61,8 @@ namespace UdonLuau {
             bool                     noInline = false;
             bool                     inlined = false;
             bool                     trampoline = true;
+            bool                     networkCallable = false;
+            int                      maxEventsPerSecond = 0;
         };
 
         constexpr size_t kInlineBudget = 40;
@@ -550,6 +552,12 @@ namespace UdonLuau {
             if (!failed) {
                 result.program = emit_.Finish(std::move(entries_), std::move(sync_));
                 result.program->attributes = ModuleAttributes(parsed.root);
+                for (const auto& f : functions_) {
+                    if (!f->networkCallable) continue;
+                    NetworkCallable n{ f->entryName, f->maxEventsPerSecond, {} };
+                    for (const Variable& p : f->parameters) n.parameters.push_back({ result.program->heap[p.slot].symbol, p.type->udonName });
+                    result.program->networkCallables.push_back(std::move(n));
+                }
             }
             result.diagnostics = std::move(diagnostics_);
             return result;
@@ -687,6 +695,7 @@ namespace UdonLuau {
                 ScriptMethod m;
                 m.name = f->name;
                 m.entryPoint = f->entryName;
+                m.networkCallable = f->networkCallable;
                 for (size_t i = 0; i < f->parameters.size(); ++i)
                     m.parameters.push_back(MakeVariable(f->node->args.data[i]->name.value, f->parameters[i].type, emit_.Slot(f->parameters[i].slot).symbol));
                 for (size_t i = 0; i < f->returns.size(); ++i)
@@ -908,7 +917,28 @@ namespace UdonLuau {
                     Fail(location, std::format("function '{}' is already defined", name));
                 f->exported = true;
                 f->event = catalog_.FindEvent(name);
-                f->entryName = f->event ? "_" + LowerFirst(name) : name;
+            }
+
+            for (const FieldAttribute& a : AnnotationsFor(location).attributes) {
+                if (a.name != "networkcallable") continue;
+                if (!f->exported || f->event) Fail(location, "only 'export function' methods can be @networkcallable");
+                f->networkCallable = true;
+                if (!a.arguments.empty()) {
+                    char* end = nullptr;
+                    long rate = std::strtol(a.arguments[0].c_str(), &end, 10);
+                    if (!end || *end || rate <= 0) Fail(location, "@networkcallable takes the maximum events per second as a positive integer");
+                    f->maxEventsPerSecond = static_cast<int>(rate);
+                }
+            }
+            if (f->exported) {
+                f->entryName = f->event ? "_" + LowerFirst(name) : f->networkCallable ? name : "_" + name;
+                for (const EventInfo* e : catalog_.Events())
+                    if (!f->event && "_" + LowerFirst(e->name) == f->entryName)
+                        Fail(location, std::format("'{}' would share its entry point with the {} event; rename it", name, e->name));
+            }
+            if (f->networkCallable) {
+                if (node->args.size > 8) Fail(location, "network callable methods take at most 8 parameters");
+                if (node->returnAnnotation) Fail(node->returnAnnotation->location, "network callable methods cannot return values");
             }
 
             for (size_t i = 0; i < node->args.size; ++i) {
@@ -2091,15 +2121,30 @@ namespace UdonLuau {
                 std::string_view name = index->index.value;
                 if (receiver.kind == Value::Kind::Network) {
                     std::string entry(name);
+                    std::vector<Value> sent{ Value::OfInteger(receiver.integer, receiver.targetType), Value::OfString(entry) };
                     if (const ScriptInfo* script = receiver.type->script) {
                         auto method = std::ranges::find(script->methods, name, &ScriptMethod::name);
                         if (method == script->methods.end()) Fail(call->location, std::format("{} has no public method '{}'", script->name, name));
-                        if (!method->parameters.empty()) Fail(call->location, std::format("'{}' takes parameters; networked calls cannot pass arguments", name));
-                        entry = method->entryPoint;
+                        if (!method->networkCallable)
+                            Fail(call->location, std::format("{}.{} is not network callable; mark it with '-- @networkcallable'", script->name, name));
+                        if (args.size() != method->parameters.size())
+                            Fail(call->location, std::format("'{}' takes {} argument(s), got {}", name, method->parameters.size(), args.size()));
+                        sent[1] = Value::OfString(method->entryPoint);
+                        for (size_t i = 0; i < args.size(); ++i) {
+                            const Type* type = VariableType(method->parameters[i]);
+                            if (Cost(args[i], type) < 0)
+                                Fail(call->location, std::format("argument {} of '{}' must be {}, got {}", i + 1, name, type->displayName, Describe(args[i])));
+                            Value arg = args[i].IsLiteral() ? Value::OfSlot(Materialize(args[i], type, call->location), type) : args[i];
+                            if (arg.kind == Value::Kind::Slot && arg.type != type && arg.type->IsNumeric() && type->IsNumeric())
+                                arg = Value::OfSlot(Convert(arg.slot, arg.type, type, call->location), type);
+                            sent.push_back(arg);
+                        }
+                    } else {
+                        for (const Value& a : args) sent.push_back(a);
                     }
-                    if (!args.empty()) Fail(call->location, "networked calls cannot pass arguments");
+                    if (sent.size() > 10) Fail(call->location, "networked calls take at most 8 arguments");
                     Value self = Value::OfSlot(receiver.slot, types_.Behaviour());
-                    return CallMember(self, "SendCustomNetworkEvent", { Value::OfInteger(receiver.integer, receiver.targetType), Value::OfString(entry) }, nullptr, call->location);
+                    return CallMember(self, "SendCustomNetworkEvent", sent, nullptr, call->location);
                 }
                 if (receiver.kind == Value::Kind::Slot && receiver.type->script) {
                     const ScriptInfo* script = receiver.type->script;

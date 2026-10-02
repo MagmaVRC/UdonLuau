@@ -70,13 +70,15 @@ namespace UdonLuau {
         std::string symbol;
     };
 
-    /// <summary>A public method of a behaviour script: the entry point SendCustomEvent runs and the
-    /// heap symbols its arguments and results are passed through.</summary>
+    /// <summary>A public method of a behaviour script: the entry point SendCustomEvent runs, the
+    /// heap symbols its arguments and results are passed through, and whether other clients may
+    /// call it over the network.</summary>
     struct ScriptMethod {
         std::string                 name;
         std::string                 entryPoint;
         std::vector<ScriptVariable> parameters;
         std::vector<ScriptVariable> returns;
+        bool                        networkCallable = false;
     };
 
     /// <summary>The public surface of a behaviour script, Luau or UdonSharp.</summary>

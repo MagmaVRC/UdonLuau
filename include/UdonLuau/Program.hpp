@@ -78,6 +78,19 @@ namespace UdonLuau {
         SyncInterpolation interpolation = SyncInterpolation::None;
     };
 
+    struct NetworkParameter {
+        std::string symbol;
+        std::string type;
+    };
+
+    /// <summary>An entry point VRChat may run when another client calls it over the network, with
+    /// the heap symbols its arguments are written to. maxEventsPerSecond is 0 for the SDK default.</summary>
+    struct NetworkCallable {
+        std::string                   entryPoint;
+        int                           maxEventsPerSecond = 0;
+        std::vector<NetworkParameter> parameters;
+    };
+
     /// <summary>A compiled Udon program: code words, heap layout with initial values, exported
     /// entry points, sync metadata and the annotations written at the top of the file. Heap
     /// addresses are indices into heap.</summary>
@@ -86,6 +99,7 @@ namespace UdonLuau {
         std::vector<HeapSlot>     heap;
         std::vector<EntryPoint>   entryPoints;
         std::vector<SyncVariable> sync;
+        std::vector<NetworkCallable> networkCallables;
         std::vector<FieldAttribute> attributes;
         int                       updateOrder = 0;
 
