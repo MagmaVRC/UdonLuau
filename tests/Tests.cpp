@@ -27,6 +27,7 @@ namespace {
     using Impl = std::function<void(std::vector<Cell>&, const std::vector<uint32_t>&)>;
 
     void RunOn(const Cell& behaviour, const std::string& entry);
+    void NetworkRunOn(const Cell& behaviour, const std::string& entry, const std::vector<Cell>& arguments);
     Cell& VarOn(const Cell& behaviour, const std::string& symbol);
 
     struct Fixture {
@@ -171,6 +172,11 @@ namespace {
                 log.push_back(std::format("net:{}:{}", As<int32_t>(h, p[1]), As<std::string>(h, p[2])));
                 RunOn(h[p[0]], As<std::string>(h, p[2]));
             });
+        f.Extern("VRCUdonCommonInterfacesIUdonEventReceiver.__SendCustomNetworkEvent__VRCUdonCommonInterfacesNetworkEventTarget_SystemString_SystemObject__SystemVoid", true,
+            [&log = f.log](auto& h, auto& p) {
+                log.push_back(std::format("net:{}:{}", As<int32_t>(h, p[1]), As<std::string>(h, p[2])));
+                NetworkRunOn(h[p[0]], As<std::string>(h, p[2]), { h[p[3]] });
+            });
         f.Extern("VRCUdonCommonInterfacesIUdonEventReceiver.__SetProgramVariable__SystemString_SystemObject__SystemVoid", true, [](auto& h, auto& p) {
             VarOn(h[p[0]], As<std::string>(h, p[1])) = h[p[2]];
         });
@@ -310,6 +316,18 @@ namespace {
 
     Cell& VarOn(const Cell& behaviour, const std::string& symbol) {
         return g_machines.at(static_cast<size_t>(std::get<BehaviourRef>(behaviour).id))->Var(symbol);
+    }
+
+    void NetworkRunOn(const Cell& behaviour, const std::string& entry, const std::vector<Cell>& arguments) {
+        Machine* target = g_machines.at(static_cast<size_t>(std::get<BehaviourRef>(behaviour).id));
+        for (const NetworkCallable& n : target->program.networkCallables) {
+            if (n.entryPoint != entry) continue;
+            if (n.parameters.size() != arguments.size()) throw std::runtime_error("network argument count mismatch");
+            for (size_t i = 0; i < arguments.size(); ++i) target->Var(n.parameters[i].symbol) = arguments[i];
+            target->Run(entry);
+            return;
+        }
+        throw std::runtime_error("entry is not network callable: " + entry);
     }
 
     int failures = 0;
@@ -476,7 +494,7 @@ end
         Check(p.has_value(), "compiles");
         if (!p) return;
         bool hasEntry = std::ranges::any_of(p->entryPoints, [](const EntryPoint& e) { return e.name == "_onPlayerJoined"; });
-        bool hasCustom = std::ranges::any_of(p->entryPoints, [](const EntryPoint& e) { return e.name == "Ping"; });
+        bool hasCustom = std::ranges::any_of(p->entryPoints, [](const EntryPoint& e) { return e.name == "_Ping"; });
         bool hasParam = std::ranges::any_of(p->heap, [](const HeapSlot& s) { return s.symbol == "onPlayerJoinedPlayer" && s.type == "VRCSDKBaseVRCPlayerApi"; });
         bool keyValue = std::ranges::any_of(p->heap, [](const HeapSlot& s) { return s.symbol == "key" && s.type == "UnityEngineKeyCode" && s.value.integer == 32; });
         Check(hasEntry && hasCustom, "entry points");
@@ -567,7 +585,7 @@ end
         m.Run("_start");
         Check(std::get<int32_t>(m.Var("result")) == 5 && m.counters.externs == 0 && m.counters.indirect == 0,
             std::format("add(2, 3) folded to a constant ({} externs)", m.counters.externs));
-        m.Run("Clamp");
+        m.Run("_Clamp");
         Check(std::get<int32_t>(m.Var("result")) == 50 && m.counters.indirect == 0, "clamp inlined without call overhead");
     });
 
@@ -614,7 +632,7 @@ end
         Machine m(f, *p);
         m.Run("_update");
         Check(m.counters.indirect == 0 && m.counters.copies == 0, std::format("Update: {} indirect, {} copies", m.counters.indirect, m.counters.copies));
-        m.Run("Reset");
+        m.Run("_Reset");
         Check(m.counters.indirect == 1, "an event that is also called keeps its trampoline");
     });
 
@@ -640,7 +658,7 @@ end
         m.Run("_start");
         Check(std::get<int32_t>(m.Var("sum")) == 55, "for result");
         Check(m.counters.jumps == 1 && m.counters.branches == 10, std::format("for: {} jumps, {} branches", m.counters.jumps, m.counters.branches));
-        m.Run("Count");
+        m.Run("_Count");
         Check(std::get<int32_t>(m.Var("k")) == 5, "while result");
         Check(m.counters.jumps == 2 && m.counters.branches == 6, std::format("while: {} jumps, {} branches", m.counters.jumps, m.counters.branches));
     });
@@ -689,7 +707,7 @@ end
         int maxExterns = 0;
         for (int32_t value : { 0, 3, 7, 8, -2 }) {
             m.Var("x") = value;
-            m.Run("Pick");
+            m.Run("_Pick");
             int32_t expected = value >= 0 && value <= 7 ? 10 + value : -1;
             all = all && std::get<int32_t>(m.Var("r")) == expected;
             maxExterns = std::max(maxExterns, m.counters.externs);
@@ -770,8 +788,13 @@ end
         const char* doorSource = R"(
 export local opened = 0
 export local speed: number = 1
+-- @networkcallable
 export function Open()
     opened += 1
+end
+-- @networkcallable(10)
+export function Hit(damage: int)
+    opened += damage
 end
 export function Add(a: int, b: int): int
     return a + b
@@ -783,7 +806,9 @@ end
         ScriptInfo door = *face.scriptInterface;
         door.name = "Door";
         auto add = std::ranges::find(door.methods, "Add", &ScriptMethod::name);
-        Check(add != door.methods.end() && add->entryPoint == "Add" && add->parameters.size() == 2 && add->parameters[0].symbol == "__Add_a__param" &&
+        auto open = std::ranges::find(door.methods, "Open", &ScriptMethod::name);
+        Check(open != door.methods.end() && open->entryPoint == "Open" && open->networkCallable, "network callable method keeps its name");
+        Check(add != door.methods.end() && !add->networkCallable && add->entryPoint == "_Add" && add->parameters.size() == 2 && add->parameters[0].symbol == "__Add_a__param" &&
                   add->returns.size() == 1 && add->returns[0].symbol == "__Add__ret" && add->returns[0].type == "SystemInt32",
             "method layout");
         Check(door.fields.size() == 2 && door.fields[1].name == "speed" && door.fields[1].type == "SystemSingle", "public fields");
@@ -801,6 +826,7 @@ function Start()
     door.speed = 5
     speedSeen = door.speed
     Network.All(door):Open()
+    Network.Owner(door):Hit(7)
 end
 )");
         Check(doorProgram.has_value() && callerProgram.has_value(), "both compile");
@@ -810,12 +836,20 @@ end
         g_machines = { &doorMachine, &caller };
         caller.Var("door") = BehaviourRef{ 0 };
         caller.Run("_start");
-        Check(std::get<int32_t>(doorMachine.Var("opened")) == 2, "Open ran locally and through the network");
+        Check(std::get<int32_t>(doorMachine.Var("opened")) == 9, "Open ran locally and through the network, Hit(7) delivered its argument");
+        const NetworkCallable* hit = nullptr;
+        for (const NetworkCallable& n : doorProgram->networkCallables)
+            if (n.entryPoint == "Hit") hit = &n;
+        Check(doorProgram->networkCallables.size() == 2 && hit && hit->maxEventsPerSecond == 10 && hit->parameters.size() == 1 &&
+                  hit->parameters[0].symbol == "__Hit_damage__param" && hit->parameters[0].type == "SystemInt32",
+            "network calling metadata");
         Check(std::get<int32_t>(caller.Var("result")) == 42, "arguments in, result out");
         Check(std::get<float>(doorMachine.Var("speed")) == 5.0f && std::get<float>(caller.Var("speedSeen")) == 5.0f, "fields written and read");
-        Check(f.log.size() == 1 && f.log[0] == "net:0:Open", "SendCustomNetworkEvent with NetworkEventTarget.All");
+        Check(f.log.size() == 2 && f.log[0] == "net:0:Open" && f.log[1] == "net:1:Hit", "SendCustomNetworkEvent with NetworkEventTarget.All and .Owner");
         Check(HasError(f, "export local door: Door\nfunction Start()\n door:Close()\nend", "no member 'Close'"), "unknown method");
-        Check(HasError(f, "export local door: Door\nfunction Start()\n Network.All(door):Add(1, 2)\nend", "cannot pass arguments"), "networked calls take no arguments");
+        Check(HasError(f, "export local door: Door\nfunction Start()\n Network.All(door):Add(1, 2)\nend", "not network callable"), "unmarked methods cannot be called over the network");
+        Check(HasError(f, "-- @networkcallable\nexport function Get(): int\n return 1\nend", "cannot return values"), "network callable methods cannot return");
+        Check(HasError(f, "-- @networkcallable\nlocal function Hidden()\nend", "only 'export function'"), "network callable must be public");
         g_machines.clear();
     });
 

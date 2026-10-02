@@ -112,7 +112,10 @@ end
 - Any other `-- @name(args)` annotation directly above a variable is kept on its heap slot for the host, for example `@range(0, 10)`, `@header("Motion")` or `@tooltip("...")`. The compiler does not interpret these; the editor decides what they mean.
 - Functions:
   - A global function named after a VRChat event (`Start`, `Update`, `Interact`, `OnPlayerJoined`, ...) receives that event, with its parameters.
-  - `export function Name(...)` is a public method. Other behaviours can call it, and so can `SendCustomEvent("Name")`. Its parameters and results go through the heap symbols `__Name_param__param` and `__Name__ret`.
+  - `export function Name(...)` is a public method that other behaviours can call. Its parameters and results go through the heap symbols `__Name_param__param` and `__Name__ret`. Its entry point is `_Name`, and VRChat never runs entry points starting with `_` for network events, so a public method cannot be triggered by other clients unless marked as below.
+  - `-- @networkcallable` above an `export function` makes it callable over the network. `-- @networkcallable(10)` also sets the rate limit in events per second.
+    - The entry point is then `Name`, and the program carries VRChat's network-calling metadata.
+    - It may take up to 8 parameters, which arrive with the event, and cannot return values.
   - `local function` is private.
   - Parameters and return values need type annotations.
 - `this`, `gameObject` and `transform` refer to the behaviour itself.
@@ -161,7 +164,7 @@ These compile to what Udon understands:
 | `door:Add(2, 40)` | `SetProgramVariable` for each argument, `SendCustomEvent("Add")`, `GetProgramVariable` for the result |
 | `door.speed` | `GetProgramVariable("speed")` |
 | `door.speed = 5` | `SetProgramVariable("speed", 5)` |
-| `Network.All(door):Open()` | `SendCustomNetworkEvent(NetworkEventTarget.All, "Open")`. Any `NetworkEventTarget` member works as the name. |
+| `Network.All(door):Hit(7)` | `SendCustomNetworkEvent(NetworkEventTarget.All, "Hit", 7)`. Any `NetworkEventTarget` member works as the name. Only `@networkcallable` methods are allowed. |
 
 Names, argument counts and types are checked when compiling. Typed references are also usable in arrays (`{Door}`). A plain `UdonBehaviour` still has every SDK member (`SendCustomEvent`, `GetProgramVariable`, ...), and converts to a script type with `behaviour :: Door`.
 
