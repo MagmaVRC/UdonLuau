@@ -39,7 +39,7 @@ Open `UdonLuau.slnx`, choose `Release|x64` and build.
 `unity/com.magma.vrc.udonluau` is the editor integration for VRChat world projects (Windows, Unity 2022.3, VRChat Worlds SDK 3.7+).
 
 - Builds the catalog from the Udon wrapper modules, types and event definitions the editor has loaded.
-- Imports `.luau` files. Assets > Create > VRChat > UdonLuau Script creates a script and its program asset.
+- Imports scripts as `.lua` files (`.luau` is accepted too). Assets > Create > VRChat > UdonLuau Script creates a script and its program asset.
 - Recompiles when a script changes, after a domain reload, and before a world build. A build with script errors is blocked.
 - Reports errors in the console with file and line, so double-clicking opens the script.
 - Draws exported variables with `@header`, `@space`, `@tooltip`, `@range`, `@hideininspector` and `@multiline`.
@@ -56,7 +56,7 @@ Each script also gets:
 
 These generated C# files change only when a script's public interface changes. Other edits recompile just the Luau program, and in play mode the running behaviours are hot-swapped.
 
-Dragging a script onto a GameObject in the Hierarchy, Scene view or Inspector adds it. `.lua` files are treated as UdonLuau scripts unless that is turned off in Project Settings > UdonLuau.
+Dragging a script onto a GameObject in the Hierarchy, Scene view or Inspector adds it. Projects that also contain unrelated `.lua` text files can turn off `.lua` handling in Project Settings > UdonLuau and use `.luau` instead.
 
 ## Usage
 
