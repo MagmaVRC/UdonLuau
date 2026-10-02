@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <new>
+#include <type_traits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -47,6 +48,34 @@ namespace {
         *out = { v.name.c_str(), v.type.c_str(), v.script.c_str(), v.symbol.c_str() };
     }
 
+    template <typename F>
+    auto Guarded(F&& body) noexcept {
+        using R = decltype(body());
+        try {
+            return body();
+        } catch (...) {
+            if constexpr (!std::is_void_v<R>) return R{};
+        }
+    }
+
+    template <typename F>
+    int32_t EditScript(ul_catalog* catalog, const char* script, F&& edit) {
+        if (!catalog || !script) return 0;
+        return Guarded([&]() -> int32_t {
+            const UdonLuau::ScriptInfo* existing = catalog->catalog.FindScript(script);
+            if (!existing) return 0;
+            UdonLuau::ScriptInfo copy = *existing;
+            if (!edit(copy)) return 0;
+            catalog->catalog.AddScript(std::move(copy));
+            return 1;
+        });
+    }
+
+    UdonLuau::ScriptMethod* FindMethod(UdonLuau::ScriptInfo& script, const char* method) {
+        auto it = std::find_if(script.methods.begin(), script.methods.end(), [&](const UdonLuau::ScriptMethod& m) { return m.name == method; });
+        return it == script.methods.end() ? nullptr : &*it;
+    }
+
 } // namespace
 
 extern "C" {
@@ -60,42 +89,48 @@ void ul_catalog_destroy(ul_catalog* catalog) {
 }
 
 void ul_catalog_add_type(ul_catalog* catalog, const char* udon_name, const char* full_name, int32_t kind, const char* base_type, const char* interfaces, const char* element_type) {
-    if (!catalog) return;
-    UdonLuau::TypeInfo t;
-    t.udonName = Str(udon_name);
-    t.fullName = Str(full_name);
-    t.kind = static_cast<UdonLuau::TypeKind>(kind);
-    t.baseType = Str(base_type);
-    t.interfaces = SplitList(interfaces);
-    t.elementType = Str(element_type);
-    catalog->catalog.AddType(std::move(t));
+    if (!catalog || kind < 0 || kind > static_cast<int32_t>(UdonLuau::TypeKind::Array)) return;
+    Guarded([&] {
+        UdonLuau::TypeInfo t;
+        t.udonName = Str(udon_name);
+        t.fullName = Str(full_name);
+        t.kind = static_cast<UdonLuau::TypeKind>(kind);
+        t.baseType = Str(base_type);
+        t.interfaces = SplitList(interfaces);
+        t.elementType = Str(element_type);
+        catalog->catalog.AddType(std::move(t));
+    });
 }
 
 int32_t ul_catalog_add_enum_member(ul_catalog* catalog, const char* udon_name, const char* member, int64_t value) {
     if (!catalog || !udon_name || !member) return 0;
-    const UdonLuau::TypeInfo* existing = catalog->catalog.FindType(udon_name);
-    if (!existing) return 0;
-    UdonLuau::TypeInfo copy = *existing;
-    copy.enumMembers.push_back({ member, value });
-    catalog->catalog.AddType(std::move(copy));
-    return 1;
+    return Guarded([&]() -> int32_t {
+        const UdonLuau::TypeInfo* existing = catalog->catalog.FindType(udon_name);
+        if (!existing) return 0;
+        UdonLuau::TypeInfo copy = *existing;
+        copy.enumMembers.push_back({ member, value });
+        catalog->catalog.AddType(std::move(copy));
+        return 1;
+    });
 }
 
 int32_t ul_catalog_add_extern(ul_catalog* catalog, const char* signature, int32_t parameter_count) {
     if (!catalog || !signature) return 0;
-    return catalog->catalog.AddExtern(signature, parameter_count) ? 1 : 0;
+    return Guarded([&]() -> int32_t { return catalog->catalog.AddExtern(signature, parameter_count) ? 1 : 0; });
 }
 
 void ul_catalog_add_event(ul_catalog* catalog, const char* name, const char* const* parameter_names, const char* const* parameter_types, int32_t parameter_count) {
-    if (!catalog || !name) return;
-    UdonLuau::EventInfo e;
-    e.name = name;
-    for (int32_t i = 0; i < parameter_count; ++i) e.parameters.push_back({ Str(parameter_names[i]), Str(parameter_types[i]) });
-    catalog->catalog.AddEvent(std::move(e));
+    if (!catalog || !name || parameter_count < 0 || (parameter_count > 0 && (!parameter_names || !parameter_types))) return;
+    Guarded([&] {
+        UdonLuau::EventInfo e;
+        e.name = name;
+        for (int32_t i = 0; i < parameter_count; ++i) e.parameters.push_back({ Str(parameter_names[i]), Str(parameter_types[i]) });
+        catalog->catalog.AddEvent(std::move(e));
+    });
 }
 
 void ul_catalog_add_standard_events(ul_catalog* catalog) {
-    if (catalog) catalog->catalog.AddStandardEvents();
+    if (catalog) Guarded([&] { catalog->catalog.AddStandardEvents(); });
 }
 
 const char* ul_catalog_definitions(ul_catalog* catalog) {
@@ -109,58 +144,51 @@ const char* ul_catalog_definitions(ul_catalog* catalog) {
 }
 
 void ul_catalog_add_syncable_type(ul_catalog* catalog, const char* udon_name, int32_t linear, int32_t smooth) {
-    if (catalog && udon_name && *udon_name) catalog->catalog.AddSyncableType(udon_name, linear != 0, smooth != 0);
+    if (catalog && udon_name && *udon_name) Guarded([&] { catalog->catalog.AddSyncableType(udon_name, linear != 0, smooth != 0); });
 }
 
 void ul_catalog_add_script(ul_catalog* catalog, const char* name) {
     if (!catalog || !name || !*name) return;
-    UdonLuau::ScriptInfo script;
-    script.name = name;
-    catalog->catalog.AddScript(std::move(script));
+    Guarded([&] {
+        UdonLuau::ScriptInfo script;
+        script.name = name;
+        catalog->catalog.AddScript(std::move(script));
+    });
 }
 
 int32_t ul_catalog_add_script_field(ul_catalog* catalog, const char* script, const char* name, const char* udon_type, const char* script_type, const char* symbol) {
-    if (!catalog || !script) return 0;
-    const UdonLuau::ScriptInfo* existing = catalog->catalog.FindScript(script);
-    if (!existing) return 0;
-    UdonLuau::ScriptInfo copy = *existing;
-    copy.fields.push_back(MakeVariable(name, udon_type, script_type, symbol));
-    catalog->catalog.AddScript(std::move(copy));
-    return 1;
+    return EditScript(catalog, script, [&](UdonLuau::ScriptInfo& s) {
+        s.fields.push_back(MakeVariable(name, udon_type, script_type, symbol));
+        return true;
+    });
 }
 
 int32_t ul_catalog_add_script_method(ul_catalog* catalog, const char* script, const char* name, const char* entry_point) {
-    if (!catalog || !script || !name) return 0;
-    const UdonLuau::ScriptInfo* existing = catalog->catalog.FindScript(script);
-    if (!existing) return 0;
-    UdonLuau::ScriptInfo copy = *existing;
-    copy.methods.push_back({ name, entry_point ? entry_point : name, {}, {} });
-    catalog->catalog.AddScript(std::move(copy));
-    return 1;
+    if (!name) return 0;
+    return EditScript(catalog, script, [&](UdonLuau::ScriptInfo& s) {
+        s.methods.push_back({ name, entry_point ? entry_point : name, {}, {} });
+        return true;
+    });
 }
 
 int32_t ul_catalog_add_script_method_value(ul_catalog* catalog, const char* script, const char* method, int32_t is_return, const char* name, const char* udon_type, const char* script_type, const char* symbol) {
-    if (!catalog || !script || !method) return 0;
-    const UdonLuau::ScriptInfo* existing = catalog->catalog.FindScript(script);
-    if (!existing) return 0;
-    UdonLuau::ScriptInfo copy = *existing;
-    auto it = std::find_if(copy.methods.begin(), copy.methods.end(), [&](const UdonLuau::ScriptMethod& m) { return m.name == method; });
-    if (it == copy.methods.end()) return 0;
-    (is_return ? it->returns : it->parameters).push_back(MakeVariable(name, udon_type, script_type, symbol));
-    catalog->catalog.AddScript(std::move(copy));
-    return 1;
+    if (!method) return 0;
+    return EditScript(catalog, script, [&](UdonLuau::ScriptInfo& s) {
+        UdonLuau::ScriptMethod* m = FindMethod(s, method);
+        if (!m) return false;
+        (is_return ? m->returns : m->parameters).push_back(MakeVariable(name, udon_type, script_type, symbol));
+        return true;
+    });
 }
 
 int32_t ul_catalog_set_script_method_network_callable(ul_catalog* catalog, const char* script, const char* method, int32_t network_callable) {
-    if (!catalog || !script || !method) return 0;
-    const UdonLuau::ScriptInfo* existing = catalog->catalog.FindScript(script);
-    if (!existing) return 0;
-    UdonLuau::ScriptInfo copy = *existing;
-    auto it = std::find_if(copy.methods.begin(), copy.methods.end(), [&](const UdonLuau::ScriptMethod& m) { return m.name == method; });
-    if (it == copy.methods.end()) return 0;
-    it->networkCallable = network_callable != 0;
-    catalog->catalog.AddScript(std::move(copy));
-    return 1;
+    if (!method) return 0;
+    return EditScript(catalog, script, [&](UdonLuau::ScriptInfo& s) {
+        UdonLuau::ScriptMethod* m = FindMethod(s, method);
+        if (!m) return false;
+        m->networkCallable = network_callable != 0;
+        return true;
+    });
 }
 
 ul_result* ul_extract_interface(const ul_catalog* catalog, const char* source, size_t length, const char* defines) {
@@ -185,7 +213,7 @@ ul_result* ul_extract_interface(const ul_catalog* catalog, const char* source, s
 }
 
 void ul_catalog_set_preferred_namespaces(ul_catalog* catalog, const char* namespaces) {
-    if (catalog) catalog->catalog.SetPreferredNamespaces(SplitList(namespaces));
+    if (catalog) Guarded([&] { catalog->catalog.SetPreferredNamespaces(SplitList(namespaces)); });
 }
 
 ul_result* ul_compile(const ul_catalog* catalog, const char* source, size_t length) {
