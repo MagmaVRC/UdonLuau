@@ -244,8 +244,30 @@ namespace Magma.VRC.UdonLuau
 
             SyncModes.DrawGUI(this, backing, ref dirty);
             DrawInteractionArea(backing);
-            DrawPublicVariables(backing, ref dirty);
+            if (Application.isPlaying) DrawRunningVariables(backing);
+            else DrawPublicVariables(backing, ref dirty);
             DrawMethods();
+        }
+
+        private void DrawRunningVariables(UdonBehaviour backing)
+        {
+            EditorGUILayout.LabelField("Public Variables", EditorStyles.boldLabel);
+            IUdonSymbolTable symbols = program?.SymbolTable;
+            using (new EditorGUI.IndentLevelScope())
+            {
+                if (symbols == null || symbols.GetExportedSymbols().Length == 0)
+                {
+                    EditorGUILayout.LabelField("No public variables.");
+                    return;
+                }
+
+                foreach (string symbol in symbols.GetExportedSymbols())
+                {
+                    bool changed = false;
+                    object value = DrawPublicVariableField(symbol, backing.GetProgramVariable(symbol), symbols.GetSymbolType(symbol), ref changed, true);
+                    if (changed) backing.SetProgramVariable(symbol, value);
+                }
+            }
         }
 
         private void DrawMethods()

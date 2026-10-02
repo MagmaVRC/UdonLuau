@@ -18,9 +18,19 @@ namespace Magma.VRC.UdonLuau
     }
 
     /// <summary>Base of the generated components that stand for UdonLuau scripts. The script runs on a hidden UdonBehaviour linked to this component; the component itself does nothing at run time and is removed from uploaded worlds.</summary>
+    [ExecuteAlways]
     public abstract class UdonLuauBehaviour : MonoBehaviour
     {
         [SerializeField, HideInInspector] private UdonBehaviour backingBehaviour;
+
+        private void OnEnable() => SyncEnabled();
+
+        private void OnDisable() => SyncEnabled();
+
+        private void SyncEnabled()
+        {
+            if (backingBehaviour != null && backingBehaviour.gameObject == gameObject && backingBehaviour.enabled != enabled) backingBehaviour.enabled = enabled;
+        }
 
         /// <summary>The hidden UdonBehaviour that runs the script.</summary>
         public UdonBehaviour BackingBehaviour

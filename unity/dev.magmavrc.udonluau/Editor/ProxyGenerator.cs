@@ -195,6 +195,7 @@ namespace Magma.VRC.UdonLuau
             text.Append(GeneratedHeader);
             text.Append("namespace ").Append(ProxyNamespace).Append("\n{\n");
             text.Append("    [global::Magma.VRC.UdonLuau.UdonLuauScript(\"").Append(guid).Append("\")]\n");
+            text.Append("    [global::UnityEngine.ExecuteAlways]\n");
             text.Append("    [global::UnityEngine.AddComponentMenu(\"UdonLuau/").Append(scriptName.Replace("\"", "")).Append("\")]\n");
             text.Append("    public sealed class ").Append(className).Append(" : global::Magma.VRC.UdonLuau.UdonLuauBehaviour\n    {\n");
 
