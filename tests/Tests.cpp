@@ -19,8 +19,15 @@ namespace {
         float x = 0, y = 0, z = 0;
     };
 
-    using Cell = std::variant<std::monostate, bool, int32_t, uint32_t, int64_t, float, double, std::string, Vec3, std::vector<int32_t>, std::vector<uint32_t>>;
+    struct BehaviourRef {
+        int id = 0;
+    };
+
+    using Cell = std::variant<std::monostate, bool, int32_t, uint32_t, int64_t, float, double, std::string, Vec3, std::vector<int32_t>, std::vector<uint32_t>, BehaviourRef>;
     using Impl = std::function<void(std::vector<Cell>&, const std::vector<uint32_t>&)>;
+
+    void RunOn(const Cell& behaviour, const std::string& entry);
+    Cell& VarOn(const Cell& behaviour, const std::string& symbol);
 
     struct Fixture {
         Catalog                                catalog;
@@ -155,7 +162,21 @@ namespace {
         });
         f.Extern("UnityEngineComponent.__GetComponent__T", true);
         f.Extern("UnityEngineComponent.__GetComponent__SystemType__UnityEngineComponent", true);
-        f.Extern("VRCUdonCommonInterfacesIUdonEventReceiver.__SendCustomEvent__SystemString__SystemVoid", true);
+        f.Type("VRC.Udon.Common.Interfaces.NetworkEventTarget", TypeKind::Enum, {}, {}, { { "All", 0 }, { "Owner", 1 } });
+        f.Extern("VRCUdonCommonInterfacesIUdonEventReceiver.__SendCustomEvent__SystemString__SystemVoid", true, [](auto& h, auto& p) {
+            RunOn(h[p[0]], As<std::string>(h, p[1]));
+        });
+        f.Extern("VRCUdonCommonInterfacesIUdonEventReceiver.__SendCustomNetworkEvent__VRCUdonCommonInterfacesNetworkEventTarget_SystemString__SystemVoid", true,
+            [&log = f.log](auto& h, auto& p) {
+                log.push_back(std::format("net:{}:{}", As<int32_t>(h, p[1]), As<std::string>(h, p[2])));
+                RunOn(h[p[0]], As<std::string>(h, p[2]));
+            });
+        f.Extern("VRCUdonCommonInterfacesIUdonEventReceiver.__SetProgramVariable__SystemString_SystemObject__SystemVoid", true, [](auto& h, auto& p) {
+            VarOn(h[p[0]], As<std::string>(h, p[1])) = h[p[2]];
+        });
+        f.Extern("VRCUdonCommonInterfacesIUdonEventReceiver.__GetProgramVariable__SystemString__SystemObject", true, [](auto& h, auto& p) {
+            h[p[2]] = VarOn(h[p[0]], As<std::string>(h, p[1]));
+        });
         return f;
     }
 
@@ -280,6 +301,16 @@ namespace {
             if (!stack.empty()) throw std::runtime_error(std::format("stack not balanced: {} left", stack.size()));
         }
     };
+
+    std::vector<Machine*> g_machines;
+
+    void RunOn(const Cell& behaviour, const std::string& entry) {
+        g_machines.at(static_cast<size_t>(std::get<BehaviourRef>(behaviour).id))->Run(entry);
+    }
+
+    Cell& VarOn(const Cell& behaviour, const std::string& symbol) {
+        return g_machines.at(static_cast<size_t>(std::get<BehaviourRef>(behaviour).id))->Var(symbol);
+    }
 
     int failures = 0;
 
@@ -438,7 +469,7 @@ local joined = 0
 function OnPlayerJoined(player: VRCPlayerApi)
     joined += 1
 end
-function Ping()
+export function Ping()
     this:SendCustomEvent("Pong")
 end
 )");
@@ -526,7 +557,7 @@ end
 function Start()
     result = add(2, 3)
 end
-function Clamp()
+export function Clamp()
     result = clamp(result + 100, 0, 50)
 end
 )");
@@ -568,7 +599,7 @@ end
         auto p = Build(f, R"(
 local n = 0
 -- @noinline
-function Reset()
+export function Reset()
     n = 0
 end
 function Update()
@@ -597,7 +628,7 @@ function Start()
         sum += i
     end
 end
-function Count()
+export function Count()
     while k < 5 do
         k += 1
     end
@@ -638,7 +669,7 @@ end
         auto p = Build(f, R"(
 export local x: int = 0
 local r = 0
-function Pick()
+export function Pick()
     if x == 0 then r = 10
     elseif x == 1 then r = 11
     elseif x == 2 then r = 12
@@ -722,7 +753,7 @@ function Start()
     out = 10 * speed * speed - -speed
     m = a % 5
 end
-function Other()
+export function Other()
     transform:Grab(pickup)
     local info = TMP_TextInfo.new(label)
 end
@@ -734,10 +765,65 @@ end
         Check(std::get<float>(m.Var("out")) == 42.0f && std::get<int32_t>(m.Var("m")) == 2, "op_Multiplication, op_UnaryMinus and op_Remainder used");
     });
 
+    Case("public methods and typed cross-behaviour calls", [] {
+        Fixture f = MakeFixture();
+        const char* doorSource = R"(
+export local opened = 0
+export local speed: number = 1
+export function Open()
+    opened += 1
+end
+export function Add(a: int, b: int): int
+    return a + b
+end
+)";
+        CompileResult face = ExtractInterface(f.catalog, doorSource);
+        Check(face.scriptInterface.has_value() && !face.program, "interface extracted without compiling bodies");
+        if (!face.scriptInterface) return;
+        ScriptInfo door = *face.scriptInterface;
+        door.name = "Door";
+        auto add = std::ranges::find(door.methods, "Add", &ScriptMethod::name);
+        Check(add != door.methods.end() && add->entryPoint == "Add" && add->parameters.size() == 2 && add->parameters[0].symbol == "__Add_a__param" &&
+                  add->returns.size() == 1 && add->returns[0].symbol == "__Add__ret" && add->returns[0].type == "SystemInt32",
+            "method layout");
+        Check(door.fields.size() == 2 && door.fields[1].name == "speed" && door.fields[1].type == "SystemSingle", "public fields");
+        f.catalog.AddScript(door);
+
+        auto doorProgram = Build(f, doorSource);
+        auto callerProgram = Build(f, R"(
+export local door: Door
+export local doors: {Door}
+local result = 0
+local speedSeen: number = 0
+function Start()
+    door:Open()
+    result = door:Add(2, 40)
+    door.speed = 5
+    speedSeen = door.speed
+    Network.All(door):Open()
+end
+)");
+        Check(doorProgram.has_value() && callerProgram.has_value(), "both compile");
+        if (!doorProgram || !callerProgram) return;
+        Machine doorMachine(f, *doorProgram);
+        Machine caller(f, *callerProgram);
+        g_machines = { &doorMachine, &caller };
+        caller.Var("door") = BehaviourRef{ 0 };
+        caller.Run("_start");
+        Check(std::get<int32_t>(doorMachine.Var("opened")) == 2, "Open ran locally and through the network");
+        Check(std::get<int32_t>(caller.Var("result")) == 42, "arguments in, result out");
+        Check(std::get<float>(doorMachine.Var("speed")) == 5.0f && std::get<float>(caller.Var("speedSeen")) == 5.0f, "fields written and read");
+        Check(f.log.size() == 1 && f.log[0] == "net:0:Open", "SendCustomNetworkEvent with NetworkEventTarget.All");
+        Check(HasError(f, "export local door: Door\nfunction Start()\n door:Close()\nend", "no member 'Close'"), "unknown method");
+        Check(HasError(f, "export local door: Door\nfunction Start()\n Network.All(door):Add(1, 2)\nend", "cannot pass arguments"), "networked calls take no arguments");
+        g_machines.clear();
+    });
+
     Case("diagnostics", [] {
         Fixture f = MakeFixture();
         Check(HasError(f, "function Start() transform:Nope() end", "has no member 'Nope'"), "unknown member");
-        Check(HasError(f, "function A() B() end\nfunction B() A() end", "recursion"), "recursion");
+        Check(HasError(f, "export function A()\n A()\nend", "recursion"), "recursion");
+        Check(HasError(f, "function Helper() end", "not an Udon event"), "plain global functions must be events");
         Check(HasError(f, "local x: int = \"s\"", "cannot initialize"), "type mismatch");
         Check(HasError(f, "function Start() undefinedThing = 1 end", "unknown variable"), "undeclared global");
         Check(HasError(f, "function Start() local v = transform.position end", "no member 'position'"), "missing property");
