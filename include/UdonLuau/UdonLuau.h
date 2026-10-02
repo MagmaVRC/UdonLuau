@@ -52,6 +52,7 @@ typedef struct ul_heap_value {
     int32_t     argument_count;
 } ul_heap_value;
 
+/// <summary>A compiler message. Lines and columns are zero-based; the end is exclusive.</summary>
 typedef struct ul_diagnostic {
     int32_t     is_warning;
     int32_t     line;
