@@ -251,8 +251,8 @@ namespace UdonLuau {
         std::string Generator::Run() {
             out_ += "--!nocheck\n\n";
             for (std::string_view alias : { "int", "uint", "long", "ulong", "short", "ushort", "byte", "sbyte", "char", "float", "double" })
-                out_ += std::format("type {} = number\n", alias);
-            out_ += "type object = any\n\n";
+                out_ += std::format("export type {} = number\n", alias);
+            out_ += "export type object = any\n\n";
 
             Collect();
             const Type* behaviour = types_.Behaviour();
