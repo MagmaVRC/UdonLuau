@@ -1,0 +1,28 @@
+{
+    "name": "Magma.VRC.UdonLuau.Editor",
+    "rootNamespace": "Magma.VRC.UdonLuau",
+    "references": [
+        "VRC.Udon",
+        "VRC.Udon.Editor"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": true,
+    "precompiledReferences": [
+        "VRC.Udon.Common.dll",
+        "VRC.Udon.EditorBindings.dll",
+        "VRC.Udon.Graph.dll",
+        "VRC.Udon.UAssembly.dll",
+        "VRCSDKBase.dll",
+        "VRCSDKBase-Editor.dll",
+        "VRCSDK3.dll",
+        "System.Collections.Immutable.dll"
+    ],
+    "autoReferenced": false,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

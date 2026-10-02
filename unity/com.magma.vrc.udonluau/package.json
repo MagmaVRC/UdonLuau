@@ -1,0 +1,13 @@
+{
+  "name": "com.magma.vrc.udonluau",
+  "displayName": "UdonLuau",
+  "version": "0.1.0",
+  "unity": "2022.3",
+  "description": "Write VRChat Udon behaviours in Luau. Compiles .luau scripts to Udon programs against the externs the installed SDK exposes.",
+  "author": {
+    "name": "Magma"
+  },
+  "vpmDependencies": {
+    "com.vrchat.worlds": ">=3.7.0"
+  }
+}
