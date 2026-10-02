@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <ProjectGuid>{05A99680-0B68-4D46-9052-CCC34EFEDFB1}</ProjectGuid>
+    <RootNamespace>LuauAst</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <PlatformToolset>$(DefaultPlatformToolset)</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="UdonLuau.props" />
+  </ImportGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <SDLCheck>false</SDLCheck>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="$(LuauRoot)Common\src\BytecodeWire.cpp" />
+    <ClCompile Include="$(LuauRoot)Common\src\StringUtils.cpp" />
+    <ClCompile Include="$(LuauRoot)Common\src\TimeTrace.cpp" />
+    <ClCompile Include="$(LuauRoot)Ast\src\Allocator.cpp" />
+    <ClCompile Include="$(LuauRoot)Ast\src\Ast.cpp" />
+    <ClCompile Include="$(LuauRoot)Ast\src\Confusables.cpp" />
+    <ClCompile Include="$(LuauRoot)Ast\src\Cst.cpp" />
+    <ClCompile Include="$(LuauRoot)Ast\src\Lexer.cpp" />
+    <ClCompile Include="$(LuauRoot)Ast\src\Location.cpp" />
+    <ClCompile Include="$(LuauRoot)Ast\src\Parser.cpp" />
+    <ClCompile Include="$(LuauRoot)Ast\src\PrettyPrinter.cpp" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <ProjectGuid>{BB60234B-C235-4A13-B53E-5D86F76FD6F3}</ProjectGuid>
+    <RootNamespace>UdonLuauCore</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <PlatformToolset>$(DefaultPlatformToolset)</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="UdonLuau.props" />
+  </ImportGroup>
+  <ItemGroup>
+    <ClInclude Include="..\include\UdonLuau\Catalog.hpp" />
+    <ClInclude Include="..\include\UdonLuau\Compiler.hpp" />
+    <ClInclude Include="..\include\UdonLuau\Program.hpp" />
+    <ClInclude Include="..\src\Emitter.hpp" />
+    <ClInclude Include="..\src\TypeSystem.hpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="..\src\Catalog.cpp" />
+    <ClCompile Include="..\src\Compiler.cpp" />
+    <ClCompile Include="..\src\Emitter.cpp" />
+    <ClCompile Include="..\src\Program.cpp" />
+    <ClCompile Include="..\src\TypeSystem.cpp" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

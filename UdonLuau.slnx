@@ -1,0 +1,13 @@
+<Solution>
+  <Configurations>
+    <BuildType Name="Debug" />
+    <BuildType Name="Release" />
+    <Platform Name="x64" />
+  </Configurations>
+  <Folder Name="/extern/">
+    <Project Path="projects/Luau.Ast.vcxproj" Id="05a99680-0b68-4d46-9052-ccc34efedfb1" />
+  </Folder>
+  <Project Path="projects/UdonLuau.Core.vcxproj" Id="bb60234b-c235-4a13-b53e-5d86f76fd6f3" />
+  <Project Path="projects/UdonLuau.Native.vcxproj" Id="9b575e6d-1daa-47b5-8456-fdf9c1840b98" />
+  <Project Path="projects/UdonLuau.Tests.vcxproj" Id="924c84fc-5b51-42fb-9698-da4c247b0929" />
+</Solution>
