@@ -3,7 +3,10 @@
     "rootNamespace": "Magma.VRC.UdonLuau",
     "references": [
         "VRC.Udon",
-        "VRC.Udon.Editor"
+        "VRC.Udon.Editor",
+        "UdonSharp.Editor",
+        "UdonSharp.Runtime",
+        "Magma.VRC.UdonLuau.Runtime"
     ],
     "includePlatforms": [
         "Editor"

@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
+using VRC.SDK3.UdonNetworkCalling;
 using VRC.Udon.Common;
 using VRC.Udon.Common.Interfaces;
 
@@ -34,6 +36,14 @@ namespace Magma.VRC.UdonLuau
         public List<LuauAnnotation> annotations = new List<LuauAnnotation>();
     }
 
+    /// <summary>An exported variable that holds a typed reference to a behaviour script.</summary>
+    [Serializable]
+    public class LuauScriptReference
+    {
+        public string symbol;
+        public string script;
+    }
+
     /// <summary>Everything a compilation produced.</summary>
     public sealed class LuauCompileResult
     {
@@ -43,6 +53,17 @@ namespace Magma.VRC.UdonLuau
         public readonly List<LuauDiagnostic> Diagnostics = new List<LuauDiagnostic>();
         public readonly List<LuauFieldAnnotations> Fields = new List<LuauFieldAnnotations>();
         public readonly List<LuauAnnotation> ModuleAnnotations = new List<LuauAnnotation>();
+        public readonly List<LuauScriptReference> ScriptReferences = new List<LuauScriptReference>();
+        public readonly List<NetworkCallingEntrypointMetadata> NetworkCallables = new List<NetworkCallingEntrypointMetadata>();
+
+        /// <summary>Max events per second declared with @networkcallable(n) by entry point; 0 means the SDK default.</summary>
+        public readonly Dictionary<string, int> NetworkRates = new Dictionary<string, int>();
+
+        /// <summary>The script's public fields and methods.</summary>
+        public ScriptInterface Interface = new ScriptInterface();
+
+        /// <summary>The sync mode the script declares with @syncmode.</summary>
+        public UdonSharp.BehaviourSyncMode SyncMode = UdonSharp.BehaviourSyncMode.Any;
 
         /// <summary>The compiler's readable listing of the program.</summary>
         public string Disassembly = "";
@@ -57,9 +78,13 @@ namespace Magma.VRC.UdonLuau
     public static class LuauCompiler
     {
         private const int MinimumHeapSize = 512;
+        private const string TypeIdSymbol = "__refl_typeid";
+        private const string TypeNameSymbol = "__refl_typename";
 
         /// <summary>Compiles Luau source against the editor's catalog and builds the Udon program.</summary>
-        public static LuauCompileResult Compile(string source)
+        /// <param name="source">The Luau source.</param>
+        /// <param name="scriptName">The script's name; when given, the program carries UdonSharp's type identity for the script's generated class.</param>
+        public static LuauCompileResult Compile(string source, string scriptName = null)
         {
             var output = new LuauCompileResult();
             LuauCatalog catalog = LuauCatalog.Current;
@@ -86,12 +111,18 @@ namespace Magma.VRC.UdonLuau
 
             if (Native.ul_result_succeeded(result) == 0) return output;
 
+            output.Interface = ScriptRegistry.ReadInterface(result, scriptName);
+            foreach (ScriptVariable field in output.Interface.Fields)
+                if (!string.IsNullOrEmpty(field.Script)) output.ScriptReferences.Add(new LuauScriptReference { symbol = field.Symbol, script = field.Script });
+            if (Native.ul_result_sync_mode != null) output.SyncMode = (UdonSharp.BehaviourSyncMode)Native.ul_result_sync_mode(result);
             output.ModuleAnnotations.AddRange(ReadAnnotations(result, -1));
             output.Disassembly = Native.Read(Native.ul_result_disassembly(result)) ?? "";
 
             try
             {
-                output.Program = new ProgramBuilder(catalog, result, output).Build();
+                ReadNetworkCallables(catalog, result, output);
+                string typeName = scriptName == null ? null : ProxyGenerator.UdonSharpTypeName(scriptName);
+                output.Program = new ProgramBuilder(catalog, result, output, typeName).Build();
             }
             catch (Exception e)
             {
@@ -101,23 +132,34 @@ namespace Magma.VRC.UdonLuau
             return output;
         }
 
-        private static bool _definesUnsupported;
-
         private static ResultHandle Invoke(LuauCatalog catalog, byte[] source, string defines)
         {
-            if (!_definesUnsupported)
+            IntPtr result = Native.ul_compile_with_defines != null
+                ? Native.ul_compile_with_defines(catalog.Handle, source, (UIntPtr)source.Length, Native.Utf8(defines ?? ""))
+                : Native.ul_compile(catalog.Handle, source, (UIntPtr)source.Length);
+            return new ResultHandle(result);
+        }
+
+        private static void ReadNetworkCallables(LuauCatalog catalog, ResultHandle result, LuauCompileResult output)
+        {
+            if (Native.ul_result_network_count == null) return;
+            int count = Native.ul_result_network_count(result);
+            for (int i = 0; i < count; i++)
             {
-                try
+                if (Native.ul_result_network(result, i, out NativeNetworkCallable callable) == 0) continue;
+                var parameters = new NetworkCallingParameterMetadata[callable.ParameterCount];
+                for (int j = 0; j < parameters.Length; j++)
                 {
-                    return Native.ul_compile_with_defines(catalog.Handle, source, (UIntPtr)source.Length, Native.Utf8(defines ?? ""));
+                    if (Native.ul_result_network_parameter(result, i, j, out NativeNetworkParameter p) == 0) throw new InvalidOperationException($"network parameter {j} is missing");
+                    string typeName = Native.Read(p.Type);
+                    Type type = catalog.ResolveType(typeName) ?? throw new InvalidOperationException($"unknown network parameter type '{typeName}'");
+                    parameters[j] = new NetworkCallingParameterMetadata(Native.Read(p.Symbol), type);
                 }
-                catch (EntryPointNotFoundException)
-                {
-                    _definesUnsupported = true;
-                    UnityEngine.Debug.LogWarning("[UdonLuau] The loaded native compiler does not support defines; restart the editor after updating UdonLuau.dll.");
-                }
+                var attribute = callable.MaxEventsPerSecond > 0 ? new NetworkCallableAttribute(callable.MaxEventsPerSecond) : new NetworkCallableAttribute();
+                string entry = Native.Read(callable.EntryPoint);
+                output.NetworkCallables.Add(new NetworkCallingEntrypointMetadata(entry, attribute, parameters));
+                output.NetworkRates[entry] = callable.MaxEventsPerSecond;
             }
-            return Native.ul_compile(catalog.Handle, source, (UIntPtr)source.Length);
         }
 
         internal static List<LuauAnnotation> ReadAnnotations(ResultHandle result, int address)
@@ -140,11 +182,14 @@ namespace Magma.VRC.UdonLuau
             private readonly ResultHandle _result;
             private readonly LuauCompileResult _output;
 
-            public ProgramBuilder(LuauCatalog catalog, ResultHandle result, LuauCompileResult output)
+            private readonly string _reflectionTypeName;
+
+            public ProgramBuilder(LuauCatalog catalog, ResultHandle result, LuauCompileResult output, string reflectionTypeName)
             {
                 _catalog = catalog;
                 _result = result;
                 _output = output;
+                _reflectionTypeName = reflectionTypeName;
             }
 
             public IUdonProgram Build()
@@ -154,7 +199,7 @@ namespace Magma.VRC.UdonLuau
                 if (code != IntPtr.Zero) Marshal.Copy(code, byteCode, 0, byteCode.Length);
 
                 int slotCount = Native.ul_result_heap_count(_result);
-                var heap = new UdonHeap((uint)Math.Max(slotCount, MinimumHeapSize));
+                var heap = new UdonHeap((uint)Math.Max(slotCount + 2, MinimumHeapSize));
                 var symbols = new List<IUdonSymbol>(slotCount);
                 var exported = new List<string>();
 
@@ -172,6 +217,14 @@ namespace Magma.VRC.UdonLuau
 
                     var annotations = ReadAnnotations(_result, address);
                     if (annotations.Count > 0) _output.Fields.Add(new LuauFieldAnnotations { symbol = symbol, annotations = annotations });
+                }
+
+                if (_reflectionTypeName != null && symbols.All(s => s.Name != TypeIdSymbol && s.Name != TypeNameSymbol))
+                {
+                    heap.SetHeapVariable((uint)slotCount, UdonSharp.Internal.UdonSharpInternalUtility.GetTypeID(_reflectionTypeName), typeof(long));
+                    symbols.Add(new UdonSymbol(TypeIdSymbol, typeof(long), (uint)slotCount));
+                    heap.SetHeapVariable((uint)slotCount + 1, _reflectionTypeName, typeof(string));
+                    symbols.Add(new UdonSymbol(TypeNameSymbol, typeof(string), (uint)slotCount + 1));
                 }
 
                 var entries = new List<IUdonSymbol>();

@@ -1,7 +1,11 @@
 using System;
+using System.ComponentModel;
+using System.IO;
+using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
-using Microsoft.Win32.SafeHandles;
+using UnityEditor;
 
 namespace Magma.VRC.UdonLuau
 {
@@ -87,118 +91,269 @@ namespace Magma.VRC.UdonLuau
         public int Interpolation;
     }
 
-    internal sealed class CatalogHandle : SafeHandleZeroOrMinusOneIsInvalid
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct NativeScriptVariable
     {
-        public CatalogHandle() : base(true) { }
-
-        protected override bool ReleaseHandle()
-        {
-            Native.ul_catalog_destroy(handle);
-            return true;
-        }
+        public IntPtr Name;
+        public IntPtr Type;
+        public IntPtr Script;
+        public IntPtr Symbol;
     }
 
-    internal sealed class ResultHandle : SafeHandleZeroOrMinusOneIsInvalid
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct NativeScriptMethod
     {
-        public ResultHandle() : base(true) { }
-
-        protected override bool ReleaseHandle()
-        {
-            Native.ul_result_destroy(handle);
-            return true;
-        }
+        public IntPtr Name;
+        public IntPtr EntryPoint;
+        public int ParameterCount;
+        public int ReturnCount;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct NativeNetworkCallable
+    {
+        public IntPtr EntryPoint;
+        public int MaxEventsPerSecond;
+        public int ParameterCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct NativeNetworkParameter
+    {
+        public IntPtr Symbol;
+        public IntPtr Type;
+    }
+
+    internal abstract class NativeHandle : IDisposable
+    {
+        private readonly int _generation;
+
+        protected NativeHandle(IntPtr ptr)
+        {
+            Ptr = ptr;
+            _generation = Native.Generation;
+        }
+
+        public IntPtr Ptr { get; private set; }
+
+        public bool IsInvalid => Ptr == IntPtr.Zero;
+
+        public static implicit operator IntPtr(NativeHandle handle) => handle?.Ptr ?? IntPtr.Zero;
+
+        public void Dispose()
+        {
+            if (Ptr != IntPtr.Zero && Native.IsLoaded && Native.Generation == _generation) Release(Ptr);
+            Ptr = IntPtr.Zero;
+        }
+
+        protected abstract void Release(IntPtr ptr);
+    }
+
+    internal sealed class CatalogHandle : NativeHandle
+    {
+        public CatalogHandle(IntPtr ptr) : base(ptr) { }
+
+        protected override void Release(IntPtr ptr) => Native.ul_catalog_destroy(ptr);
+    }
+
+    internal sealed class ResultHandle : NativeHandle
+    {
+        public ResultHandle(IntPtr ptr) : base(ptr) { }
+
+        protected override void Release(IntPtr ptr) => Native.ul_result_destroy(ptr);
+    }
+
+    /// <summary>Loads a private copy of UdonLuau.dll so a new build can replace the package's file while the editor runs.</summary>
+    [InitializeOnLoad]
     internal static class Native
     {
-        private const string Library = "UdonLuau";
+        private const string PluginGuid = "4963dd02733f4afaa9b4be0e79713c81";
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate IntPtr Create();
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate void Destroy(IntPtr handle);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate void AddType(IntPtr catalog, byte[] udonName, byte[] fullName, int kind, byte[] baseType, byte[] interfaces, byte[] elementType);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int AddEnumMember(IntPtr catalog, byte[] udonName, byte[] member, long value);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int AddExtern(IntPtr catalog, byte[] signature, int parameterCount);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate void AddEvent(IntPtr catalog, byte[] name, IntPtr[] parameterNames, IntPtr[] parameterTypes, int parameterCount);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate void CatalogText(IntPtr catalog, byte[] text);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int AddScriptField(IntPtr catalog, byte[] script, byte[] name, byte[] udonType, byte[] scriptType, byte[] symbol);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int AddScriptMethod(IntPtr catalog, byte[] script, byte[] name, byte[] entryPoint);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int AddScriptMethodValue(IntPtr catalog, byte[] script, byte[] method, int isReturn, byte[] name, byte[] udonType, byte[] scriptType, byte[] symbol);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate void AddSyncableType(IntPtr catalog, byte[] udonName, int linear, int smooth);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int SetScriptMethodFlag(IntPtr catalog, byte[] script, byte[] method, int value);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int GetNetworkCallable(IntPtr result, int index, out NativeNetworkCallable callable);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int GetNetworkParameter(IntPtr result, int index, int parameter, out NativeNetworkParameter value);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate IntPtr CompileSource(IntPtr catalog, byte[] source, UIntPtr length);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate IntPtr CompileWithDefines(IntPtr catalog, byte[] source, UIntPtr length, byte[] defines);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int ResultInt(IntPtr result);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int ResultAt(IntPtr result, int index);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate IntPtr ResultText(IntPtr result);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int GetDiagnostic(IntPtr result, int index, out NativeDiagnostic diagnostic);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate IntPtr GetBytecode(IntPtr result, out UIntPtr length);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int GetHeapSlot(IntPtr result, int address, out NativeHeapSlot slot);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int GetHeapArgument(IntPtr result, int address, int index, out NativeHeapValue value);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int GetAttribute(IntPtr result, int address, int index, out NativeAttribute attribute);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate IntPtr GetAttributeArgument(IntPtr result, int address, int index, int argument);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int GetEntry(IntPtr result, int index, out NativeEntryPoint entry);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int GetSync(IntPtr result, int index, out NativeSyncVariable variable);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int GetInterfaceField(IntPtr result, int index, out NativeScriptVariable variable);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int GetInterfaceMethod(IntPtr result, int index, out NativeScriptMethod method);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int GetInterfaceMethodValue(IntPtr result, int method, int isReturn, int index, out NativeScriptVariable variable);
+
+        public static Create ul_catalog_create;
+        public static Destroy ul_catalog_destroy;
+        public static AddType ul_catalog_add_type;
+        public static AddEnumMember ul_catalog_add_enum_member;
+        public static AddExtern ul_catalog_add_extern;
+        public static AddEvent ul_catalog_add_event;
+        public static Destroy ul_catalog_add_standard_events;
+        public static CatalogText ul_catalog_set_preferred_namespaces;
+        public static CatalogText ul_catalog_add_script;
+        public static AddScriptField ul_catalog_add_script_field;
+        public static AddScriptMethod ul_catalog_add_script_method;
+        public static AddScriptMethodValue ul_catalog_add_script_method_value;
+        public static SetScriptMethodFlag ul_catalog_set_script_method_network_callable;
+        public static AddSyncableType ul_catalog_add_syncable_type;
+        public static ResultInt ul_result_sync_mode;
+        public static ResultAt ul_result_interface_method_network_callable;
+        public static ResultInt ul_result_network_count;
+        public static GetNetworkCallable ul_result_network;
+        public static GetNetworkParameter ul_result_network_parameter;
+        public static CompileWithDefines ul_extract_interface;
+        public static CompileSource ul_compile;
+        public static CompileWithDefines ul_compile_with_defines;
+        public static Destroy ul_result_destroy;
+        public static ResultInt ul_result_succeeded;
+        public static ResultInt ul_result_diagnostic_count;
+        public static GetDiagnostic ul_result_diagnostic;
+        public static GetBytecode ul_result_bytecode;
+        public static ResultInt ul_result_heap_count;
+        public static GetHeapSlot ul_result_heap_slot;
+        public static ResultAt ul_result_heap_argument_count;
+        public static GetHeapArgument ul_result_heap_argument;
+        public static ResultAt ul_result_attribute_count;
+        public static GetAttribute ul_result_attribute;
+        public static GetAttributeArgument ul_result_attribute_argument;
+        public static ResultInt ul_result_entry_count;
+        public static GetEntry ul_result_entry;
+        public static ResultInt ul_result_sync_count;
+        public static GetSync ul_result_sync;
+        public static ResultInt ul_result_update_order;
+        public static ResultInt ul_result_has_interface;
+        public static ResultInt ul_result_interface_field_count;
+        public static GetInterfaceField ul_result_interface_field;
+        public static ResultInt ul_result_interface_method_count;
+        public static GetInterfaceMethod ul_result_interface_method;
+        public static GetInterfaceMethodValue ul_result_interface_method_value;
+        public static ResultText ul_result_disassembly;
+
+        private static IntPtr _module;
+
+        static Native()
+        {
+            AssemblyReloadEvents.beforeAssemblyReload += Unload;
+            EditorApplication.quitting += Unload;
+        }
+
+        public static int Generation { get; private set; }
+
+        public static bool IsLoaded => _module != IntPtr.Zero;
+
+        /// <summary>The private copy that is loaded, or null.</summary>
+        public static string LoadedPath { get; private set; }
+
+        public static event Action Unloading;
 
         public static byte[] Utf8(string text) => text == null ? null : Encoding.UTF8.GetBytes(text + "\0");
 
         public static string Read(IntPtr text) => text == IntPtr.Zero ? null : Marshal.PtrToStringUTF8(text);
 
-        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
-        public static extern CatalogHandle ul_catalog_create();
+        /// <summary>Copies the package's UdonLuau.dll under Library/UdonLuau and binds its exports.</summary>
+        /// <exception cref="DllNotFoundException">The library is missing, cannot be loaded or lacks a required export.</exception>
+        public static void Load()
+        {
+            if (IsLoaded) return;
 
-        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void ul_catalog_destroy(IntPtr catalog);
+            string source = LocateLibrary();
+            if (source == null || !File.Exists(source)) throw new DllNotFoundException($"UdonLuau.dll was not found at {source ?? "the package's Editor/Plugins/x86_64 folder"}");
 
-        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void ul_catalog_add_type(CatalogHandle catalog, byte[] udonName, byte[] fullName, int kind, byte[] baseType, byte[] interfaces, byte[] elementType);
+            byte[] bytes = File.ReadAllBytes(source);
+            string hash;
+            using (var sha = SHA256.Create()) hash = BitConverter.ToString(sha.ComputeHash(bytes), 0, 8).Replace("-", "");
 
-        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int ul_catalog_add_enum_member(CatalogHandle catalog, byte[] udonName, byte[] member, long value);
+            string folder = Path.GetFullPath(Path.Combine("Library", "UdonLuau"));
+            Directory.CreateDirectory(folder);
+            string copy = Path.Combine(folder, $"UdonLuau-{hash}.dll");
+            if (!File.Exists(copy)) File.WriteAllBytes(copy, bytes);
+            DeleteStaleCopies(folder, copy);
 
-        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int ul_catalog_add_extern(CatalogHandle catalog, byte[] signature, int parameterCount);
+            IntPtr module = LoadLibraryW(copy);
+            if (module == IntPtr.Zero) throw new DllNotFoundException($"{copy} could not be loaded: {new Win32Exception(Marshal.GetLastWin32Error()).Message}");
 
-        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void ul_catalog_add_event(CatalogHandle catalog, byte[] name, IntPtr[] parameterNames, IntPtr[] parameterTypes, int parameterCount);
+            foreach (FieldInfo field in typeof(Native).GetFields(BindingFlags.Public | BindingFlags.Static))
+            {
+                if (!field.Name.StartsWith("ul_", StringComparison.Ordinal)) continue;
+                IntPtr export = GetProcAddress(module, field.Name);
+                field.SetValue(null, export == IntPtr.Zero ? null : Marshal.GetDelegateForFunctionPointer(export, field.FieldType));
+            }
 
-        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void ul_catalog_add_standard_events(CatalogHandle catalog);
+            if (ul_catalog_create == null || ul_compile == null || ul_result_destroy == null)
+            {
+                FreeLibrary(module);
+                throw new DllNotFoundException($"{source} does not export the UdonLuau C API");
+            }
 
-        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void ul_catalog_set_preferred_namespaces(CatalogHandle catalog, byte[] namespaces);
+            _module = module;
+            LoadedPath = copy;
+            Generation++;
+        }
 
-        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
-        public static extern ResultHandle ul_compile(CatalogHandle catalog, byte[] source, UIntPtr length);
+        /// <summary>Releases native objects and frees the loaded copy.</summary>
+        public static void Unload()
+        {
+            if (!IsLoaded) return;
+            Unloading?.Invoke();
+            foreach (FieldInfo field in typeof(Native).GetFields(BindingFlags.Public | BindingFlags.Static))
+                if (field.Name.StartsWith("ul_", StringComparison.Ordinal)) field.SetValue(null, null);
+            FreeLibrary(_module);
+            _module = IntPtr.Zero;
+            LoadedPath = null;
+        }
 
-        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
-        public static extern ResultHandle ul_compile_with_defines(CatalogHandle catalog, byte[] source, UIntPtr length, byte[] defines);
+        private static string LocateLibrary()
+        {
+            var package = UnityEditor.PackageManager.PackageInfo.FindForAssembly(typeof(Native).Assembly);
+            if (package != null) return Path.Combine(package.resolvedPath, "Editor", "Plugins", "x86_64", "UdonLuau.dll");
 
-        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void ul_result_destroy(IntPtr result);
+            string asset = AssetDatabase.GUIDToAssetPath(PluginGuid);
+            return string.IsNullOrEmpty(asset) ? null : Path.GetFullPath(asset);
+        }
 
-        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int ul_result_succeeded(ResultHandle result);
+        private static void DeleteStaleCopies(string folder, string keep)
+        {
+            foreach (string file in Directory.GetFiles(folder, "UdonLuau-*.dll"))
+            {
+                if (string.Equals(file, keep, StringComparison.OrdinalIgnoreCase)) continue;
+                try
+                {
+                    File.Delete(file);
+                }
+                catch (IOException)
+                {
+                }
+                catch (UnauthorizedAccessException)
+                {
+                }
+            }
+        }
 
-        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int ul_result_diagnostic_count(ResultHandle result);
+        [DllImport("kernel32", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr LoadLibraryW(string path);
 
-        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int ul_result_diagnostic(ResultHandle result, int index, out NativeDiagnostic diagnostic);
+        [DllImport("kernel32", CharSet = CharSet.Ansi, ExactSpelling = true)]
+        private static extern IntPtr GetProcAddress(IntPtr module, string name);
 
-        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
-        public static extern IntPtr ul_result_bytecode(ResultHandle result, out UIntPtr length);
-
-        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int ul_result_heap_count(ResultHandle result);
-
-        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int ul_result_heap_slot(ResultHandle result, int address, out NativeHeapSlot slot);
-
-        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int ul_result_heap_argument_count(ResultHandle result, int address);
-
-        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int ul_result_heap_argument(ResultHandle result, int address, int index, out NativeHeapValue value);
-
-        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int ul_result_attribute_count(ResultHandle result, int address);
-
-        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int ul_result_attribute(ResultHandle result, int address, int index, out NativeAttribute attribute);
-
-        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
-        public static extern IntPtr ul_result_attribute_argument(ResultHandle result, int address, int index, int argument);
-
-        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int ul_result_entry_count(ResultHandle result);
-
-        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int ul_result_entry(ResultHandle result, int index, out NativeEntryPoint entry);
-
-        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int ul_result_sync_count(ResultHandle result);
-
-        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int ul_result_sync(ResultHandle result, int index, out NativeSyncVariable variable);
-
-        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int ul_result_update_order(ResultHandle result);
-
-        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
-        public static extern IntPtr ul_result_disassembly(ResultHandle result);
+        [DllImport("kernel32")]
+        private static extern bool FreeLibrary(IntPtr module);
     }
 }

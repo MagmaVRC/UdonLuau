@@ -1,0 +1,20 @@
+{
+    "name": "Magma.VRC.UdonLuau.Runtime",
+    "rootNamespace": "Magma.VRC.UdonLuau",
+    "references": [
+        "VRC.Udon"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": true,
+    "precompiledReferences": [
+        "VRC.Udon.Common.dll",
+        "VRCSDKBase.dll",
+        "VRCSDK3.dll"
+    ],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

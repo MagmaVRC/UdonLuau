@@ -2,8 +2,11 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using UnityEditor;
+using VRC.Udon;
 using VRC.Udon.Common.Interfaces;
 using VRC.Udon.Editor;
 using Debug = UnityEngine.Debug;
@@ -48,15 +51,35 @@ namespace Magma.VRC.UdonLuau
                 if (_current != null || _failed) return _current;
                 try
                 {
+                    Native.Load();
                     _current = Build();
                 }
-                catch (Exception e) when (e is DllNotFoundException || e is EntryPointNotFoundException || e is BadImageFormatException)
+                catch (Exception e) when (e is DllNotFoundException || e is EntryPointNotFoundException || e is BadImageFormatException || e is IOException)
                 {
                     _failed = true;
-                    Debug.LogError($"[UdonLuau] The native compiler could not be loaded ({e.Message}). Place UdonLuau.dll in the package's Editor/Plugins/x86_64 folder and restart the editor.");
+                    Debug.LogError($"[UdonLuau] The native compiler could not be loaded: {e.Message}. Place UdonLuau.dll in the package's Editor/Plugins/x86_64 folder, then use Tools > UdonLuau > Reload Native Compiler.");
                 }
                 return _current;
             }
+        }
+
+        /// <summary>Frees the native compiler and the catalog, then loads the package's UdonLuau.dll again.</summary>
+        [MenuItem("Tools/UdonLuau/Reload Native Compiler")]
+        public static void Reload()
+        {
+            Native.Unload();
+            _failed = false;
+            if (Current != null) LuauEditorHooks.CompileAll();
+        }
+
+        static LuauCatalog()
+        {
+            Native.Unloading += () =>
+            {
+                ScriptRegistry.Reset();
+                _current?.Handle.Dispose();
+                _current = null;
+            };
         }
 
         /// <summary>Resolves an Udon type name, such as UnityEngineTransform, to its System.Type.</summary>
@@ -136,7 +159,7 @@ namespace Magma.VRC.UdonLuau
         private static LuauCatalog Build()
         {
             var stopwatch = Stopwatch.StartNew();
-            var catalog = new LuauCatalog { Handle = Native.ul_catalog_create() };
+            var catalog = new LuauCatalog { Handle = new CatalogHandle(Native.ul_catalog_create()) };
             catalog.Wrapper = UdonEditorManager.Instance.GetWrapper();
 
             Native.ul_catalog_add_standard_events(catalog.Handle);
@@ -148,8 +171,9 @@ namespace Magma.VRC.UdonLuau
             }
 
             catalog.AddEvents();
+            catalog.AddSyncableTypes();
 
-            foreach (string name in new[] { "SystemObject", "SystemVoid", "SystemString", "SystemType", "SystemBoolean", "SystemInt32", "SystemSingle" })
+            foreach (string name in new[] { "SystemObject", "SystemVoid", "SystemString", "SystemType", "SystemBoolean", "SystemInt32", "SystemSingle", "VRCUdonUdonBehaviour", "VRCUdonUdonBehaviourArray" })
                 catalog.AddType(name);
 
             stopwatch.Stop();
@@ -262,6 +286,23 @@ namespace Magma.VRC.UdonLuau
             }
 
             return udonName;
+        }
+
+        private void AddSyncableTypes()
+        {
+            if (Native.ul_catalog_add_syncable_type == null) return;
+            var field = typeof(UdonNetworkTypes).GetField("_syncTypes", BindingFlags.Static | BindingFlags.NonPublic);
+            if (!(field?.GetValue(null) is IEnumerable<Type> types))
+            {
+                Debug.LogWarning("[UdonLuau] Could not read the SDK's syncable types; synced variable types will not be checked.");
+                return;
+            }
+
+            foreach (Type type in types)
+            {
+                string name = AddType(type);
+                if (name != null) Native.ul_catalog_add_syncable_type(Handle, Native.Utf8(name), UdonNetworkTypes.CanSyncLinear(type) ? 1 : 0, UdonNetworkTypes.CanSyncSmooth(type) ? 1 : 0);
+            }
         }
 
         private void AddEvents()
