@@ -61,6 +61,11 @@ typedef struct ul_heap_slot {
     const char* text;
 } ul_heap_slot;
 
+typedef struct ul_attribute {
+    const char* name;
+    int32_t     argument_count;
+} ul_attribute;
+
 typedef struct ul_entry_point {
     const char* name;
     uint32_t    address;
@@ -94,6 +99,9 @@ UDONLUAU_API void ul_catalog_add_event(ul_catalog* catalog, const char* name, co
 /// <summary>Adds the events VRChat dispatches to every UdonBehaviour.</summary>
 UDONLUAU_API void ul_catalog_add_standard_events(ul_catalog* catalog);
 
+/// <summary>Sets the ';'-separated namespaces that decide an ambiguous short type name, highest priority first.</summary>
+UDONLUAU_API void ul_catalog_set_preferred_namespaces(ul_catalog* catalog, const char* namespaces);
+
 /// <summary>Compiles Luau source against the catalog. Always returns a result.</summary>
 UDONLUAU_API ul_result* ul_compile(const ul_catalog* catalog, const char* source, size_t length);
 
@@ -111,6 +119,11 @@ UDONLUAU_API const uint8_t* ul_result_bytecode(const ul_result* result, size_t* 
 
 UDONLUAU_API int32_t ul_result_heap_count(const ul_result* result);
 UDONLUAU_API int32_t ul_result_heap_slot(const ul_result* result, int32_t address, ul_heap_slot* out);
+
+/// <summary>Annotations written above the variable at a heap address, such as @range(0, 10).</summary>
+UDONLUAU_API int32_t ul_result_attribute_count(const ul_result* result, int32_t address);
+UDONLUAU_API int32_t ul_result_attribute(const ul_result* result, int32_t address, int32_t index, ul_attribute* out);
+UDONLUAU_API const char* ul_result_attribute_argument(const ul_result* result, int32_t address, int32_t index, int32_t argument);
 
 UDONLUAU_API int32_t ul_result_entry_count(const ul_result* result);
 UDONLUAU_API int32_t ul_result_entry(const ul_result* result, int32_t index, ul_entry_point* out);

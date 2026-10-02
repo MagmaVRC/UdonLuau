@@ -87,6 +87,10 @@ void ul_catalog_add_standard_events(ul_catalog* catalog) {
     if (catalog) catalog->catalog.AddStandardEvents();
 }
 
+void ul_catalog_set_preferred_namespaces(ul_catalog* catalog, const char* namespaces) {
+    if (catalog) catalog->catalog.SetPreferredNamespaces(SplitList(namespaces));
+}
+
 ul_result* ul_compile(const ul_catalog* catalog, const char* source, size_t length) {
     auto* r = new (std::nothrow) ul_result();
     if (!r) return nullptr;
@@ -138,6 +142,35 @@ int32_t ul_result_heap_slot(const ul_result* result, int32_t address, ul_heap_sl
     const UdonLuau::HeapValue& v = s.value;
     *out = { s.symbol.c_str(), s.type.c_str(), s.exported, static_cast<int32_t>(v.kind), v.boolean, v.integer, v.unsignedInteger, v.real, v.text.c_str() };
     return 1;
+}
+
+namespace {
+
+    const UdonLuau::HeapSlot* SlotAt(const ul_result* result, int32_t address) {
+        if (!result || !result->result.program || !InRange(address, result->result.program->heap.size())) return nullptr;
+        return &result->result.program->heap[static_cast<size_t>(address)];
+    }
+
+} // namespace
+
+int32_t ul_result_attribute_count(const ul_result* result, int32_t address) {
+    const UdonLuau::HeapSlot* slot = SlotAt(result, address);
+    return slot ? static_cast<int32_t>(slot->attributes.size()) : 0;
+}
+
+int32_t ul_result_attribute(const ul_result* result, int32_t address, int32_t index, ul_attribute* out) {
+    const UdonLuau::HeapSlot* slot = SlotAt(result, address);
+    if (!slot || !out || !InRange(index, slot->attributes.size())) return 0;
+    const UdonLuau::FieldAttribute& a = slot->attributes[static_cast<size_t>(index)];
+    *out = { a.name.c_str(), static_cast<int32_t>(a.arguments.size()) };
+    return 1;
+}
+
+const char* ul_result_attribute_argument(const ul_result* result, int32_t address, int32_t index, int32_t argument) {
+    const UdonLuau::HeapSlot* slot = SlotAt(result, address);
+    if (!slot || !InRange(index, slot->attributes.size())) return nullptr;
+    const UdonLuau::FieldAttribute& a = slot->attributes[static_cast<size_t>(index)];
+    return InRange(argument, a.arguments.size()) ? a.arguments[static_cast<size_t>(argument)].c_str() : nullptr;
 }
 
 int32_t ul_result_entry_count(const ul_result* result) {
