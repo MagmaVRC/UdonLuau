@@ -7,6 +7,25 @@ types, extern signatures and events it exposes, normally by enumerating the live
 modules, and the compiler resolves every member access, operator and overload against it. When
 VRChat exposes a new extern, it is usable from Luau the moment the host sees it.
 
+## Installing in Unity
+
+Requirements: Windows, Unity 2022.3 or Unity 6, and the VRChat Worlds SDK.
+
+Download the latest release from [Releases](https://github.com/MagmaVRC/UdonLuau/releases) and use one of:
+
+- **`com.magma.vrc.udonluau-<version>.zip`:** in Unity, open Window > Package Manager, choose + > Add package from tarball/disk... and pick the extracted `package.json`. Alternatively, extract it into your project's `Packages/` folder.
+- **`UdonLuau-<version>.unitypackage`:** Assets > Import Package > Custom Package. It installs into `Packages/com.magma.vrc.udonluau`. Samples are only available from the `.zip` install.
+
+Installing straight from the git URL is not supported: the native compiler DLL is a build output that only the release files contain.
+
+**Updating:** install the new release over the old one; the editor can stay open. Unity never loads the package's `UdonLuau.dll` itself. It loads a private copy under `Library/UdonLuau/`, so the file is never locked, and the next script reload picks up the new compiler.
+
+Then:
+
+1. Right-click in the Project window and choose Create > VRChat > UdonLuau Script, or drop a `.lua` file into your project.
+2. Drag the script onto a GameObject.
+3. Install the [Luau Language Server](https://marketplace.visualstudio.com/items?itemName=JohnnyMorganz.luau-lsp) extension for VS Code. The package writes the definitions and workspace settings it needs, so the whole VRChat API autocompletes and type-checks.
+
 ## Layout
 
 | path | contents |
@@ -26,17 +45,21 @@ Projects:
 
 ## Building
 
-Requires Visual Studio 2022 or later with the C++ workload, and Windows.
+Requires Windows and Visual Studio 2022 or later with the C++ workload.
 
 ```
 git clone --recursive https://github.com/MagmaVRC/UdonLuau
+cd UdonLuau
+pwsh tools/build.ps1
 ```
 
-Open `UdonLuau.slnx`, choose `Release|x64` and build.
+`tools/build.ps1` builds the static libraries, `UdonLuau.dll` and the tests into `build/Release`, then runs the tests. `tools/package.ps1` builds and produces the release files in `dist/`: the package `.zip`, the `.unitypackage`, a native SDK zip (DLL, import and static libraries, headers) and `SHA256SUMS.txt`. For development in Visual Studio, open `UdonLuau.slnx`.
+
+Releases are published by pushing a `v<version>` tag that matches the package version. The release workflow builds, tests, packages and attaches the files.
 
 ## Unity package
 
-`unity/com.magma.vrc.udonluau` is the editor integration for VRChat world projects (Windows, Unity 2022.3, VRChat Worlds SDK 3.7+).
+`unity/com.magma.vrc.udonluau` is the editor integration for VRChat world projects (Windows, Unity 2022.3 and Unity 6, VRChat Worlds SDK).
 
 - Builds the catalog from the Udon wrapper modules, types and event definitions the editor has loaded.
 - Imports scripts as `.lua` files (`.luau` is accepted too). Assets > Create > VRChat > UdonLuau Script creates a script and its program asset.
@@ -46,7 +69,7 @@ Open `UdonLuau.slnx`, choose `Release|x64` and build.
 - Applies the script's sync mode to the UdonBehaviour, and shows a sync method picker when the mode is `any`.
 - Holds project-wide defines in Project Settings > UdonLuau.
 
-Build `UdonLuau.Native` and copy `UdonLuau.dll` to `Editor/Plugins/x86_64/` in the package. The editor loads a private copy of it from `Library/UdonLuau/`, so a new build is picked up on the next domain reload, or through Tools > UdonLuau > Reload Native Compiler, without restarting Unity.
+When working from source, copy `build/Release/UdonLuau.dll` to `Editor/Plugins/x86_64/` in the package; `tools/package.ps1` does this too. The editor loads a private copy of it from `Library/UdonLuau/`, so a new build is picked up on the next domain reload, or through Tools > UdonLuau > Reload Native Compiler, without restarting Unity.
 
 Each script also gets:
 
