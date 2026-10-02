@@ -857,6 +857,18 @@ end
         g_machines.clear();
     });
 
+    Case("Unity 6 member names", [] {
+        Fixture f = MakeFixture();
+        f.Type("UnityEngine.Rigidbody", TypeKind::Class, "UnityEngineComponent");
+        f.Extern("UnityEngineRigidbody.__get_velocity__UnityEngineVector3", true);
+        f.Extern("UnityEngineRigidbody.__set_velocity__UnityEngineVector3__SystemVoid", true);
+        auto p = Build(f, "export local rb: Rigidbody\nfunction Start()\n rb.linearVelocity = rb.linearVelocity\n rb.velocity = rb.velocity\nend");
+        Check(p.has_value(), "linearVelocity resolves to the velocity externs Udon exposes");
+        if (!p) return;
+        std::string listing = Disassemble(*p);
+        Check(listing.find("__get_velocity__") != std::string::npos && listing.find("linearVelocity") == std::string::npos, "emits the exposed signature");
+    });
+
     Case("behaviour sync modes", [] {
         Fixture f = MakeFixture();
         auto mode = [&](std::string_view source) {

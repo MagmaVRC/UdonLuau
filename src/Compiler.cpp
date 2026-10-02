@@ -430,6 +430,7 @@ namespace UdonLuau {
             std::vector<Value> Invoke(const Resolution& r, const std::optional<Value>& receiver, const std::vector<Value>& args, const Location& location);
             std::vector<Value> InvokeOperator(std::string_view opName, const std::vector<const Type*>& owners, std::vector<Value> args, const Location& location);
             std::vector<const Method*> StaticMethods(const std::vector<const Type*>& owners, std::string_view name);
+            std::vector<const Method*> MembersWithRenames(const Type* owner, std::string_view name, bool wantStatic);
 
             int Cost(const Value& value, const Type* to) const;
             const Type* NaturalType(const Value& value) const;
@@ -2367,6 +2368,31 @@ namespace UdonLuau {
             return results;
         }
 
+        std::vector<const Method*> Compiler::MembersWithRenames(const Type* owner, std::string_view name, bool wantStatic) {
+            auto methods = types_.Methods(owner, name, wantStatic, true);
+            if (!methods.empty()) return methods;
+            static constexpr std::pair<std::string_view, std::string_view> kUnity6Renames[] = {
+                { "linearVelocity", "velocity" },
+                { "linearVelocityX", "velocityX" },
+                { "linearVelocityY", "velocityY" },
+                { "linearDamping", "drag" },
+                { "angularDamping", "angularDrag" },
+            };
+            std::string_view prefix;
+            std::string_view member = name;
+            if (member.starts_with("get_") || member.starts_with("set_")) {
+                prefix = member.substr(0, 4);
+                member.remove_prefix(4);
+            }
+            for (auto [unity6, unity2022] : kUnity6Renames) {
+                std::string_view other = member == unity6 ? unity2022 : member == unity2022 ? unity6 : std::string_view{};
+                if (other.empty()) continue;
+                methods = types_.Methods(owner, std::string(prefix) + std::string(other), wantStatic, true);
+                if (!methods.empty()) return methods;
+            }
+            return methods;
+        }
+
         std::vector<const Method*> Compiler::StaticMethods(const std::vector<const Type*>& owners, std::string_view name) {
             static constexpr std::pair<std::string_view, std::string_view> kSpellings[] = {
                 { "op_Multiply", "op_Multiplication" },
@@ -2389,7 +2415,7 @@ namespace UdonLuau {
         }
 
         std::vector<Value> Compiler::CallMember(const Value& receiver, std::string_view name, std::vector<Value> args, const Type* typeArg, const Location& location) {
-            auto methods = types_.Methods(receiver.type, name, false, true);
+            auto methods = MembersWithRenames(receiver.type, name, false);
             if (methods.empty()) {
                 std::string_view shown = name;
                 if (shown.starts_with("get_") || shown.starts_with("set_")) shown.remove_prefix(4);
@@ -2408,7 +2434,7 @@ namespace UdonLuau {
         }
 
         std::vector<Value> Compiler::CallStatic(const Type* owner, std::string_view name, std::vector<Value> args, const Type* typeArg, const Location& location) {
-            auto methods = types_.Methods(owner, name, true, name != "ctor");
+            auto methods = name == "ctor" ? types_.Methods(owner, name, true, false) : MembersWithRenames(owner, name, true);
             if (methods.empty()) {
                 if (name == "ctor") Fail(location, std::format("{} has no constructor", owner->displayName));
                 std::string_view shown = name;
