@@ -86,6 +86,11 @@ namespace UdonLuau {
         /// cannot enumerate them.</summary>
         void AddStandardEvents();
 
+        /// <summary>Sets the namespaces that decide an ambiguous short type name, highest
+        /// priority first.</summary>
+        void SetPreferredNamespaces(std::vector<std::string> namespaces);
+        [[nodiscard]] std::span<const std::string> PreferredNamespaces() const;
+
         [[nodiscard]] const TypeInfo* FindType(std::string_view udonName) const;
         [[nodiscard]] const TypeInfo* FindTypeByFullName(std::string_view fullName) const;
         [[nodiscard]] std::vector<const TypeInfo*> FindTypesByShortName(std::string_view shortName) const;

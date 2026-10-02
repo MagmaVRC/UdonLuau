@@ -42,11 +42,19 @@ namespace UdonLuau {
         std::string text;
     };
 
+    /// <summary>An annotation written above a variable, such as <c>-- @range(0, 10)</c>. String
+    /// arguments are unquoted.</summary>
+    struct FieldAttribute {
+        std::string              name;
+        std::vector<std::string> arguments;
+    };
+
     struct HeapSlot {
-        std::string symbol;
-        std::string type;
-        HeapValue   value;
-        bool        exported = false;
+        std::string                 symbol;
+        std::string                 type;
+        HeapValue                   value;
+        bool                        exported = false;
+        std::vector<FieldAttribute> attributes;
     };
 
     struct EntryPoint {

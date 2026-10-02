@@ -143,6 +143,7 @@ namespace UdonLuau {
         StringMap<std::unique_ptr<ExternInfo>>              externs;
         StringMap<StringMap<std::vector<const ExternInfo*>>> methods;
         StringMap<std::unique_ptr<EventInfo>>               events;
+        std::vector<std::string> preferredNamespaces = { "UnityEngine", "VRC.SDKBase", "VRC.SDK3.Components", "VRC.SDK3.Data", "VRC.Udon", "System" };
 
         void Unindex(const TypeInfo& type) {
             if (type.fullName.empty()) return;
@@ -213,6 +214,14 @@ namespace UdonLuau {
             }
             if (!FindEvent(event.name)) AddEvent(std::move(event));
         }
+    }
+
+    void Catalog::SetPreferredNamespaces(std::vector<std::string> namespaces) {
+        impl_->preferredNamespaces = std::move(namespaces);
+    }
+
+    std::span<const std::string> Catalog::PreferredNamespaces() const {
+        return impl_->preferredNamespaces;
     }
 
     const TypeInfo* Catalog::FindType(std::string_view udonName) const {

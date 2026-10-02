@@ -130,9 +130,74 @@ namespace UdonLuau {
         };
 
         struct Annotations {
-            bool              synced = false;
-            SyncInterpolation interpolation = SyncInterpolation::None;
+            bool                        synced = false;
+            SyncInterpolation           interpolation = SyncInterpolation::None;
+            std::vector<FieldAttribute> attributes;
         };
+
+        std::vector<std::string> SplitArguments(std::string_view text) {
+            std::vector<std::string> out;
+            std::string current;
+            char quote = 0;
+            bool quoted = false;
+            auto flush = [&] {
+                size_t b = current.find_first_not_of(" \t");
+                size_t e = current.find_last_not_of(" \t");
+                std::string item = b == std::string::npos ? std::string() : current.substr(b, e - b + 1);
+                if (!item.empty() || quoted) out.push_back(std::move(item));
+                current.clear();
+                quoted = false;
+            };
+            for (size_t i = 0; i < text.size(); ++i) {
+                char c = text[i];
+                if (quote) {
+                    if (c == '\\' && i + 1 < text.size()) current += text[++i];
+                    else if (c == quote) quote = 0;
+                    else current += c;
+                } else if (c == '"' || c == '\'') {
+                    quote = c;
+                    quoted = true;
+                } else if (c == ',') {
+                    flush();
+                } else {
+                    current += c;
+                }
+            }
+            flush();
+            return out;
+        }
+
+        std::vector<FieldAttribute> ParseAttributes(std::string_view text) {
+            std::vector<FieldAttribute> out;
+            for (size_t i = 0; i < text.size(); ++i) {
+                if (text[i] != '@' || (i > 0 && !std::isspace(static_cast<unsigned char>(text[i - 1])))) continue;
+                size_t start = ++i;
+                while (i < text.size() && (std::isalnum(static_cast<unsigned char>(text[i])) || text[i] == '_' || text[i] == '.')) ++i;
+                if (i == start) continue;
+                FieldAttribute attribute{ std::string(text.substr(start, i - start)), {} };
+                size_t open = i;
+                while (open < text.size() && (text[open] == ' ' || text[open] == '\t')) ++open;
+                if (open < text.size() && text[open] == '(') {
+                    char quote = 0;
+                    size_t close = open + 1;
+                    for (; close < text.size(); ++close) {
+                        char c = text[close];
+                        if (quote) {
+                            if (c == '\\') ++close;
+                            else if (c == quote) quote = 0;
+                        } else if (c == '"' || c == '\'') {
+                            quote = c;
+                        } else if (c == ')') {
+                            break;
+                        }
+                    }
+                    attribute.arguments = SplitArguments(text.substr(open + 1, close - open - 1));
+                    i = close;
+                }
+                out.push_back(std::move(attribute));
+            }
+            return out;
+        }
 
         struct LoopLabels {
             Label exit;
@@ -315,6 +380,9 @@ namespace UdonLuau {
 
             const Type* ResolveType(AstType* type);
             const Type* ResolveTypeName(std::string_view name, const Location& location);
+            const Type* PreferredType(const std::vector<const Type*>& matches) const;
+            const Type* ShortType(std::string_view name, const Location& location);
+            void DeclareTypeAlias(AstStatTypeAlias* alias);
             Value SelfValue(std::string_view name);
             Variable LookupLocal(AstLocal* local, const Location& location);
 
@@ -323,7 +391,9 @@ namespace UdonLuau {
             Emitter                                        emit_;
             std::string_view                               source_;
             std::vector<size_t>                            lineStarts_;
-            std::map<unsigned, std::vector<std::string>>   commentTokens_;
+            std::map<unsigned, std::vector<std::pair<FieldAttribute, Location>>> commentAttributes_;
+            std::unordered_map<AstLocal*, Value>           aliases_;
+            std::unordered_map<std::string, const Type*>   typeAliases_;
             std::vector<Diagnostic>                        diagnostics_;
 
             std::unordered_map<AstLocal*, Variable>        variables_;
@@ -399,14 +469,8 @@ namespace UdonLuau {
                 if (c.type != Lexeme::Comment) continue;
                 std::string_view text = TextAt(c.location);
                 while (text.starts_with('-')) text.remove_prefix(1);
-                auto& tokens = commentTokens_[c.location.begin.line];
-                size_t i = 0;
-                while (i < text.size()) {
-                    while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i]))) ++i;
-                    size_t start = i;
-                    while (i < text.size() && !std::isspace(static_cast<unsigned char>(text[i]))) ++i;
-                    if (i > start) tokens.emplace_back(text.substr(start, i - start));
-                }
+                auto& attributes = commentAttributes_[c.location.begin.line];
+                for (FieldAttribute& a : ParseAttributes(text)) attributes.push_back({ std::move(a), c.location });
             }
         }
 
@@ -421,25 +485,60 @@ namespace UdonLuau {
         }
 
         Annotations Compiler::AnnotationsFor(const Location& location) const {
-            Annotations a;
-            auto apply = [&](const std::vector<std::string>& tokens) {
-                for (size_t i = 0; i < tokens.size(); ++i) {
-                    const std::string& t = tokens[i];
-                    if (t != "@sync") continue;
-                    a.synced = true;
-                    if (i + 1 < tokens.size()) {
-                        if (tokens[i + 1] == "linear") a.interpolation = SyncInterpolation::Linear;
-                        if (tokens[i + 1] == "smooth") a.interpolation = SyncInterpolation::Smooth;
-                    }
-                }
-            };
-            if (auto it = commentTokens_.find(location.begin.line); it != commentTokens_.end()) apply(it->second);
+            std::vector<const std::pair<FieldAttribute, Location>*> found;
             for (unsigned line = location.begin.line; line > 0;) {
-                auto it = commentTokens_.find(--line);
-                if (it == commentTokens_.end()) break;
-                apply(it->second);
+                auto it = commentAttributes_.find(--line);
+                if (it == commentAttributes_.end()) break;
+                for (auto rit = it->second.rbegin(); rit != it->second.rend(); ++rit) found.insert(found.begin(), &*rit);
+            }
+            if (auto it = commentAttributes_.find(location.begin.line); it != commentAttributes_.end())
+                for (const auto& entry : it->second) found.push_back(&entry);
+
+            Annotations a;
+            for (const auto* entry : found) {
+                const FieldAttribute& attribute = entry->first;
+                if (attribute.name != "sync") {
+                    a.attributes.push_back(attribute);
+                    continue;
+                }
+                a.synced = true;
+                std::string_view mode = attribute.arguments.empty() ? "none" : std::string_view(attribute.arguments[0]);
+                if (mode == "linear") a.interpolation = SyncInterpolation::Linear;
+                else if (mode == "smooth") a.interpolation = SyncInterpolation::Smooth;
+                else if (mode != "none") Fail(entry->second, std::format("unknown sync mode '{}'; use none, linear or smooth", mode));
             }
             return a;
+        }
+
+        const Type* Compiler::PreferredType(const std::vector<const Type*>& matches) const {
+            for (const std::string& space : catalog_.PreferredNamespaces()) {
+                const Type* found = nullptr;
+                int count = 0;
+                for (const Type* t : matches) {
+                    std::string_view full = t->fullName;
+                    size_t dot = full.rfind('.');
+                    if ((dot == std::string_view::npos ? std::string_view{} : full.substr(0, dot)) != space) continue;
+                    found = t;
+                    ++count;
+                }
+                if (count == 1) return found;
+            }
+            return nullptr;
+        }
+
+        const Type* Compiler::ShortType(std::string_view name, const Location& location) {
+            std::vector<const Type*> matches = types_.FindByShortName(name);
+            if (matches.size() == 1) return matches[0];
+            if (matches.empty()) return nullptr;
+            if (const Type* preferred = PreferredType(matches)) return preferred;
+            std::string list;
+            for (const Type* t : matches) list += (list.empty() ? "" : ", ") + t->fullName;
+            Fail(location, std::format("'{}' is ambiguous: {}; qualify it or add an alias such as 'type {} = Namespace.{}'", name, list, name, name));
+        }
+
+        void Compiler::DeclareTypeAlias(AstStatTypeAlias* alias) {
+            if (alias->generics.size || alias->genericPacks.size) Fail(alias->location, "generic type aliases are not supported");
+            typeAliases_[alias->name.value] = ResolveType(alias->type);
         }
 
         void Compiler::CheckUserName(std::string_view name, const Location& location) {
@@ -448,6 +547,13 @@ namespace UdonLuau {
         }
 
         void Compiler::DeclareModule(AstStatBlock* root) {
+            for (AstStat* stat : root->body) {
+                try {
+                    if (auto* alias = stat->as<AstStatTypeAlias>()) DeclareTypeAlias(alias);
+                } catch (const CompileError& e) {
+                    Report(e.location, e.message);
+                }
+            }
             for (AstStat* stat : root->body) {
                 try {
                     if (auto* local = stat->as<AstStatLocal>()) {
@@ -481,6 +587,11 @@ namespace UdonLuau {
                 if (i < stat->values.size) {
                     AstExpr* init = stat->values.data[i];
                     Value v = CompileExpr(init, type);
+                    if (!type && (v.kind == Value::Kind::TypeRef || v.kind == Value::Kind::Namespace)) {
+                        if (stat->isExported) Fail(var->location, "type and namespace aliases cannot be exported");
+                        aliases_[var] = v;
+                        continue;
+                    }
                     if (!v.IsLiteral()) Fail(init->location, "field initializers must be constants; assign other values in Start");
                     if (!type) type = NaturalType(v);
                     if (!type) Fail(var->location, std::format("'{}' needs a type annotation", name));
@@ -491,6 +602,7 @@ namespace UdonLuau {
                 }
 
                 uint32_t slot = emit_.AddSlot(name, type, initial, stat->isExported);
+                emit_.Slot(slot).attributes = annotations.attributes;
                 variables_[var] = { slot, type };
                 if (annotations.synced) sync_.push_back({ name, annotations.interpolation });
             }
@@ -639,7 +751,7 @@ namespace UdonLuau {
                 return;
             }
             if (stat->is<AstStatLocalFunction>() || stat->is<AstStatFunction>()) Fail(stat->location, "functions can only be declared at module level");
-            if (stat->is<AstStatTypeAlias>()) return;
+            if (auto* s = stat->as<AstStatTypeAlias>()) return DeclareTypeAlias(s);
             Fail(stat->location, "unsupported statement");
         }
 
@@ -651,6 +763,10 @@ namespace UdonLuau {
             for (size_t i = 0; i < stat->vars.size; ++i) {
                 AstLocal* var = stat->vars.data[i];
                 CheckUserName(var->name.value, var->location);
+                if (!expected[i] && (values[i].kind == Value::Kind::TypeRef || values[i].kind == Value::Kind::Namespace)) {
+                    aliases_[var] = values[i];
+                    continue;
+                }
                 const Type* type = expected[i] ? expected[i] : NaturalType(values[i]);
                 if (!type) Fail(var->location, std::format("cannot infer the type of '{}'; add a type annotation", var->name.value));
                 Variable v{ emit_.Local(var->name.value, type), type };
@@ -894,6 +1010,7 @@ namespace UdonLuau {
             if (auto* e = expr->as<AstExprConstantInteger>()) return Value::OfInteger(e->value);
             if (auto* e = expr->as<AstExprConstantString>()) return Value::OfString(std::string(e->value.data, e->value.size));
             if (auto* e = expr->as<AstExprLocal>()) {
+                if (auto it = aliases_.find(e->local); it != aliases_.end()) return it->second;
                 if (auto it = localFunctions_.find(e->local); it != localFunctions_.end()) return Value::OfFunction(it->second);
                 Variable v = LookupLocal(e->local, e->location);
                 return Value::OfSlot(v.slot, v.type);
@@ -957,14 +1074,9 @@ namespace UdonLuau {
             if (name == "this" || name == "gameObject" || name == "transform") return SelfValue(name);
             if (auto it = globalFunctions_.find(std::string(name)); it != globalFunctions_.end()) return Value::OfFunction(it->second);
 
-            std::vector<const Type*> matches = types_.FindByShortName(name);
-            if (matches.size() == 1) return Value::OfType(matches[0]);
-            if (matches.size() > 1) {
-                std::string list;
-                for (const Type* t : matches) list += (list.empty() ? "" : ", ") + t->fullName;
-                if (types_.IsNamespace(name)) return Value::OfNamespace(std::string(name));
-                Fail(expr->location, std::format("'{}' is ambiguous: {}; qualify it with its namespace", name, list));
-            }
+            if (auto it = typeAliases_.find(std::string(name)); it != typeAliases_.end()) return Value::OfType(it->second);
+            if (types_.IsNamespace(name) && types_.FindByShortName(name).empty()) return Value::OfNamespace(std::string(name));
+            if (const Type* t = ShortType(name, expr->location)) return Value::OfType(t);
             if (types_.IsNamespace(name)) return Value::OfNamespace(std::string(name));
             Fail(expr->location, std::format("unknown name '{}'", name));
         }
@@ -1803,14 +1915,9 @@ namespace UdonLuau {
                 { "char", "SystemChar" }, { "boolean", "SystemBoolean" }, { "bool", "SystemBoolean" },
                 { "string", "SystemString" }, { "any", "SystemObject" }, { "object", "SystemObject" },
             };
+            if (auto it = typeAliases_.find(std::string(name)); it != typeAliases_.end()) return it->second;
             if (auto it = aliases.find(name); it != aliases.end()) return types_.Get(it->second);
-            auto matches = types_.FindByShortName(name);
-            if (matches.size() == 1) return matches[0];
-            if (matches.size() > 1) {
-                std::string list;
-                for (const Type* t : matches) list += (list.empty() ? "" : ", ") + t->fullName;
-                Fail(location, std::format("type '{}' is ambiguous: {}", name, list));
-            }
+            if (const Type* t = ShortType(name, location)) return t;
             Fail(location, std::format("unknown type '{}'", name));
         }
 
@@ -1819,6 +1926,10 @@ namespace UdonLuau {
             if (auto* ref = type->as<AstTypeReference>()) {
                 if (ref->prefix) {
                     std::string path = std::string(ref->prefix->value) + "." + ref->name.value;
+                    if (auto it = ref->prefixLocal ? aliases_.find(ref->prefixLocal) : aliases_.end(); it != aliases_.end()) {
+                        const Value& alias = it->second;
+                        path = alias.kind == Value::Kind::Namespace ? alias.text + "." + ref->name.value : alias.type->fullName + "+" + ref->name.value;
+                    }
                     if (const Type* t = types_.FindByFullName(path)) return t;
                     Fail(ref->location, std::format("unknown type '{}'", path));
                 }
