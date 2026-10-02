@@ -45,10 +45,11 @@ namespace UdonLuau {
                 case ValueKind::String: return std::format("\"{}\"", v.text);
                 case ValueKind::This: return "this";
                 case ValueKind::Type: return std::format("typeof({})", v.text);
-                case ValueKind::Construct: {
+                case ValueKind::Construct:
+                case ValueKind::Array: {
                     std::string args;
                     for (const HeapValue& a : v.arguments) args += (args.empty() ? "" : ", ") + ValueText(a);
-                    return std::format("{}({})", v.text, args);
+                    return v.kind == ValueKind::Array ? std::format("{}[] {{{}}}", v.text, args) : std::format("{}({})", v.text, args);
                 }
             }
             return "?";

@@ -6,6 +6,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -24,10 +25,15 @@ namespace UdonLuau::Detail {
         uint32_t Local(std::string_view name, const Type* type);
         uint32_t Hidden(const Type* type);
 
+        uint32_t JumpTable(const Type* arrayType, const Type* elementType, const std::vector<Label>& targets);
+
         uint32_t Temp(const Type* type);
         [[nodiscard]] size_t TempMark() const { return liveTemps_.size(); }
         void ReleaseTemps(size_t mark);
+        void Promote(uint32_t slot);
         [[nodiscard]] bool IsTemp(uint32_t slot) const;
+        void MarkConstant(uint32_t slot);
+        [[nodiscard]] bool IsConstant(uint32_t slot) const;
 
         [[nodiscard]] Label NewLabel();
         void Bind(Label label);
@@ -65,6 +71,8 @@ namespace UdonLuau::Detail {
         std::unordered_map<const Type*, std::vector<uint32_t>> freeTemps_;
         std::vector<uint32_t>                       liveTemps_;
         std::vector<bool>                           isTemp_;
+        std::vector<bool>                           isConstant_;
+        std::vector<std::tuple<uint32_t, size_t, int>> elementFixups_;
         std::vector<std::optional<uint32_t>>        labels_;
         std::vector<std::pair<size_t, int>>         codeFixups_;
         std::vector<std::pair<uint32_t, int>>       slotFixups_;

@@ -1,5 +1,6 @@
 #include "Emitter.hpp"
 
+#include <algorithm>
 #include <format>
 #include <stdexcept>
 
@@ -26,9 +27,10 @@ namespace UdonLuau::Detail {
 
     uint32_t Emitter::AddSlot(std::string symbol, const Type* type, HeapValue value, bool exported) {
         auto address = static_cast<uint32_t>(heap_.size());
-        heap_.push_back({ std::move(symbol), type->udonName, std::move(value), exported });
+        heap_.push_back({ std::move(symbol), type->udonName, std::move(value), exported, {} });
         slotTypes_.push_back(type);
         isTemp_.push_back(false);
+        isConstant_.push_back(false);
         return address;
     }
 
@@ -36,8 +38,35 @@ namespace UdonLuau::Detail {
         std::string key = ConstantKey(type, value);
         if (auto it = constants_.find(key); it != constants_.end()) return it->second;
         uint32_t slot = AddSlot(Unique("__const_" + type->udonName), type, value);
+        isConstant_[slot] = true;
         constants_.emplace(std::move(key), slot);
         return slot;
+    }
+
+    uint32_t Emitter::JumpTable(const Type* arrayType, const Type* elementType, const std::vector<Label>& targets) {
+        HeapValue table;
+        table.kind = ValueKind::Array;
+        table.text = elementType->udonName;
+        HeapValue entry;
+        entry.kind = ValueKind::Unsigned;
+        table.arguments.assign(targets.size(), entry);
+        uint32_t slot = AddSlot(Unique("__gintnl_" + arrayType->udonName), arrayType, std::move(table));
+        isConstant_[slot] = true;
+        for (size_t i = 0; i < targets.size(); ++i) elementFixups_.emplace_back(slot, i, targets[i].id);
+        return slot;
+    }
+
+    void Emitter::MarkConstant(uint32_t slot) {
+        isConstant_[slot] = true;
+    }
+
+    bool Emitter::IsConstant(uint32_t slot) const {
+        return slot < isConstant_.size() && isConstant_[slot];
+    }
+
+    void Emitter::Promote(uint32_t slot) {
+        if (auto it = std::find(liveTemps_.rbegin(), liveTemps_.rend(), slot); it != liveTemps_.rend()) liveTemps_.erase(std::next(it).base());
+        isTemp_[slot] = false;
     }
 
     uint32_t Emitter::ExternSlot(const std::string& signature) {
@@ -45,9 +74,10 @@ namespace UdonLuau::Detail {
         HeapValue v;
         v.kind = ValueKind::String;
         v.text = signature;
-        heap_.push_back({ Unique("__extern"), "SystemString", std::move(v), false });
+        heap_.push_back({ Unique("__extern"), "SystemString", std::move(v), false, {} });
         slotTypes_.push_back(nullptr);
         isTemp_.push_back(false);
+        isConstant_.push_back(true);
         auto slot = static_cast<uint32_t>(heap_.size() - 1);
         externs_.emplace(signature, slot);
         return slot;
@@ -56,9 +86,10 @@ namespace UdonLuau::Detail {
     uint32_t Emitter::AddressConstant(Label target) {
         HeapValue v;
         v.kind = ValueKind::Unsigned;
-        heap_.push_back({ Unique("__gintnl_SystemUInt32"), "SystemUInt32", v, false });
+        heap_.push_back({ Unique("__gintnl_SystemUInt32"), "SystemUInt32", v, false, {} });
         slotTypes_.push_back(nullptr);
         isTemp_.push_back(false);
+        isConstant_.push_back(true);
         auto slot = static_cast<uint32_t>(heap_.size() - 1);
         slotFixups_.emplace_back(slot, target.id);
         return slot;
@@ -173,6 +204,10 @@ namespace UdonLuau::Detail {
         for (auto [slot, label] : slotFixups_) {
             if (!labels_[label]) throw std::logic_error("unbound label");
             heap_[slot].value.unsignedInteger = *labels_[label];
+        }
+        for (auto [slot, index, label] : elementFixups_) {
+            if (!labels_[label]) throw std::logic_error("unbound label");
+            heap_[slot].value.arguments[index].unsignedInteger = *labels_[label];
         }
 
         Program program;

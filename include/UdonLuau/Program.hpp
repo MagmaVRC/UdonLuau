@@ -29,12 +29,14 @@ namespace UdonLuau {
         This,
         Type,
         Construct,
+        Array,
     };
 
     /// <summary>The initial value of a heap slot. Integer also carries enum values; This means
     /// the behaviour, its GameObject or its Transform, chosen by the slot type; Type names a
     /// System.Type by its Udon name in text; Construct is the result of calling the constructor
-    /// extern named in text with the constant arguments.</summary>
+    /// extern named in text with the constant arguments; Array is an array of the element type
+    /// named in text holding the arguments.</summary>
     struct HeapValue {
         ValueKind              kind = ValueKind::Default;
         bool                   boolean = false;
