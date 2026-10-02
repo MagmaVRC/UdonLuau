@@ -64,8 +64,7 @@ A `Program` holds everything needed to build an `IUdonProgram`:
 UdonLuau compiles a statically typed subset of Luau. Each file becomes one UdonBehaviour program.
 
 ```lua
--- @export
-local speed: number = 2
+export local speed: number = 2
 -- @sync linear
 local height: number = 0
 
@@ -92,7 +91,7 @@ end
 ### Declarations
 
 - Module-level `local`s are behaviour variables; their initializers must be constants.
-- `-- @export` exposes a variable in the inspector.
+- `export local` exposes a variable in the inspector, using Luau's export syntax.
 - `-- @sync`, `-- @sync linear` and `-- @sync smooth` add sync metadata.
 - Global functions are entry points:
   - a function named after a VRChat event (`Start`, `Update`, `Interact`, `OnPlayerJoined`, ...) receives that event, with its parameters;

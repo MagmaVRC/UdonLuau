@@ -278,8 +278,7 @@ int main() {
     Case("loops, fields and concatenation", [] {
         Fixture f = MakeFixture();
         auto p = Build(f, R"(
--- @export
-local count: int = 0
+export local count: int = 0
 local total: number = 0
 function Start()
     for i = 1, 10 do
@@ -426,6 +425,7 @@ end
         Check(HasError(f, "function Start() undefinedThing = 1 end", "unknown variable"), "undeclared global");
         Check(HasError(f, "function Start() local v = transform.position end", "no member 'position'"), "missing property");
         Check(HasError(f, "function Start() local a = 1 local b: number = 2 a = b end", "convert explicitly"), "narrowing");
+        Check(HasError(f, "function Start()\n export local x = 1\nend", "xport"), "export only at module level");
     });
 
     Case("disassembly", [] {

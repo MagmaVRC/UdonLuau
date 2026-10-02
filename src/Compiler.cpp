@@ -16,6 +16,8 @@
 #include <unordered_map>
 #include <unordered_set>
 
+LUAU_FASTFLAG(LuauExportValueSyntax)
+
 namespace UdonLuau {
 
     namespace {
@@ -128,7 +130,6 @@ namespace UdonLuau {
         };
 
         struct Annotations {
-            bool              exported = false;
             bool              synced = false;
             SyncInterpolation interpolation = SyncInterpolation::None;
         };
@@ -340,6 +341,7 @@ namespace UdonLuau {
         };
 
         CompileResult Compiler::Run() {
+            FFlag::LuauExportValueSyntax.value = true;
             Allocator allocator;
             AstNameTable names(allocator);
             ParseOptions options;
@@ -423,7 +425,6 @@ namespace UdonLuau {
             auto apply = [&](const std::vector<std::string>& tokens) {
                 for (size_t i = 0; i < tokens.size(); ++i) {
                     const std::string& t = tokens[i];
-                    if (t == "@export") a.exported = true;
                     if (t != "@sync") continue;
                     a.synced = true;
                     if (i + 1 < tokens.size()) {
@@ -489,7 +490,7 @@ namespace UdonLuau {
                     Fail(var->location, std::format("'{}' needs a type annotation or an initializer", name));
                 }
 
-                uint32_t slot = emit_.AddSlot(name, type, initial, annotations.exported);
+                uint32_t slot = emit_.AddSlot(name, type, initial, stat->isExported);
                 variables_[var] = { slot, type };
                 if (annotations.synced) sync_.push_back({ name, annotations.interpolation });
             }
