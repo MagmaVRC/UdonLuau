@@ -1,4 +1,7 @@
 #include "UdonLuau/Compiler.hpp"
+#include "UdonLuau/Definitions.hpp"
+
+#include "Luau/Parser.h"
 
 #include <algorithm>
 #include <cmath>
@@ -884,6 +887,36 @@ end
                   method("Again")->parameters[1].symbol == "__0_other__param",
             "parameter counters are shared across the class in declaration order");
         Check(method("Ping")->entryPoint == "Ping" && method("Ping")->parameters[0].symbol == "__2_value__param", "network callable keeps its name");
+    });
+
+    Case("luau-lsp definitions", [] {
+        Fixture f = MakeFixture();
+        ScriptInfo door;
+        door.name = "Door";
+        door.fields.push_back({ "speed", "SystemSingle", "", "speed" });
+        door.methods.push_back({ "Add", "__0__Add", { { "a", "SystemInt32", "", "__0_a__param" } }, { { "result", "SystemInt32", "", "__0___0__Add__ret" } }, false });
+        f.catalog.AddScript(door);
+        f.Type("Foo.Thing", TypeKind::Class);
+        f.Type("Bar.Thing", TypeKind::Class);
+        std::string defs = GenerateDefinitions(f.catalog);
+
+        Luau::Allocator allocator;
+        Luau::AstNameTable names(allocator);
+        Luau::ParseOptions options;
+        options.allowDeclarationSyntax = true;
+        Luau::ParseResult parsed = Luau::Parser::parse(defs.data(), defs.size(), names, allocator, options);
+        for (const Luau::ParseError& e : parsed.errors) std::printf("    %u: %s\n", e.getLocation().begin.line + 1, e.getMessage().c_str());
+        Check(parsed.errors.empty(), std::format("definitions parse as Luau ({} bytes)", defs.size()));
+
+        auto has = [&](std::string_view text) { return defs.find(text) != std::string::npos; };
+        Check(has("declare extern type Vector3 with\n") && has("    y: number\n") && has("    function __add(self, p1: Vector3): Vector3\n"), "struct with fields and operators");
+        Check(has("declare Vector3: {\n    new: (number, number, number) -> Vector3,"), "constructor on the global");
+        Check(has("declare extern type Transform extends Component with\n"), "inheritance");
+        Check(has("declare extern type UdonBehaviour extends MonoBehaviour with\n") && has("function SendCustomEvent(self, p1: string): ()"), "interface members folded into the class");
+        Check(has("declare KeyCode: {\n    Space: KeyCode,\n    Return: KeyCode,\n}"), "enum members");
+        Check(has("declare extern type Door extends UdonBehaviour with\n    speed: number\n    function Add(self, a: int): int\n"), "behaviour scripts");
+        Check(has("declare transform: Transform\n") && has("    All: (behaviour: UdonBehaviour) -> any,\n"), "globals and Network");
+        Check(has("declare Foo: {\n    Thing: {") && has("declare Bar: {\n    Thing: {") && !has("declare Thing:"), "ambiguous types reachable by namespace");
     });
 
     Case("Unity 6 member names", [] {
