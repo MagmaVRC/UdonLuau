@@ -7,7 +7,6 @@ using UnityEditor.Callbacks;
 using UnityEditor.SceneManagement;
 using UnityEngine;
 using UnityEngine.SceneManagement;
-using VRC.SDKBase.Editor;
 using VRC.Udon;
 using Object = UnityEngine.Object;
 
@@ -26,7 +25,6 @@ namespace Magma.VRC.UdonLuau
         {
             EditorSceneManager.sceneOpened += (_, __) => QueueSanitize();
             EditorApplication.hierarchyChanged += QueueSanitize;
-            VRC_SdkBuilder.RegisterContentPreUploadCallback(OnContentPreUpload);
         }
 
         /// <summary>Returns the component standing for the script a behaviour runs, or null.</summary>
@@ -157,12 +155,7 @@ namespace Magma.VRC.UdonLuau
         [PostProcessScene(-10)]
         private static void OnPostProcessScene()
         {
-            if (BuildPipeline.isBuildingPlayer) StripScene(SceneManager.GetActiveScene());
-        }
-
-        private static void OnContentPreUpload(object sender, object args)
-        {
-            for (int i = 0; i < SceneManager.sceneCount; i++) StripScene(SceneManager.GetSceneAt(i));
+            if (!EditorApplication.isPlayingOrWillChangePlaymode) StripScene(SceneManager.GetActiveScene());
         }
 
         /// <summary>Removes the UdonLuau components from a scene being built, leaving the UdonBehaviours that run the scripts.</summary>
