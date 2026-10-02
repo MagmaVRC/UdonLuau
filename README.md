@@ -34,6 +34,20 @@ git clone --recursive https://github.com/MagmaVRC/UdonLuau
 
 Open `UdonLuau.slnx`, choose `Release|x64` and build.
 
+## Unity package
+
+`unity/com.magma.vrc.udonluau` is the editor integration for VRChat world projects (Windows, Unity 2022.3, VRChat Worlds SDK 3.7+).
+
+- Builds the catalog from the Udon wrapper modules, types and event definitions the editor has loaded.
+- Imports `.luau` files. Assets > Create > VRChat > UdonLuau Script creates a script and its program asset.
+- Recompiles when a script changes, after a domain reload, and before a world build. A build with script errors is blocked.
+- Reports errors in the console with file and line, so double-clicking opens the script.
+- Draws exported variables with `@header`, `@space`, `@tooltip`, `@range`, `@hideininspector` and `@multiline`.
+- Applies `-- @syncmode(none|manual|continuous)` to the UdonBehaviour.
+- Holds project-wide defines in Project Settings > UdonLuau.
+
+Build `UdonLuau.Native` and copy `UdonLuau.dll` to `Editor/Plugins/x86_64/` in the package. Unity locks native plugins once loaded, so restart the editor to pick up a new build.
+
 ## Usage
 
 ```cpp
