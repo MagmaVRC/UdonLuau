@@ -14,6 +14,7 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -104,10 +105,36 @@ namespace UdonLuau {
                 return true;
             }
             bool visit(AstExprCall* c) override {
-                onCall(c->func);
+                AstExpr* func = c->func;
+                while (true) {
+                    if (auto* g = func->as<AstExprGroup>()) func = g->expr;
+                    else if (auto* i = func->as<AstExprInstantiate>()) func = i->expr;
+                    else break;
+                }
+                onCall(func);
+                if (auto* index = func->as<AstExprIndexName>(); index && c->self) {
+                    AstExpr* owner = index->expr;
+                    while (auto* g = owner->as<AstExprGroup>()) owner = g->expr;
+                    if (auto* l = owner->as<AstExprLocal>()) memberAssigned.insert(l->local);
+                }
                 return true;
             }
         };
+
+        class CallFinder : public AstVisitor {
+        public:
+            bool found = false;
+            bool visit(AstExprCall*) override {
+                found = true;
+                return false;
+            }
+        };
+
+        bool HasCall(AstExpr* expr) {
+            CallFinder finder;
+            expr->visit(&finder);
+            return finder.found;
+        }
 
         class NodeCounter : public AstVisitor {
         public:
@@ -397,6 +424,10 @@ namespace UdonLuau {
             Value CompileGlobal(AstExprGlobal* expr);
             Value CompileIndexName(AstExprIndexName* expr);
             Value CompileIndexExpr(AstExprIndexExpr* expr);
+            Value ReadMember(const Value& owner, std::string_view name, const Location& location);
+            void WriteMember(const Value& owner, std::string_view name, const Value& value, const Location& location);
+            Value ReadIndex(const Value& owner, const Value& key, const Location& location);
+            void WriteIndex(const Value& owner, const Value& key, const Value& value, const Location& location);
             Value CompileUnary(AstExprUnary* expr);
             Value CompileBinary(AstExprBinary* expr, const Type* expected);
             Value CompileArithmetic(AstExprBinary::Op op, Value left, Value right, const Location& location);
@@ -517,7 +548,8 @@ namespace UdonLuau {
         };
 
         CompileResult Compiler::Run() {
-            FFlag::LuauExportValueSyntax.value = true;
+            static std::once_flag exportSyntax;
+            std::call_once(exportSyntax, [] { FFlag::LuauExportValueSyntax.value = true; });
             Allocator allocator;
             AstNameTable names(allocator);
             ParseOptions options;
@@ -579,6 +611,8 @@ namespace UdonLuau {
         }
 
         void Compiler::Report(const Location& location, std::string message, Severity severity) {
+            for (const Diagnostic& existing : diagnostics_)
+                if (existing.message == message && existing.line == static_cast<int>(location.begin.line) && existing.column == static_cast<int>(location.begin.column)) return;
             Diagnostic d;
             d.severity = severity;
             d.message = std::move(message);
@@ -1045,6 +1079,7 @@ namespace UdonLuau {
         void Compiler::CompileFunction(Function& f) {
             if (!f.exported && (f.inlined || f.calls == 0)) return;
             current_ = &f;
+            emit_.ResetTemps();
             for (size_t i = 0; i < f.parameters.size(); ++i) {
                 AstLocal* arg = f.node->args.data[i];
                 aliases_.erase(arg);
@@ -1201,7 +1236,13 @@ namespace UdonLuau {
                 return value;
             }
             Variable v{ emit_.Local(var->name.value, type), type };
-            if (hasValue) Store(value, v, var->location);
+            if (hasValue) {
+                Store(value, v, var->location);
+            } else {
+                HeapValue initial;
+                initial.kind = type->IsValueType() ? ValueKind::Default : ValueKind::Null;
+                emit_.Copy(emit_.Constant(type, initial), v.slot);
+            }
             variables_[var] = v;
             return Value::OfSlot(v.slot, type);
         }
@@ -1224,7 +1265,7 @@ namespace UdonLuau {
         }
 
         Value Compiler::Evaluate(const Value& value) {
-            if (value.kind != Value::Kind::Slot || emit_.IsTemp(value.slot)) return value;
+            if (value.kind != Value::Kind::Slot || emit_.IsTemp(value.slot) || emit_.IsConstant(value.slot)) return value;
             uint32_t t = emit_.Temp(value.type);
             emit_.Copy(value.slot, t);
             return Value::OfSlot(t, value.type);
@@ -1252,38 +1293,12 @@ namespace UdonLuau {
                 return;
             }
             if (auto* index = target->as<AstExprIndexName>()) {
-                Value owner = CompileExpr(index->expr);
-                std::string setter = std::string("set_") + index->index.value;
-                if (owner.kind == Value::Kind::TypeRef) {
-                    CallStatic(owner.type, setter, { value }, nullptr, target->location);
-                    return;
-                }
-                if (owner.kind != Value::Kind::Slot) Fail(target->location, "cannot assign to this expression");
-                if (const ScriptInfo* script = owner.type->script) {
-                    auto field = std::ranges::find(script->fields, std::string_view(index->index.value), &ScriptVariable::name);
-                    if (field != script->fields.end()) {
-                        const Type* type = VariableType(*field);
-                        if (Cost(value, type) < 0) Fail(target->location, std::format("cannot assign {} to {}.{} ({})", Describe(value), script->name, field->name, type->displayName));
-                        Value v = value.IsLiteral() ? Value::OfSlot(Materialize(value, type, target->location), type) : value;
-                        if (v.kind == Value::Kind::Slot && v.type != type && v.type->IsNumeric() && type->IsNumeric())
-                            v = Value::OfSlot(Convert(v.slot, v.type, type, target->location), type);
-                        CallMember(Value::OfSlot(owner.slot, types_.Behaviour()), "SetProgramVariable", { Value::OfString(field->symbol), v }, nullptr, target->location);
-                        return;
-                    }
-                }
-                if (owner.type->IsValueType() && emit_.IsConstant(owner.slot))
-                    Fail(target->location, std::format("cannot modify '{}' of a constant {}", index->index.value, owner.type->displayName));
-                if (owner.type->IsValueType() && emit_.IsTemp(owner.slot))
-                    Fail(target->location, std::format("cannot modify '{}' of a {} copy; store it in a local, change it, then assign it back", index->index.value, owner.type->displayName));
-                CallMember(owner, setter, { value }, nullptr, target->location);
+                WriteMember(CompileExpr(index->expr), index->index.value, value, target->location);
                 return;
             }
             if (auto* index = target->as<AstExprIndexExpr>()) {
                 Value owner = CompileExpr(index->expr);
-                if (owner.kind != Value::Kind::Slot) Fail(target->location, "cannot index this expression");
-                Value key = CompileExpr(index->index);
-                std::string_view method = owner.type->kind == TypeKind::Array ? "Set" : "set_Item";
-                CallMember(owner, method, { key, value }, nullptr, target->location);
+                WriteIndex(owner, CompileExpr(index->index), value, target->location);
                 return;
             }
             if (auto* global = target->as<AstExprGlobal>())
@@ -1291,11 +1306,76 @@ namespace UdonLuau {
             Fail(target->location, "cannot assign to this expression");
         }
 
+        void Compiler::WriteMember(const Value& owner, std::string_view name, const Value& value, const Location& location) {
+            std::string setter = "set_" + std::string(name);
+            if (owner.kind == Value::Kind::TypeRef) {
+                CallStatic(owner.type, setter, { value }, nullptr, location);
+                return;
+            }
+            if (owner.kind != Value::Kind::Slot || !owner.type) Fail(location, std::format("cannot assign to a member of {}", Describe(owner)));
+            if (const ScriptInfo* script = owner.type->script) {
+                auto field = std::ranges::find(script->fields, name, &ScriptVariable::name);
+                if (field != script->fields.end()) {
+                    const Type* type = VariableType(*field);
+                    if (Cost(value, type) < 0) Fail(location, std::format("cannot assign {} to {}.{} ({})", Describe(value), script->name, field->name, type->displayName));
+                    Value v = value.IsLiteral() ? Value::OfSlot(Materialize(value, type, location), type) : value;
+                    if (v.kind == Value::Kind::Slot && v.type != type && v.type->IsNumeric() && type->IsNumeric())
+                        v = Value::OfSlot(Convert(v.slot, v.type, type, location), type);
+                    CallMember(Value::OfSlot(owner.slot, types_.Behaviour()), "SetProgramVariable", { Value::OfString(field->symbol), v }, nullptr, location);
+                    return;
+                }
+            }
+            if (owner.type->IsValueType() && emit_.IsConstant(owner.slot))
+                Fail(location, std::format("cannot modify '{}' of a constant {}", name, owner.type->displayName));
+            if (owner.type->IsValueType() && emit_.IsTemp(owner.slot))
+                Fail(location, std::format("cannot modify '{}' of a {} copy; store it in a local, change it, then assign it back", name, owner.type->displayName));
+            CallMember(owner, setter, { value }, nullptr, location);
+        }
+
+        Value Compiler::ReadIndex(const Value& owner, const Value& key, const Location& location) {
+            if (owner.kind != Value::Kind::Slot || !owner.type) Fail(location, std::format("cannot index {}", Describe(owner)));
+            std::string_view method = owner.type->kind == TypeKind::Array ? "Get" : "get_Item";
+            Value item = CallMember(owner, method, { key }, nullptr, location).at(0);
+            if (owner.type->kind == TypeKind::Array && owner.type->element && owner.type->element->script) item.type = owner.type->element;
+            return item;
+        }
+
+        void Compiler::WriteIndex(const Value& owner, const Value& key, const Value& value, const Location& location) {
+            if (owner.kind != Value::Kind::Slot || !owner.type) Fail(location, std::format("cannot index {}", Describe(owner)));
+            std::string_view method = owner.type->kind == TypeKind::Array ? "Set" : "set_Item";
+            CallMember(owner, method, { key, value }, nullptr, location);
+        }
+
         void Compiler::CompileCompoundAssign(AstStatCompoundAssign* stat) {
-            AstExprBinary synthetic(stat->location, stat->op, stat->var, stat->value);
-            const Type* hint = nullptr;
-            if (auto* local = Unwrap(stat->var)->as<AstExprLocal>()) hint = LookupLocal(local->local, local->location).type;
-            AssignTo(stat->var, CompileBinary(&synthetic, hint));
+            AstExpr* target = Unwrap(stat->var);
+            if (auto* local = target->as<AstExprLocal>()) {
+                AstExprBinary synthetic(stat->location, stat->op, stat->var, stat->value);
+                AssignTo(stat->var, CompileBinary(&synthetic, LookupLocal(local->local, local->location).type));
+                return;
+            }
+            bool valueCall = HasCall(stat->value);
+            auto combine = [&](const Value& current) {
+                Value right = CompileExpr(stat->value, NaturalType(current));
+                if (stat->op == AstExprBinary::Concat) return ConcatValues({ current, right }, stat->location);
+                return CompileArithmetic(stat->op, current, right, stat->location);
+            };
+            if (auto* index = target->as<AstExprIndexName>()) {
+                Value owner = CompileExpr(index->expr);
+                if (valueCall) owner = Evaluate(owner);
+                Value current = Evaluate(ReadMember(owner, index->index.value, stat->location));
+                WriteMember(owner, index->index.value, combine(current), stat->location);
+                return;
+            }
+            if (auto* index = target->as<AstExprIndexExpr>()) {
+                Value owner = CompileExpr(index->expr);
+                if (valueCall || HasCall(index->index)) owner = Evaluate(owner);
+                Value key = CompileExpr(index->index);
+                if (valueCall) key = Evaluate(key);
+                Value current = Evaluate(ReadIndex(owner, key, stat->location));
+                WriteIndex(owner, key, combine(current), stat->location);
+                return;
+            }
+            Fail(stat->location, "cannot assign to this expression");
         }
 
         void Compiler::CompileIf(AstStatIf* stat) {
@@ -1473,6 +1553,7 @@ namespace UdonLuau {
             auto variable = variables_.find(subject);
             if (variable == variables_.end() || variable->second.type != types_.Int32) return false;
 
+            if (std::ranges::any_of(cases, [](const Case& c) { return !FitsIntegral(c.value, Numeric::Int32); })) return false;
             auto [low, high] = std::ranges::minmax(cases, {}, &Case::value);
             int64_t span = high.value - low.value + 1;
             if (span > static_cast<int64_t>(cases.size()) * 3 || span > 1024) return false;
@@ -1550,6 +1631,9 @@ namespace UdonLuau {
                 type = integral(from) && integral(to) && integral(step) ? types_.Int32 : types_.Single;
             }
             if (!type->IsNumeric()) Fail(stat->var->location, "loop variables must be numeric");
+            for (auto [value, expr] : { std::pair{ &from, stat->from }, std::pair{ &to, stat->to }, std::pair{ &step, stat->step ? stat->step : stat->to } })
+                if (Cost(*value, type) < 0)
+                    Fail(expr->location, std::format("{} cannot be used as a {} loop bound or step", Describe(*value), type->displayName));
 
             bool knownBounds = from.IsNumberLiteral() && to.IsNumberLiteral();
             if (knownBounds) {
@@ -1558,8 +1642,10 @@ namespace UdonLuau {
                 if (stepValue > 0 ? a > b : a < b) return;
             }
 
-            Variable counter{ emit_.Local(stat->var->name.value, type), type };
-            variables_[stat->var] = counter;
+            bool userWrites = assigned_.contains(stat->var);
+            Variable counter{ userWrites ? emit_.Hidden(type) : emit_.Local(stat->var->name.value, type), type };
+            Variable user = userWrites ? Variable{ emit_.Local(stat->var->name.value, type), type } : counter;
+            variables_[stat->var] = user;
             Store(from, counter, stat->from->location);
             Variable limit{};
             if (to.IsLiteral()) {
@@ -1576,14 +1662,22 @@ namespace UdonLuau {
             Label increment = emit_.NewLabel();
             if (!knownBounds) emit_.Jump(next);
             emit_.Bind(top);
+            if (userWrites) emit_.Copy(counter.slot, user.slot);
             CompileLoopBody(stat->body, { end, increment });
             emit_.Bind(increment);
             Value sum = CompileArithmetic(AstExprBinary::Add, Value::OfSlot(counter.slot, type), Value::OfSlot(stepSlot, type), stat->location);
             Store(sum, counter, stat->location);
             emit_.Bind(next);
-            Value done = CompareValues(stepValue > 0 ? AstExprBinary::CompareGt : AstExprBinary::CompareLt,
-                Value::OfSlot(counter.slot, type), Value::OfSlot(limit.slot, type), stat->location);
-            emit_.JumpIfFalse(done.slot, top);
+            if (type->IsIntegral()) {
+                Value done = CompareValues(stepValue > 0 ? AstExprBinary::CompareGt : AstExprBinary::CompareLt,
+                    Value::OfSlot(counter.slot, type), Value::OfSlot(limit.slot, type), stat->location);
+                emit_.JumpIfFalse(done.slot, top);
+            } else {
+                Value inside = CompareValues(stepValue > 0 ? AstExprBinary::CompareLe : AstExprBinary::CompareGe,
+                    Value::OfSlot(counter.slot, type), Value::OfSlot(limit.slot, type), stat->location);
+                emit_.JumpIfFalse(inside.slot, end);
+                emit_.Jump(top);
+            }
             emit_.Bind(end);
         }
 
@@ -1772,14 +1866,18 @@ namespace UdonLuau {
         }
 
         Value Compiler::CompileIndexName(AstExprIndexName* expr) {
-            Value owner = CompileExpr(expr->expr);
-            std::string_view name = expr->index.value;
+            return ReadMember(CompileExpr(expr->expr), expr->index.value, expr->location);
+        }
+
+        Value Compiler::ReadMember(const Value& owner, std::string_view name, const Location& location) {
+            if (owner.kind == Value::Kind::Nil || owner.kind == Value::Kind::None)
+                Fail(location, std::format("cannot read '{}' of {}", name, Describe(owner)));
 
             if (owner.kind == Value::Kind::Namespace) {
                 std::string path = owner.text + "." + std::string(name);
                 if (const Type* t = types_.FindByFullName(path)) return Value::OfType(t);
                 if (types_.IsNamespace(path)) return Value::OfNamespace(path);
-                Fail(expr->location, std::format("'{}' does not exist", path));
+                Fail(location, std::format("'{}' does not exist", path));
             }
 
             if (owner.kind == Value::Kind::TypeRef) {
@@ -1790,30 +1888,26 @@ namespace UdonLuau {
                 }
                 if (!t->fullName.empty())
                     if (const Type* nested = types_.FindByFullName(t->fullName + "+" + std::string(name))) return Value::OfType(nested);
-                return CallStatic(t, "get_" + std::string(name), {}, nullptr, expr->location).at(0);
+                return CallStatic(t, "get_" + std::string(name), {}, nullptr, location).at(0);
             }
 
-            if (owner.kind == Value::Kind::Function) Fail(expr->location, "functions have no members");
-            if (owner.kind == Value::Kind::Network) Fail(expr->location, "use ':' to call a method through Network");
+            if (owner.kind == Value::Kind::Function) Fail(location, "functions have no members");
+            if (owner.kind == Value::Kind::Network) Fail(location, "use ':' to call a method through Network");
             if (owner.kind == Value::Kind::Slot && owner.type->script) {
                 const ScriptInfo* script = owner.type->script;
                 auto field = std::ranges::find(script->fields, name, &ScriptVariable::name);
-                if (field != script->fields.end()) return ReadScriptField(owner, *field, expr->location);
+                if (field != script->fields.end()) return ReadScriptField(owner, *field, location);
                 if (std::ranges::find(script->methods, name, &ScriptMethod::name) != script->methods.end())
-                    Fail(expr->location, std::format("'{}' is a method; call it with '{}:{}()'", name, "value", name));
+                    Fail(location, std::format("'{}' is a method; call it with 'value:{}()'", name, name));
             }
-            Value receiver = owner.kind == Value::Kind::Slot ? owner : Value::OfSlot(Materialize(owner, nullptr, expr->location), NaturalType(owner));
-            return CallMember(receiver, "get_" + std::string(name), {}, nullptr, expr->location).at(0);
+            Value receiver = owner.kind == Value::Kind::Slot ? owner : Value::OfSlot(Materialize(owner, nullptr, location), NaturalType(owner));
+            return CallMember(receiver, "get_" + std::string(name), {}, nullptr, location).at(0);
         }
 
         Value Compiler::CompileIndexExpr(AstExprIndexExpr* expr) {
             Value owner = CompileExpr(expr->expr);
-            if (owner.kind != Value::Kind::Slot) Fail(expr->location, std::format("cannot index {}", Describe(owner)));
-            Value key = CompileExpr(expr->index);
-            std::string_view method = owner.type->kind == TypeKind::Array ? "Get" : "get_Item";
-            Value item = CallMember(owner, method, { key }, nullptr, expr->location).at(0);
-            if (owner.type->kind == TypeKind::Array && owner.type->element && owner.type->element->script) item.type = owner.type->element;
-            return item;
+            if (HasCall(expr->index)) owner = Evaluate(owner);
+            return ReadIndex(owner, CompileExpr(expr->index), expr->location);
         }
 
         Value Compiler::CompileUnary(AstExprUnary* expr) {
@@ -1853,6 +1947,7 @@ namespace UdonLuau {
             if (IsComparison(expr->op)) return CompileComparison(expr->op, expr->left, expr->right, expr->location);
 
             Value left = CompileExpr(expr->left, expected);
+            if (HasCall(expr->right)) left = Evaluate(left);
             Value right = CompileExpr(expr->right, expected);
             return CompileArithmetic(expr->op, std::move(left), std::move(right), expr->location);
         }
@@ -1869,10 +1964,10 @@ namespace UdonLuau {
                 case AstExprBinary::Div: return b == 0 ? std::nullopt : std::optional(Value::OfReal(a / b));
                 case AstExprBinary::FloorDiv:
                     if (b == 0) return std::nullopt;
-                    return ints ? Value::OfInteger(static_cast<int64_t>(std::floor(a / b))) : Value::OfReal(std::floor(a / b));
+                    return ints ? Value::OfInteger(l.integer / r.integer) : Value::OfReal(std::floor(a / b));
                 case AstExprBinary::Mod:
                     if (b == 0) return std::nullopt;
-                    return ints ? Value::OfInteger(l.integer - static_cast<int64_t>(std::floor(a / b)) * r.integer) : Value::OfReal(a - std::floor(a / b) * b);
+                    return ints ? Value::OfInteger(l.integer % r.integer) : Value::OfReal(std::fmod(a, b));
                 case AstExprBinary::Pow: return Value::OfReal(std::pow(a, b));
                 default: return std::nullopt;
             }
@@ -1916,6 +2011,7 @@ namespace UdonLuau {
 
         Value Compiler::CompileComparison(AstExprBinary::Op op, AstExpr* leftExpr, AstExpr* rightExpr, const Location& location) {
             Value left = CompileExpr(leftExpr);
+            if (HasCall(rightExpr)) left = Evaluate(left);
             Value right = CompileExpr(rightExpr);
             return CompareValues(op, left, right, location);
         }
@@ -1966,7 +2062,11 @@ namespace UdonLuau {
             };
             flatten(expr);
             std::vector<Value> parts;
-            for (AstExpr* e : operands) parts.push_back(CompileExpr(e));
+            for (size_t i = 0; i < operands.size(); ++i) {
+                Value part = CompileExpr(operands[i]);
+                bool laterCall = std::any_of(operands.begin() + static_cast<ptrdiff_t>(i) + 1, operands.end(), [](AstExpr* e) { return HasCall(e); });
+                parts.push_back(laterCall ? Evaluate(part) : part);
+            }
             return ConcatValues(std::move(parts), expr->location);
         }
 
@@ -2023,6 +2123,7 @@ namespace UdonLuau {
 
             while (strings.size() > 1) {
                 size_t take = std::min(widest, strings.size());
+                while (!arity(take)) --take;
                 const Method* m = arity(take);
                 std::vector<Value> group(strings.begin(), strings.begin() + static_cast<ptrdiff_t>(take));
                 Value joined = Invoke({ m, nullptr }, std::nullopt, group, location).at(0);
@@ -2106,7 +2207,23 @@ namespace UdonLuau {
                     return;
                 }
                 if (IsComparison(b->op)) {
-                    Value test = CompileComparison(negate ? NegateComparison(b->op) : b->op, b->left, b->right, b->location);
+                    Value left = CompileExpr(b->left);
+                    if (HasCall(b->right)) left = Evaluate(left);
+                    Value right = CompileExpr(b->right);
+                    auto floating = [&](const Value& v) {
+                        const Type* t = NaturalType(v);
+                        return t && (t->numeric == Numeric::Single || t->numeric == Numeric::Double);
+                    };
+                    bool ordering = b->op != AstExprBinary::CompareEq && b->op != AstExprBinary::CompareNe;
+                    if (negate && ordering && (floating(left) || floating(right))) {
+                        Value test = CompareValues(b->op, left, right, b->location);
+                        Label skip = emit_.NewLabel();
+                        emit_.JumpIfFalse(TruthySlot(test, b->location), skip);
+                        emit_.Jump(whenFalse);
+                        emit_.Bind(skip);
+                        return;
+                    }
+                    Value test = CompareValues(negate ? NegateComparison(b->op) : b->op, left, right, b->location);
                     emit_.JumpIfFalse(TruthySlot(test, b->location), whenFalse);
                     return;
                 }
@@ -2173,12 +2290,23 @@ namespace UdonLuau {
                 func = Unwrap(inst->expr);
             }
 
+            bool argsCall = std::any_of(call->args.begin(), call->args.end(), [](AstExpr* a) { return HasCall(a); });
+            std::optional<Value> selfReceiver;
+            if (call->self) {
+                selfReceiver = CompileExpr(func->as<AstExprIndexName>()->expr);
+                if (argsCall) selfReceiver = Evaluate(*selfReceiver);
+            }
+
             std::vector<Value> args;
-            for (AstExpr* a : call->args) args.push_back(CompileExpr(a));
+            for (size_t i = 0; i < call->args.size; ++i) {
+                Value arg = CompileExpr(call->args.data[i]);
+                bool laterCall = std::any_of(call->args.begin() + i + 1, call->args.end(), [](AstExpr* a) { return HasCall(a); });
+                args.push_back(laterCall ? Evaluate(arg) : arg);
+            }
 
             if (call->self) {
                 auto* index = func->as<AstExprIndexName>();
-                Value receiver = CompileExpr(index->expr);
+                Value receiver = *selfReceiver;
                 std::string_view name = index->index.value;
                 if (receiver.kind == Value::Kind::Network) {
                     std::string entry(name);
@@ -2214,6 +2342,8 @@ namespace UdonLuau {
                 }
                 if (receiver.kind == Value::Kind::TypeRef || receiver.kind == Value::Kind::Namespace)
                     Fail(call->location, "use '.' to call static methods");
+                if (receiver.kind == Value::Kind::Nil || receiver.kind == Value::Kind::Function || receiver.kind == Value::Kind::None)
+                    Fail(call->location, std::format("cannot call '{}' on {}", name, Describe(receiver)));
                 if (receiver.kind != Value::Kind::Slot) receiver = Value::OfSlot(Materialize(receiver, nullptr, call->location), NaturalType(receiver));
                 return CallMember(receiver, index->index.value, std::move(args), typeArg, call->location);
             }
@@ -2299,11 +2429,14 @@ namespace UdonLuau {
                         continue;
                     }
                     if (a.kind == Value::Kind::Slot) {
-                        aliases_[param] = Value::OfSlot(Materialize(a, type, location), type);
+                        uint32_t slot = Materialize(a, type, location);
+                        if (emit_.IsTemp(slot)) emit_.Promote(slot);
+                        aliases_[param] = Value::OfSlot(slot, type);
                         continue;
                     }
                 }
                 if (a.kind == Value::Kind::Slot && a.type == type && emit_.IsTemp(a.slot)) {
+                    emit_.Promote(a.slot);
                     variables_[param] = { a.slot, type };
                     continue;
                 }
@@ -2422,6 +2555,7 @@ namespace UdonLuau {
         }
 
         std::vector<Value> Compiler::CallMember(const Value& receiver, std::string_view name, std::vector<Value> args, const Type* typeArg, const Location& location) {
+            if (receiver.kind != Value::Kind::Slot || !receiver.type) Fail(location, std::format("cannot call '{}' on {}", name, Describe(receiver)));
             auto methods = MembersWithRenames(receiver.type, name, false);
             if (methods.empty()) {
                 std::string_view shown = name;
@@ -2553,7 +2687,15 @@ namespace UdonLuau {
 
             std::vector<uint32_t> pushes;
             std::vector<Value> refResults;
-            if (receiver) pushes.push_back(receiver->slot);
+            if (receiver) {
+                uint32_t self = receiver->slot;
+                if (receiver->type && receiver->type->IsValueType() && emit_.IsConstant(self) && !m.ext->method.starts_with("get_")) {
+                    uint32_t copy = emit_.Temp(receiver->type);
+                    emit_.Copy(self, copy);
+                    self = copy;
+                }
+                pushes.push_back(self);
+            }
             size_t inputIndex = 0;
             for (const Parameter& p : m.parameters) {
                 if (p.byRef) {
@@ -2707,10 +2849,10 @@ namespace UdonLuau {
                         h.real = real;
                     } else if (IsUnsigned(type->numeric)) {
                         h.kind = ValueKind::Unsigned;
-                        h.unsignedInteger = static_cast<uint64_t>(v.integer);
+                        h.unsignedInteger = v.kind == Value::Kind::Real ? static_cast<uint64_t>(std::nearbyint(v.real)) : static_cast<uint64_t>(v.integer);
                     } else if (type->IsIntegral()) {
                         h.kind = ValueKind::Integer;
-                        h.integer = v.integer;
+                        h.integer = v.kind == Value::Kind::Real ? static_cast<int64_t>(std::nearbyint(v.real)) : v.integer;
                     } else {
                         Fail(location, std::format("a number cannot be stored as {}", type->displayName));
                     }
@@ -2804,6 +2946,8 @@ namespace UdonLuau {
                     std::string path = std::string(ref->prefix->value) + "." + ref->name.value;
                     if (auto it = ref->prefixLocal ? aliases_.find(ref->prefixLocal) : aliases_.end(); it != aliases_.end()) {
                         const Value& alias = it->second;
+                        if (alias.kind != Value::Kind::Namespace && alias.kind != Value::Kind::TypeRef)
+                            Fail(ref->location, std::format("'{}' is not a type or namespace", ref->prefix->value));
                         path = alias.kind == Value::Kind::Namespace ? alias.text + "." + ref->name.value : alias.type->fullName + "+" + ref->name.value;
                     }
                     if (const Type* t = types_.FindByFullName(path)) return t;

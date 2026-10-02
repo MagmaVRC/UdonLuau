@@ -31,6 +31,7 @@ namespace UdonLuau::Detail {
         [[nodiscard]] size_t TempMark() const { return liveTemps_.size(); }
         void ReleaseTemps(size_t mark);
         void Promote(uint32_t slot);
+        void ResetTemps();
         [[nodiscard]] bool IsTemp(uint32_t slot) const;
         void MarkConstant(uint32_t slot);
         [[nodiscard]] bool IsConstant(uint32_t slot) const;

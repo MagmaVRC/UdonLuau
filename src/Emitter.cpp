@@ -64,6 +64,11 @@ namespace UdonLuau::Detail {
         return slot < isConstant_.size() && isConstant_[slot];
     }
 
+    void Emitter::ResetTemps() {
+        freeTemps_.clear();
+        liveTemps_.clear();
+    }
+
     void Emitter::Promote(uint32_t slot) {
         if (auto it = std::find(liveTemps_.rbegin(), liveTemps_.rend(), slot); it != liveTemps_.rend()) liveTemps_.erase(std::next(it).base());
         isTemp_[slot] = false;
