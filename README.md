@@ -110,10 +110,11 @@ end
 - `export local` exposes a variable in the inspector, using Luau's export syntax.
 - `-- @sync`, `-- @sync(linear)` and `-- @sync(smooth)` add sync metadata.
 - Any other `-- @name(args)` annotation directly above a variable is kept on its heap slot for the host, for example `@range(0, 10)`, `@header("Motion")` or `@tooltip("...")`. The compiler does not interpret these; the editor decides what they mean.
-- Global functions are entry points:
-  - a function named after a VRChat event (`Start`, `Update`, `Interact`, `OnPlayerJoined`, ...) receives that event, with its parameters;
-  - any other global function is a custom event, callable through `SendCustomEvent`.
-- `local function`s are internal and may take parameters and return values. Parameters and return values need type annotations.
+- Functions:
+  - A global function named after a VRChat event (`Start`, `Update`, `Interact`, `OnPlayerJoined`, ...) receives that event, with its parameters.
+  - `export function Name(...)` is a public method. Other behaviours can call it, and so can `SendCustomEvent("Name")`. Its parameters and results go through the heap symbols `__Name_param__param` and `__Name__ret`.
+  - `local function` is private.
+  - Parameters and return values need type annotations.
 - `this`, `gameObject` and `transform` refer to the behaviour itself.
 
 ### Types
@@ -137,6 +138,34 @@ end
 - **Operators:** they map to the operator externs. `/` on integers divides as floats, `//` divides as integers, `..` and backtick strings concatenate, `#` gives `Length` or `Count`, and `and`, `or` and `not` short-circuit on booleans.
 - **Truthiness:** an object in a condition means "is not nil".
 - **Built-ins:** `print`, `warn` and `tostring`.
+
+### Other behaviours
+
+Behaviour scripts, Luau or UdonSharp, are types. Name one to hold a typed reference, then use its public members directly:
+
+```lua
+export local door: Door
+
+function Interact()
+    door:Open()
+    local total = door:Add(2, 40)
+    door.speed = 5
+    Network.All(door):Open()
+end
+```
+
+These compile to what Udon understands:
+
+| Luau | Udon |
+|---|---|
+| `door:Add(2, 40)` | `SetProgramVariable` for each argument, `SendCustomEvent("Add")`, `GetProgramVariable` for the result |
+| `door.speed` | `GetProgramVariable("speed")` |
+| `door.speed = 5` | `SetProgramVariable("speed", 5)` |
+| `Network.All(door):Open()` | `SendCustomNetworkEvent(NetworkEventTarget.All, "Open")`. Any `NetworkEventTarget` member works as the name. |
+
+Names, argument counts and types are checked when compiling. Typed references are also usable in arrays (`{Door}`). A plain `UdonBehaviour` still has every SDK member (`SendCustomEvent`, `GetProgramVariable`, ...), and converts to a script type with `behaviour :: Door`.
+
+The host registers scripts with `Catalog::AddScript`. `ExtractInterface` reads a Luau module's public interface without compiling it, so scripts that reference each other can all be registered before any is compiled.
 
 ### Compile time
 
