@@ -5,6 +5,7 @@ bin/
 obj/
 out/
 build/
+dist/
 *.user
 *.aps
 *.ipch
