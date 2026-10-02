@@ -2,6 +2,7 @@
 
 #include "UdonLuau/Compiler.hpp"
 
+#include <algorithm>
 #include <new>
 #include <optional>
 #include <string>
@@ -35,6 +36,14 @@ namespace {
     }
 
     bool InRange(int32_t index, size_t size) { return index >= 0 && static_cast<size_t>(index) < size; }
+
+    UdonLuau::ScriptVariable MakeVariable(const char* name, const char* type, const char* script, const char* symbol) {
+        return { Str(name), Str(type), Str(script), Str(symbol) };
+    }
+
+    void Fill(const UdonLuau::ScriptVariable& v, ul_script_variable* out) {
+        *out = { v.name.c_str(), v.type.c_str(), v.script.c_str(), v.symbol.c_str() };
+    }
 
 } // namespace
 
@@ -85,6 +94,66 @@ void ul_catalog_add_event(ul_catalog* catalog, const char* name, const char* con
 
 void ul_catalog_add_standard_events(ul_catalog* catalog) {
     if (catalog) catalog->catalog.AddStandardEvents();
+}
+
+void ul_catalog_add_script(ul_catalog* catalog, const char* name) {
+    if (!catalog || !name || !*name) return;
+    UdonLuau::ScriptInfo script;
+    script.name = name;
+    catalog->catalog.AddScript(std::move(script));
+}
+
+int32_t ul_catalog_add_script_field(ul_catalog* catalog, const char* script, const char* name, const char* udon_type, const char* script_type, const char* symbol) {
+    if (!catalog || !script) return 0;
+    const UdonLuau::ScriptInfo* existing = catalog->catalog.FindScript(script);
+    if (!existing) return 0;
+    UdonLuau::ScriptInfo copy = *existing;
+    copy.fields.push_back(MakeVariable(name, udon_type, script_type, symbol));
+    catalog->catalog.AddScript(std::move(copy));
+    return 1;
+}
+
+int32_t ul_catalog_add_script_method(ul_catalog* catalog, const char* script, const char* name, const char* entry_point) {
+    if (!catalog || !script || !name) return 0;
+    const UdonLuau::ScriptInfo* existing = catalog->catalog.FindScript(script);
+    if (!existing) return 0;
+    UdonLuau::ScriptInfo copy = *existing;
+    copy.methods.push_back({ name, entry_point ? entry_point : name, {}, {} });
+    catalog->catalog.AddScript(std::move(copy));
+    return 1;
+}
+
+int32_t ul_catalog_add_script_method_value(ul_catalog* catalog, const char* script, const char* method, int32_t is_return, const char* name, const char* udon_type, const char* script_type, const char* symbol) {
+    if (!catalog || !script || !method) return 0;
+    const UdonLuau::ScriptInfo* existing = catalog->catalog.FindScript(script);
+    if (!existing) return 0;
+    UdonLuau::ScriptInfo copy = *existing;
+    auto it = std::find_if(copy.methods.begin(), copy.methods.end(), [&](const UdonLuau::ScriptMethod& m) { return m.name == method; });
+    if (it == copy.methods.end()) return 0;
+    (is_return ? it->returns : it->parameters).push_back(MakeVariable(name, udon_type, script_type, symbol));
+    catalog->catalog.AddScript(std::move(copy));
+    return 1;
+}
+
+ul_result* ul_extract_interface(const ul_catalog* catalog, const char* source, size_t length, const char* defines) {
+    auto* r = new (std::nothrow) ul_result();
+    if (!r) return nullptr;
+    if (!catalog) {
+        r->result.diagnostics.push_back({ UdonLuau::Severity::Error, "no catalog" });
+        return r;
+    }
+    UdonLuau::CompileOptions options;
+    for (const std::string& pair : SplitList(defines)) {
+        size_t eq = pair.find('=');
+        options.defines[pair.substr(0, eq)] = eq == std::string::npos ? "true" : pair.substr(eq + 1);
+    }
+    try {
+        r->result = UdonLuau::ExtractInterface(catalog->catalog, std::string_view(source ? source : "", source ? length : 0), options);
+    } catch (const std::exception& e) {
+        r->result = {};
+        r->result.diagnostics.push_back({ UdonLuau::Severity::Error, std::string("internal compiler error: ") + e.what() });
+    }
+    return r;
 }
 
 void ul_catalog_set_preferred_namespaces(ul_catalog* catalog, const char* namespaces) {
@@ -225,6 +294,40 @@ int32_t ul_result_sync(const ul_result* result, int32_t index, ul_sync_variable*
 
 int32_t ul_result_update_order(const ul_result* result) {
     return result && result->result.program ? result->result.program->updateOrder : 0;
+}
+
+int32_t ul_result_has_interface(const ul_result* result) {
+    return result && result->result.scriptInterface ? 1 : 0;
+}
+
+int32_t ul_result_interface_field_count(const ul_result* result) {
+    return ul_result_has_interface(result) ? static_cast<int32_t>(result->result.scriptInterface->fields.size()) : 0;
+}
+
+int32_t ul_result_interface_field(const ul_result* result, int32_t index, ul_script_variable* out) {
+    if (!ul_result_has_interface(result) || !out || !InRange(index, result->result.scriptInterface->fields.size())) return 0;
+    Fill(result->result.scriptInterface->fields[static_cast<size_t>(index)], out);
+    return 1;
+}
+
+int32_t ul_result_interface_method_count(const ul_result* result) {
+    return ul_result_has_interface(result) ? static_cast<int32_t>(result->result.scriptInterface->methods.size()) : 0;
+}
+
+int32_t ul_result_interface_method(const ul_result* result, int32_t index, ul_script_method* out) {
+    if (!ul_result_has_interface(result) || !out || !InRange(index, result->result.scriptInterface->methods.size())) return 0;
+    const UdonLuau::ScriptMethod& m = result->result.scriptInterface->methods[static_cast<size_t>(index)];
+    *out = { m.name.c_str(), m.entryPoint.c_str(), static_cast<int32_t>(m.parameters.size()), static_cast<int32_t>(m.returns.size()) };
+    return 1;
+}
+
+int32_t ul_result_interface_method_value(const ul_result* result, int32_t method, int32_t is_return, int32_t index, ul_script_variable* out) {
+    if (!ul_result_has_interface(result) || !out || !InRange(method, result->result.scriptInterface->methods.size())) return 0;
+    const UdonLuau::ScriptMethod& m = result->result.scriptInterface->methods[static_cast<size_t>(method)];
+    const auto& values = is_return ? m.returns : m.parameters;
+    if (!InRange(index, values.size())) return 0;
+    Fill(values[static_cast<size_t>(index)], out);
+    return 1;
 }
 
 const char* ul_result_disassembly(ul_result* result) {

@@ -79,6 +79,20 @@ typedef struct ul_attribute {
     int32_t     argument_count;
 } ul_attribute;
 
+typedef struct ul_script_variable {
+    const char* name;
+    const char* type;
+    const char* script;
+    const char* symbol;
+} ul_script_variable;
+
+typedef struct ul_script_method {
+    const char* name;
+    const char* entry_point;
+    int32_t     parameter_count;
+    int32_t     return_count;
+} ul_script_method;
+
 typedef struct ul_entry_point {
     const char* name;
     uint32_t    address;
@@ -114,6 +128,24 @@ UDONLUAU_API void ul_catalog_add_standard_events(ul_catalog* catalog);
 
 /// <summary>Sets the ';'-separated namespaces that decide an ambiguous short type name, highest priority first.</summary>
 UDONLUAU_API void ul_catalog_set_preferred_namespaces(ul_catalog* catalog, const char* namespaces);
+
+/// <summary>Adds a behaviour script that Luau code can hold typed references to, replacing any earlier one with the same name.</summary>
+UDONLUAU_API void ul_catalog_add_script(ul_catalog* catalog, const char* name);
+
+/// <summary>Adds a public field to a script added earlier. script_type names a behaviour script when the field holds a typed reference to one.</summary>
+/// <returns>0 when the script is unknown.</returns>
+UDONLUAU_API int32_t ul_catalog_add_script_field(ul_catalog* catalog, const char* script, const char* name, const char* udon_type, const char* script_type, const char* symbol);
+
+/// <summary>Adds a public method to a script added earlier.</summary>
+/// <returns>0 when the script is unknown.</returns>
+UDONLUAU_API int32_t ul_catalog_add_script_method(ul_catalog* catalog, const char* script, const char* name, const char* entry_point);
+
+/// <summary>Appends a parameter (is_return 0) or a return value (is_return 1) to a method added earlier.</summary>
+/// <returns>0 when the script or method is unknown.</returns>
+UDONLUAU_API int32_t ul_catalog_add_script_method_value(ul_catalog* catalog, const char* script, const char* method, int32_t is_return, const char* name, const char* udon_type, const char* script_type, const char* symbol);
+
+/// <summary>Reads a module's public methods and fields without compiling function bodies. The result has no program.</summary>
+UDONLUAU_API ul_result* ul_extract_interface(const ul_catalog* catalog, const char* source, size_t length, const char* defines);
 
 /// <summary>Compiles Luau source against the catalog. Always returns a result.</summary>
 UDONLUAU_API ul_result* ul_compile(const ul_catalog* catalog, const char* source, size_t length);
@@ -154,6 +186,16 @@ UDONLUAU_API int32_t ul_result_sync_count(const ul_result* result);
 UDONLUAU_API int32_t ul_result_sync(const ul_result* result, int32_t index, ul_sync_variable* out);
 
 UDONLUAU_API int32_t ul_result_update_order(const ul_result* result);
+
+/// <summary>Whether the result carries the module's public interface, which it does whenever its declarations were valid.</summary>
+UDONLUAU_API int32_t ul_result_has_interface(const ul_result* result);
+UDONLUAU_API int32_t ul_result_interface_field_count(const ul_result* result);
+UDONLUAU_API int32_t ul_result_interface_field(const ul_result* result, int32_t index, ul_script_variable* out);
+UDONLUAU_API int32_t ul_result_interface_method_count(const ul_result* result);
+UDONLUAU_API int32_t ul_result_interface_method(const ul_result* result, int32_t index, ul_script_method* out);
+
+/// <summary>A parameter (is_return 0) or return value (is_return 1) of a public method.</summary>
+UDONLUAU_API int32_t ul_result_interface_method_value(const ul_result* result, int32_t method, int32_t is_return, int32_t index, ul_script_variable* out);
 
 /// <summary>A readable listing of the compiled program, or an empty string when compilation failed.</summary>
 UDONLUAU_API const char* ul_result_disassembly(ul_result* result);
