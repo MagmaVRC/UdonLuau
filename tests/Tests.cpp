@@ -421,7 +421,8 @@ end
         Fixture f = MakeFixture();
         f.Type("Foo.Thing", TypeKind::Class);
         f.Type("Bar.Thing", TypeKind::Class);
-        auto p = Build(f, R"(
+        auto p = Build(f, R"(-- @syncmode(manual)
+
 type UObject = UnityEngine.Object
 local SDKBase = VRC.SDKBase
 local V3 = Vector3
@@ -456,6 +457,7 @@ end
                      speed->attributes[1].name == "range" && speed->attributes[1].arguments == std::vector<std::string>{ "0", "10" } &&
                      speed->attributes[2].name == "tooltip" && speed->attributes[2].arguments == std::vector<std::string>{ "Degrees, per second" };
         Check(attrs, "attributes passed through in order with parsed arguments");
+        Check(p->attributes.size() == 1 && p->attributes[0].name == "syncmode" && p->attributes[0].arguments == std::vector<std::string>{ "manual" }, "module annotations");
         Check(p->sync.size() == 1 && p->sync[0].symbol == "speed" && p->sync[0].interpolation == SyncInterpolation::Linear, "sync(linear)");
         Check(slot("Object") && slot("Object")->type == "UnityEngineTransform", "variable named Object");
         Check(slot("anyObject") && slot("anyObject")->type == "UnityEngineObject", "Object prefers UnityEngine");

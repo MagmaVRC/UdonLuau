@@ -13,6 +13,7 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -300,6 +301,7 @@ namespace UdonLuau {
         private:
             void IndexSource(const std::vector<Comment>& comments);
             Annotations AnnotationsFor(const Location& location) const;
+            std::vector<FieldAttribute> ModuleAttributes(AstStatBlock* root) const;
             std::string_view TextAt(const Location& location) const;
             void Report(const Location& location, std::string message, Severity severity = Severity::Error);
 
@@ -392,6 +394,7 @@ namespace UdonLuau {
             std::string_view                               source_;
             std::vector<size_t>                            lineStarts_;
             std::map<unsigned, std::vector<std::pair<FieldAttribute, Location>>> commentAttributes_;
+            std::set<unsigned>                             commentLines_;
             std::unordered_map<AstLocal*, Value>           aliases_;
             std::unordered_map<std::string, const Type*>   typeAliases_;
             std::vector<Diagnostic>                        diagnostics_;
@@ -444,7 +447,10 @@ namespace UdonLuau {
             CheckRecursion();
 
             bool failed = std::ranges::any_of(diagnostics_, [](const Diagnostic& d) { return d.severity == Severity::Error; });
-            if (!failed) result.program = emit_.Finish(std::move(entries_), std::move(sync_));
+            if (!failed) {
+                result.program = emit_.Finish(std::move(entries_), std::move(sync_));
+                result.program->attributes = ModuleAttributes(parsed.root);
+            }
             result.diagnostics = std::move(diagnostics_);
             return result;
         }
@@ -467,6 +473,7 @@ namespace UdonLuau {
 
             for (const Comment& c : comments) {
                 if (c.type != Lexeme::Comment) continue;
+                commentLines_.insert(c.location.begin.line);
                 std::string_view text = TextAt(c.location);
                 while (text.starts_with('-')) text.remove_prefix(1);
                 auto& attributes = commentAttributes_[c.location.begin.line];
@@ -486,9 +493,9 @@ namespace UdonLuau {
 
         Annotations Compiler::AnnotationsFor(const Location& location) const {
             std::vector<const std::pair<FieldAttribute, Location>*> found;
-            for (unsigned line = location.begin.line; line > 0;) {
+            for (unsigned line = location.begin.line; line > 0 && commentLines_.contains(line - 1);) {
                 auto it = commentAttributes_.find(--line);
-                if (it == commentAttributes_.end()) break;
+                if (it == commentAttributes_.end()) continue;
                 for (auto rit = it->second.rbegin(); rit != it->second.rend(); ++rit) found.insert(found.begin(), &*rit);
             }
             if (auto it = commentAttributes_.find(location.begin.line); it != commentAttributes_.end())
@@ -508,6 +515,20 @@ namespace UdonLuau {
                 else if (mode != "none") Fail(entry->second, std::format("unknown sync mode '{}'; use none, linear or smooth", mode));
             }
             return a;
+        }
+
+        std::vector<FieldAttribute> Compiler::ModuleAttributes(AstStatBlock* root) const {
+            unsigned first = root->body.size ? root->body.data[0]->location.begin.line : std::numeric_limits<unsigned>::max();
+            unsigned attached = first;
+            while (attached > 0 && commentLines_.contains(attached - 1)) --attached;
+            if (!root->body.size) attached = first;
+
+            std::vector<FieldAttribute> out;
+            for (const auto& [line, entries] : commentAttributes_) {
+                if (line >= attached) break;
+                for (const auto& entry : entries) out.push_back(entry.first);
+            }
+            return out;
         }
 
         const Type* Compiler::PreferredType(const std::vector<const Type*>& matches) const {

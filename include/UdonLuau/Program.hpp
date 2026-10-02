@@ -28,18 +28,21 @@ namespace UdonLuau {
         String,
         This,
         Type,
+        Construct,
     };
 
     /// <summary>The initial value of a heap slot. Integer also carries enum values; This means
     /// the behaviour, its GameObject or its Transform, chosen by the slot type; Type names a
-    /// System.Type by its Udon name in text.</summary>
+    /// System.Type by its Udon name in text; Construct is the result of calling the constructor
+    /// extern named in text with the constant arguments.</summary>
     struct HeapValue {
-        ValueKind   kind = ValueKind::Default;
-        bool        boolean = false;
-        int64_t     integer = 0;
-        uint64_t    unsignedInteger = 0;
-        double      real = 0.0;
-        std::string text;
+        ValueKind              kind = ValueKind::Default;
+        bool                   boolean = false;
+        int64_t                integer = 0;
+        uint64_t               unsignedInteger = 0;
+        double                 real = 0.0;
+        std::string            text;
+        std::vector<HeapValue> arguments;
     };
 
     /// <summary>An annotation written above a variable, such as <c>-- @range(0, 10)</c>. String
@@ -74,12 +77,14 @@ namespace UdonLuau {
     };
 
     /// <summary>A compiled Udon program: code words, heap layout with initial values, exported
-    /// entry points and sync metadata. Heap addresses are indices into heap.</summary>
+    /// entry points, sync metadata and the annotations written at the top of the file. Heap
+    /// addresses are indices into heap.</summary>
     struct Program {
         std::vector<uint32_t>     code;
         std::vector<HeapSlot>     heap;
         std::vector<EntryPoint>   entryPoints;
         std::vector<SyncVariable> sync;
+        std::vector<FieldAttribute> attributes;
         int                       updateOrder = 0;
 
         /// <summary>The code in Udon's serialized big-endian byte order.</summary>

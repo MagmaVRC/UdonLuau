@@ -151,25 +151,44 @@ namespace {
         return &result->result.program->heap[static_cast<size_t>(address)];
     }
 
+    const std::vector<UdonLuau::FieldAttribute>* AttributesAt(const ul_result* result, int32_t address) {
+        if (address == -1) return result && result->result.program ? &result->result.program->attributes : nullptr;
+        const UdonLuau::HeapSlot* slot = SlotAt(result, address);
+        return slot ? &slot->attributes : nullptr;
+    }
+
 } // namespace
 
-int32_t ul_result_attribute_count(const ul_result* result, int32_t address) {
+int32_t ul_result_heap_argument_count(const ul_result* result, int32_t address) {
     const UdonLuau::HeapSlot* slot = SlotAt(result, address);
-    return slot ? static_cast<int32_t>(slot->attributes.size()) : 0;
+    return slot ? static_cast<int32_t>(slot->value.arguments.size()) : 0;
+}
+
+int32_t ul_result_heap_argument(const ul_result* result, int32_t address, int32_t index, ul_heap_value* out) {
+    const UdonLuau::HeapSlot* slot = SlotAt(result, address);
+    if (!slot || !out || !InRange(index, slot->value.arguments.size())) return 0;
+    const UdonLuau::HeapValue& v = slot->value.arguments[static_cast<size_t>(index)];
+    *out = { static_cast<int32_t>(v.kind), v.boolean, v.integer, v.unsignedInteger, v.real, v.text.c_str(), static_cast<int32_t>(v.arguments.size()) };
+    return 1;
+}
+
+int32_t ul_result_attribute_count(const ul_result* result, int32_t address) {
+    const auto* attributes = AttributesAt(result, address);
+    return attributes ? static_cast<int32_t>(attributes->size()) : 0;
 }
 
 int32_t ul_result_attribute(const ul_result* result, int32_t address, int32_t index, ul_attribute* out) {
-    const UdonLuau::HeapSlot* slot = SlotAt(result, address);
-    if (!slot || !out || !InRange(index, slot->attributes.size())) return 0;
-    const UdonLuau::FieldAttribute& a = slot->attributes[static_cast<size_t>(index)];
+    const auto* attributes = AttributesAt(result, address);
+    if (!attributes || !out || !InRange(index, attributes->size())) return 0;
+    const UdonLuau::FieldAttribute& a = (*attributes)[static_cast<size_t>(index)];
     *out = { a.name.c_str(), static_cast<int32_t>(a.arguments.size()) };
     return 1;
 }
 
 const char* ul_result_attribute_argument(const ul_result* result, int32_t address, int32_t index, int32_t argument) {
-    const UdonLuau::HeapSlot* slot = SlotAt(result, address);
-    if (!slot || !InRange(index, slot->attributes.size())) return nullptr;
-    const UdonLuau::FieldAttribute& a = slot->attributes[static_cast<size_t>(index)];
+    const auto* attributes = AttributesAt(result, address);
+    if (!attributes || !InRange(index, attributes->size())) return nullptr;
+    const UdonLuau::FieldAttribute& a = (*attributes)[static_cast<size_t>(index)];
     return InRange(argument, a.arguments.size()) ? a.arguments[static_cast<size_t>(argument)].c_str() : nullptr;
 }
 

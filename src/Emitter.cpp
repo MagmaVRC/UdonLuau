@@ -7,8 +7,14 @@ namespace UdonLuau::Detail {
 
     namespace {
 
+        std::string ValueKey(const HeapValue& v) {
+            std::string key = std::format("{}|{}|{}|{}|{}|{}", static_cast<int>(v.kind), v.boolean, v.integer, v.unsignedInteger, v.real, v.text);
+            for (const HeapValue& a : v.arguments) key += "(" + ValueKey(a) + ")";
+            return key;
+        }
+
         std::string ConstantKey(const Type* type, const HeapValue& v) {
-            return std::format("{}|{}|{}|{}|{}|{}|{}", type->udonName, static_cast<int>(v.kind), v.boolean, v.integer, v.unsignedInteger, v.real, v.text);
+            return type->udonName + "|" + ValueKey(v);
         }
 
     } // namespace

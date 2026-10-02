@@ -38,7 +38,18 @@ typedef enum ul_value_kind {
     UL_VALUE_STRING = 6,
     UL_VALUE_THIS = 7,
     UL_VALUE_TYPE = 8,
+    UL_VALUE_CONSTRUCT = 9,
 } ul_value_kind;
+
+typedef struct ul_heap_value {
+    int32_t     kind;
+    int32_t     boolean;
+    int64_t     integer;
+    uint64_t    unsigned_integer;
+    double      real;
+    const char* text;
+    int32_t     argument_count;
+} ul_heap_value;
 
 typedef struct ul_diagnostic {
     int32_t     is_warning;
@@ -120,7 +131,12 @@ UDONLUAU_API const uint8_t* ul_result_bytecode(const ul_result* result, size_t* 
 UDONLUAU_API int32_t ul_result_heap_count(const ul_result* result);
 UDONLUAU_API int32_t ul_result_heap_slot(const ul_result* result, int32_t address, ul_heap_slot* out);
 
-/// <summary>Annotations written above the variable at a heap address, such as @range(0, 10).</summary>
+/// <summary>Constant arguments of a UL_VALUE_CONSTRUCT slot, in constructor parameter order.</summary>
+UDONLUAU_API int32_t ul_result_heap_argument_count(const ul_result* result, int32_t address);
+UDONLUAU_API int32_t ul_result_heap_argument(const ul_result* result, int32_t address, int32_t index, ul_heap_value* out);
+
+/// <summary>Annotations written above the variable at a heap address, such as @range(0, 10).
+/// Address -1 reads the annotations at the top of the file.</summary>
 UDONLUAU_API int32_t ul_result_attribute_count(const ul_result* result, int32_t address);
 UDONLUAU_API int32_t ul_result_attribute(const ul_result* result, int32_t address, int32_t index, ul_attribute* out);
 UDONLUAU_API const char* ul_result_attribute_argument(const ul_result* result, int32_t address, int32_t index, int32_t argument);
