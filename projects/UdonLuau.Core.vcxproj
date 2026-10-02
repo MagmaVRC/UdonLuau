@@ -29,6 +29,7 @@
   <ItemGroup>
     <ClInclude Include="..\include\UdonLuau\Catalog.hpp" />
     <ClInclude Include="..\include\UdonLuau\Compiler.hpp" />
+    <ClInclude Include="..\include\UdonLuau\Definitions.hpp" />
     <ClInclude Include="..\include\UdonLuau\Program.hpp" />
     <ClInclude Include="..\src\Emitter.hpp" />
     <ClInclude Include="..\src\TypeSystem.hpp" />
@@ -36,6 +37,7 @@
   <ItemGroup>
     <ClCompile Include="..\src\Catalog.cpp" />
     <ClCompile Include="..\src\Compiler.cpp" />
+    <ClCompile Include="..\src\Definitions.cpp" />
     <ClCompile Include="..\src\Emitter.cpp" />
     <ClCompile Include="..\src\Program.cpp" />
     <ClCompile Include="..\src\TypeSystem.cpp" />

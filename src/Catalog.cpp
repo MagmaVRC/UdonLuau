@@ -241,6 +241,13 @@ namespace UdonLuau {
         else slot = std::make_unique<ScriptInfo>(std::move(script));
     }
 
+    std::vector<const ScriptInfo*> Catalog::Scripts() const {
+        std::vector<const ScriptInfo*> out;
+        out.reserve(impl_->scripts.size());
+        for (auto& [_, s] : impl_->scripts) out.push_back(s.get());
+        return out;
+    }
+
     const ScriptInfo* Catalog::FindScript(std::string_view name) const {
         auto it = impl_->scripts.find(name);
         return it == impl_->scripts.end() ? nullptr : it->second.get();

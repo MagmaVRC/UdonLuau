@@ -121,6 +121,7 @@ namespace UdonLuau {
         /// <summary>Adds or replaces a behaviour script that Luau code can hold typed references to.</summary>
         void AddScript(ScriptInfo script);
         [[nodiscard]] const ScriptInfo* FindScript(std::string_view name) const;
+        [[nodiscard]] std::vector<const ScriptInfo*> Scripts() const;
 
         struct SyncSupport {
             bool linear = false;
