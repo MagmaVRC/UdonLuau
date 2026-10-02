@@ -183,7 +183,13 @@ end
 - **Members:** `obj.Property`, `obj:Method(args)`, `Type.StaticMember`, `Type.new(args)` (constructors) and `Enum.Member`.
 - **Generic methods:** pass the type as the last argument, `obj:GetComponent(Rigidbody)`, or explicitly with `obj:GetComponent<<Rigidbody>>()`.
 - **Out parameters:** these become extra return values, for example `local hit, info = Physics.Raycast(origin, direction)`.
-- **Operators:** they map to the operator externs. `/` on integers divides as floats, `//` divides as integers, `..` and backtick strings concatenate, `#` gives `Length` or `Count`, and `and`, `or` and `not` short-circuit on booleans.
+- **Operators:** they map to the operator externs, and constant folding gives the same results as run time.
+  - `/` on integers divides as floats.
+  - `//` truncates toward zero on integers and floors on floats.
+  - `%` is the remainder with the sign of the dividend, as in C#.
+  - `..` and backtick strings concatenate, and `#` gives `Length` or `Count`.
+  - `and`, `or` and `not` short-circuit on booleans.
+  - `value :: int` rounds a float the way `System.Convert` does.
 - **Truthiness:** an object in a condition means "is not nil".
 - **Built-ins:** `print`, `warn` and `tostring`.
 
