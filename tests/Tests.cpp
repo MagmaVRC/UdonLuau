@@ -417,6 +417,55 @@ end
         Check(std::get<int32_t>(m.Var("joined")) == 2, "event ran twice");
     });
 
+    Case("names, aliases and annotations", [] {
+        Fixture f = MakeFixture();
+        f.Type("Foo.Thing", TypeKind::Class);
+        f.Type("Bar.Thing", TypeKind::Class);
+        auto p = Build(f, R"(
+type UObject = UnityEngine.Object
+local SDKBase = VRC.SDKBase
+local V3 = Vector3
+
+-- @header("Movement")
+-- @range(0, 10)
+-- @tooltip("Degrees, per second")
+-- @sync(linear)
+export local speed: number = 1
+export local Object: Transform
+export local anyObject: Object
+export local owner: SDKBase.VRCPlayerApi
+local raw: UObject
+
+function Start()
+    if not Object then
+        Object = transform
+    end
+    local v = V3.new(1, 2, 3)
+end
+)");
+        Check(p.has_value(), "compiles");
+        if (!p) return;
+        auto slot = [&](std::string_view name) -> const HeapSlot* {
+            for (const HeapSlot& s : p->heap)
+                if (s.symbol == name) return &s;
+            return nullptr;
+        };
+        const HeapSlot* speed = slot("speed");
+        bool attrs = speed && speed->attributes.size() == 3 &&
+                     speed->attributes[0].name == "header" && speed->attributes[0].arguments == std::vector<std::string>{ "Movement" } &&
+                     speed->attributes[1].name == "range" && speed->attributes[1].arguments == std::vector<std::string>{ "0", "10" } &&
+                     speed->attributes[2].name == "tooltip" && speed->attributes[2].arguments == std::vector<std::string>{ "Degrees, per second" };
+        Check(attrs, "attributes passed through in order with parsed arguments");
+        Check(p->sync.size() == 1 && p->sync[0].symbol == "speed" && p->sync[0].interpolation == SyncInterpolation::Linear, "sync(linear)");
+        Check(slot("Object") && slot("Object")->type == "UnityEngineTransform", "variable named Object");
+        Check(slot("anyObject") && slot("anyObject")->type == "UnityEngineObject", "Object prefers UnityEngine");
+        Check(slot("owner") && slot("owner")->type == "VRCSDKBaseVRCPlayerApi", "namespace alias in annotation");
+        Check(slot("raw") && slot("raw")->type == "UnityEngineObject", "type alias");
+        Check(!slot("SDKBase") && !slot("V3"), "aliases take no heap slots");
+        Check(HasError(f, "local t: Thing", "ambiguous"), "ambiguous name outside preferred namespaces");
+        Check(HasError(f, "-- @sync(fast)\nlocal x = 1", "unknown sync mode"), "bad sync mode");
+    });
+
     Case("diagnostics", [] {
         Fixture f = MakeFixture();
         Check(HasError(f, "function Start() transform:Nope() end", "has no member 'Nope'"), "unknown member");

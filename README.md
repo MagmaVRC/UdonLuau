@@ -64,8 +64,10 @@ A `Program` holds everything needed to build an `IUdonProgram`:
 UdonLuau compiles a statically typed subset of Luau. Each file becomes one UdonBehaviour program.
 
 ```lua
+-- @header("Motion")
+-- @range(0, 10)
 export local speed: number = 2
--- @sync linear
+-- @sync(linear)
 local height: number = 0
 
 local function wave(t: number): number
@@ -92,7 +94,8 @@ end
 
 - Module-level `local`s are behaviour variables; their initializers must be constants.
 - `export local` exposes a variable in the inspector, using Luau's export syntax.
-- `-- @sync`, `-- @sync linear` and `-- @sync smooth` add sync metadata.
+- `-- @sync`, `-- @sync(linear)` and `-- @sync(smooth)` add sync metadata.
+- Any other `-- @name(args)` annotation directly above a variable is kept on its heap slot for the host, for example `@range(0, 10)`, `@header("Motion")` or `@tooltip("...")`. The compiler does not interpret these; the editor decides what they mean.
 - Global functions are entry points:
   - a function named after a VRChat event (`Start`, `Update`, `Interact`, `OnPlayerJoined`, ...) receives that event, with its parameters;
   - any other global function is a custom event, callable through `SendCustomEvent`.
@@ -103,7 +106,10 @@ end
 
 - **Numeric aliases:** `int`, `uint`, `long`, `ulong`, `short`, `ushort`, `byte`, `sbyte`, `float` (also `number`), `double`.
 - **Other built-in types:** `boolean`, `string`, `any`.
-- **Engine and SDK types:** short names (`Vector3`, `Transform`, `VRCPlayerApi`). A name shared by several namespaces must be qualified (`UnityEngine.Object`).
+- **Engine and SDK types:** short names (`Vector3`, `Transform`, `VRCPlayerApi`).
+  - A name shared by several namespaces resolves through the preferred namespaces, highest priority first: UnityEngine, VRC.SDKBase, VRC.SDK3.Components, VRC.SDK3.Data, VRC.Udon, System. So `Object` is `UnityEngine.Object`; `System.Object` is `any`. Hosts can change the list.
+  - Anything else is written qualified (`UnityEngine.Random`) or through an alias: `type UObject = UnityEngine.Object` for annotations, and `local SDK3 = VRC.SDK3.Components` for namespaces, which then also works in annotations (`x: SDK3.VRCPickup`).
+  - Variables shadow type names, so a field called `Object` is just a field.
 - **Arrays:** `{T}`, built with `{a, b, c}` or iterated with `for i, v in array do`. Indices start at 0, as everywhere in Udon.
 - **Inference:** locals take the type of their initializer. Integer literals are `int` and other number literals are `float`, unless the context needs another numeric type.
 - **Conversions:** widening numeric conversions are implicit. Narrowing ones are written `value :: int`.
