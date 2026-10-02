@@ -711,6 +711,43 @@ end
         Check(m.counters.externs == 1, std::format("Vector3.up read without an extern ({} externs)", m.counters.externs));
     });
 
+    Case("pure calls with constant arguments are built into the heap", [] {
+        Fixture f = MakeFixture();
+        auto p = Build(f, R"(
+local y: number = 0
+local z: number = 0
+function Start()
+    y = Mathf.Floor(2.5)
+    z = Mathf.PI * 2
+end
+)");
+        Check(p.has_value(), "compiles");
+        if (!p) return;
+        Machine m(f, *p);
+        m.Run("_start");
+        Check(std::get<float>(m.Var("y")) == 2.0f && std::get<float>(m.Var("z")) == 3.14159265358979f * 2.0f, "values");
+        Check(m.counters.externs == 0, std::format("no externs at run time ({})", m.counters.externs));
+    });
+
+    Case("repeated reads reuse the first result until something could change it", [] {
+        Fixture f = MakeFixture();
+        auto p = Build(f, R"(
+local y: number = 0
+local v = Vector3.new(1, 2, 3)
+function Start()
+    y = v.y + v.y
+    v.y = 5
+    y = y + v.y
+end
+)");
+        Check(p.has_value(), "compiles");
+        if (!p) return;
+        Machine m(f, *p);
+        m.Run("_start");
+        Check(std::get<float>(m.Var("y")) == 9.0f, std::format("value ({})", std::get<float>(m.Var("y"))));
+        Check(m.counters.externs == 5, std::format("v.y read once before the write ({} externs)", m.counters.externs));
+    });
+
     Case("negated conditions branch without an extern", [] {
         Fixture f = MakeFixture();
         auto p = Build(f, R"(
@@ -737,6 +774,31 @@ end
         m.Run("_start");
         Check(std::get<int32_t>(m.Var("n")) == 6, std::format("result ({})", std::get<int32_t>(m.Var("n"))));
         Check(std::ranges::none_of(p->heap, [](const HeapSlot& s) { return s.value.text.find("op_UnaryNegation") != std::string::npos; }), "no negation extern");
+    });
+
+    Case("calls that cannot write variables skip operand copies", [] {
+        Fixture f = MakeFixture();
+        auto p = Build(f, R"(
+local n = 2
+local total = 0
+local function square(x: int): int
+    return x * x
+end
+-- @noinline
+local function triple(): int
+    local a = n * 3
+    return a + 1
+end
+function Start()
+    total += square(n)
+    total = (n + 5) + triple()
+end
+)");
+        Check(p.has_value(), "compiles");
+        if (!p) return;
+        Machine m(f, *p);
+        m.Run("_start");
+        Check(std::get<int32_t>(m.Var("total")) == 14, std::format("result ({})", std::get<int32_t>(m.Var("total"))));
     });
 
     Case("switch-style chains become jump tables", [] {

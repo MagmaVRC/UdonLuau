@@ -123,18 +123,58 @@ namespace UdonLuau {
 
         class CallFinder : public AstVisitor {
         public:
+            explicit CallFinder(const std::function<bool(AstExprCall*)>& harmless) : harmless(harmless) {}
+            const std::function<bool(AstExprCall*)>& harmless;
             bool found = false;
-            bool visit(AstExprCall*) override {
+            bool visit(AstExprCall* c) override {
+                if (harmless(c)) return true;
                 found = true;
                 return false;
             }
         };
 
-        bool HasCall(AstExpr* expr) {
-            CallFinder finder;
-            expr->visit(&finder);
-            return finder.found;
+        AstExpr* CallTarget(AstExprCall* c) {
+            AstExpr* func = c->func;
+            while (true) {
+                if (auto* g = func->as<AstExprGroup>()) func = g->expr;
+                else if (auto* i = func->as<AstExprInstantiate>()) func = i->expr;
+                else return func;
+            }
         }
+
+        bool IsPureStaticCall(AstExprCall* c) {
+            static const std::set<std::string, std::less<>> types{ "Mathf", "math", "Vector2", "Vector3", "Vector4", "Quaternion", "Color", "Vector2Int", "Vector3Int" };
+            if (c->self) return false;
+            auto* index = CallTarget(c)->as<AstExprIndexName>();
+            if (!index) return false;
+            auto* global = index->expr->as<AstExprGlobal>();
+            return global && types.contains(global->name.value) && std::string_view(index->index.value) != "OrthoNormalize";
+        }
+
+        class PurityScan : public AstVisitor {
+        public:
+            explicit PurityScan(std::function<bool(AstExprCall*)> pureCall) : pureCall(std::move(pureCall)) {}
+            std::function<bool(AstExprCall*)> pureCall;
+            bool pure = true;
+
+            void Target(AstExpr* e) {
+                while (auto* g = e->as<AstExprGroup>()) e = g->expr;
+                auto* l = e->as<AstExprLocal>();
+                if (!l || l->local->functionDepth == 0) pure = false;
+            }
+            bool visit(AstStatAssign* s) override {
+                for (AstExpr* v : s->vars) Target(v);
+                return pure;
+            }
+            bool visit(AstStatCompoundAssign* s) override {
+                Target(s->var);
+                return pure;
+            }
+            bool visit(AstExprCall* c) override {
+                if (!pureCall(c)) pure = false;
+                return pure;
+            }
+        };
 
         class NodeCounter : public AstVisitor {
         public:
@@ -384,6 +424,45 @@ namespace UdonLuau {
             return e.module == "UnityEngineQuaternion" && e.method == "get_identity";
         }
 
+        bool IsFoldableCall(const ExternInfo& e) {
+            static const std::set<std::string, std::less<>> math{ "Abs", "Max", "Min", "Clamp", "Clamp01", "Sqrt", "Sin", "Cos", "Tan", "Asin", "Acos", "Atan", "Atan2", "Pow",
+                                                                  "Exp", "Log", "Log10", "Floor", "Ceil", "Round", "FloorToInt", "CeilToInt", "RoundToInt", "Sign", "Lerp",
+                                                                  "LerpUnclamped", "InverseLerp", "Repeat", "PingPong", "DeltaAngle", "MoveTowards", "SmoothStep",
+                                                                  "ClosestPowerOfTwo", "IsPowerOfTwo", "NextPowerOfTwo", "Truncate" };
+            if (!e.isStatic || e.isGeneric) return false;
+            if (e.module == "UnityEngineMathf" || e.module == "SystemMath") return math.contains(e.method);
+            return e.module == "UnityEngineQuaternion" && e.method == "Euler";
+        }
+
+        bool HasNoSideEffects(const ExternInfo& e, bool hasReceiver) {
+            static const std::set<std::string, std::less<>> modules{ "UnityEngineMathf", "SystemMath", "SystemConvert", "UnityEngineVector2", "UnityEngineVector3",
+                                                                     "UnityEngineVector4", "UnityEngineQuaternion", "UnityEngineColor", "UnityEngineVector2Int",
+                                                                     "UnityEngineVector3Int" };
+            if (e.method.starts_with("get_") || e.method.starts_with("op_")) return true;
+            return !hasReceiver && !e.isGeneric && modules.contains(e.module) && e.method != "OrthoNormalize";
+        }
+
+        bool IsStableRead(const ExternInfo& e, const Type* receiver) {
+            static const std::set<std::string, std::less<>> transform{ "get_position", "get_rotation", "get_localPosition", "get_localRotation", "get_localScale",
+                                                                       "get_eulerAngles", "get_localEulerAngles", "get_forward", "get_right", "get_up",
+                                                                       "get_lossyScale", "get_parent", "get_root", "get_childCount", "get_transform",
+                                                                       "get_gameObject" };
+            if (!receiver || !e.method.starts_with("get_") || !e.parameters.empty()) return false;
+            if (receiver->IsValueType()) return true;
+            return (e.module == "UnityEngineTransform" || e.module == "UnityEngineGameObject" || e.module == "UnityEngineComponent") && transform.contains(e.method);
+        }
+
+        std::optional<double> MathfConstant(std::string_view name) {
+            constexpr float pi = 3.14159265358979f;
+            constexpr float deg2rad = pi * 2.0f / 360.0f;
+            if (name == "PI") return pi;
+            if (name == "Deg2Rad") return deg2rad;
+            if (name == "Rad2Deg") return 1.0f / deg2rad;
+            if (name == "Infinity") return std::numeric_limits<float>::infinity();
+            if (name == "NegativeInfinity") return -std::numeric_limits<float>::infinity();
+            return std::nullopt;
+        }
+
         bool IsComparison(AstExprBinary::Op op) {
             return op == AstExprBinary::CompareEq || op == AstExprBinary::CompareNe || op == AstExprBinary::CompareLt ||
                    op == AstExprBinary::CompareLe || op == AstExprBinary::CompareGt || op == AstExprBinary::CompareGe;
@@ -487,6 +566,9 @@ namespace UdonLuau {
             HeapValue Literal(const Value& value, const Type* type, const Location& location) const;
             void Store(const Value& value, const Variable& destination, const Location& location);
             Value Evaluate(const Value& value);
+            Function* Callee(AstExpr* func) const;
+            bool CannotWrite(AstExprCall* call) const;
+            bool HasCall(AstExpr* expr) const;
 
             const Type* ResolveType(AstType* type);
             const Type* ResolveTypeName(std::string_view name, const Location& location);
@@ -529,6 +611,7 @@ namespace UdonLuau {
             const CompileOptions&                          options_;
             std::unordered_map<std::string, Value>         defines_;
             std::unordered_set<AstLocal*>                  assigned_;
+            std::unordered_set<const Function*>            pure_;
             std::unordered_set<AstLocal*>                  memberAssigned_;
             bool Immutable(AstLocal* local, const Type* type) const {
                 return !assigned_.contains(local) && (!memberAssigned_.contains(local) || (type && type->IsReference()));
@@ -877,19 +960,48 @@ namespace UdonLuau {
             for (const auto& [name, value] : options_.defines) defines_[name] = parse(value);
         }
 
+        Function* Compiler::Callee(AstExpr* func) const {
+            while (auto* g = func->as<AstExprGroup>()) func = g->expr;
+            if (auto* l = func->as<AstExprLocal>()) {
+                if (auto it = localFunctions_.find(l->local); it != localFunctions_.end()) return it->second;
+            } else if (auto* g = func->as<AstExprGlobal>()) {
+                if (auto it = globalFunctions_.find(g->name.value); it != globalFunctions_.end()) return it->second;
+            }
+            return nullptr;
+        }
+
+        bool Compiler::CannotWrite(AstExprCall* call) const {
+            if (IsPureStaticCall(call)) return true;
+            Function* f = call->self ? nullptr : Callee(CallTarget(call));
+            return f && pure_.contains(f);
+        }
+
+        bool Compiler::HasCall(AstExpr* expr) const {
+            std::function<bool(AstExprCall*)> harmless = [this](AstExprCall* c) { return CannotWrite(c); };
+            CallFinder finder(harmless);
+            expr->visit(&finder);
+            return finder.found;
+        }
+
         void Compiler::Analyze(AstStatBlock* root) {
             auto record = [&](AstExpr* func) {
-                while (auto* g = func->as<AstExprGroup>()) func = g->expr;
-                Function* f = nullptr;
-                if (auto* l = func->as<AstExprLocal>()) {
-                    if (auto it = localFunctions_.find(l->local); it != localFunctions_.end()) f = it->second;
-                } else if (auto* g = func->as<AstExprGlobal>()) {
-                    if (auto it = globalFunctions_.find(g->name.value); it != globalFunctions_.end()) f = it->second;
-                }
-                if (f) ++f->calls;
+                if (Function* f = Callee(func)) ++f->calls;
             };
             Analysis analysis(assigned_, memberAssigned_, record);
             root->visit(&analysis);
+
+            for (bool changed = true; changed;) {
+                changed = false;
+                for (auto& f : functions_) {
+                    if (f->event || f->exported || pure_.contains(f.get())) continue;
+                    PurityScan scan([this](AstExprCall* c) { return CannotWrite(c); });
+                    f->node->body->visit(&scan);
+                    if (scan.pure) {
+                        pure_.insert(f.get());
+                        changed = true;
+                    }
+                }
+            }
 
             for (auto& f : functions_) {
                 NodeCounter counter;
@@ -1901,6 +2013,8 @@ namespace UdonLuau {
                 }
                 if (!t->fullName.empty())
                     if (const Type* nested = types_.FindByFullName(t->fullName + "+" + std::string(name))) return Value::OfType(nested);
+                if (t->udonName == "UnityEngineMathf")
+                    if (auto constant = MathfConstant(name)) return Value::OfReal(*constant);
                 return CallStatic(t, "get_" + std::string(name), {}, nullptr, location).at(0);
             }
 
@@ -2077,7 +2191,7 @@ namespace UdonLuau {
             std::vector<Value> parts;
             for (size_t i = 0; i < operands.size(); ++i) {
                 Value part = CompileExpr(operands[i]);
-                bool laterCall = std::any_of(operands.begin() + static_cast<ptrdiff_t>(i) + 1, operands.end(), [](AstExpr* e) { return HasCall(e); });
+                bool laterCall = std::any_of(operands.begin() + static_cast<ptrdiff_t>(i) + 1, operands.end(), [this](AstExpr* e) { return HasCall(e); });
                 parts.push_back(laterCall ? Evaluate(part) : part);
             }
             return ConcatValues(std::move(parts), expr->location);
@@ -2309,7 +2423,7 @@ namespace UdonLuau {
                 func = Unwrap(inst->expr);
             }
 
-            bool argsCall = std::any_of(call->args.begin(), call->args.end(), [](AstExpr* a) { return HasCall(a); });
+            bool argsCall = std::any_of(call->args.begin(), call->args.end(), [this](AstExpr* a) { return HasCall(a); });
             std::optional<Value> selfReceiver;
             if (call->self) {
                 selfReceiver = CompileExpr(func->as<AstExprIndexName>()->expr);
@@ -2319,7 +2433,7 @@ namespace UdonLuau {
             std::vector<Value> args;
             for (size_t i = 0; i < call->args.size; ++i) {
                 Value arg = CompileExpr(call->args.data[i]);
-                bool laterCall = std::any_of(call->args.begin() + i + 1, call->args.end(), [](AstExpr* a) { return HasCall(a); });
+                bool laterCall = std::any_of(call->args.begin() + i + 1, call->args.end(), [this](AstExpr* a) { return HasCall(a); });
                 args.push_back(laterCall ? Evaluate(arg) : arg);
             }
 
@@ -2697,6 +2811,16 @@ namespace UdonLuau {
                     return { Value::OfSlot(emit_.Constant(constructed, value), constructed) };
                 }
             }
+            bool foldable = !receiver && IsFoldableCall(*m.ext) && std::ranges::all_of(args, [](const Value& a) { return a.IsLiteral() && a.kind != Value::Kind::Nil; }) &&
+                            std::ranges::none_of(m.parameters, [](const Parameter& p) { return p.byRef || p.generic; });
+            if (foldable && m.ext->returnType != "SystemVoid") {
+                const Type* t = types_.Get(m.ext->returnType);
+                HeapValue value;
+                value.kind = ValueKind::Construct;
+                value.text = m.ext->signature;
+                for (size_t i = 0; i < args.size(); ++i) value.arguments.push_back(Literal(args[i], m.parameters[i].type, location));
+                return { Value::OfSlot(emit_.Constant(t, value), t) };
+            }
             if (!receiver && args.empty() && IsConstantGetter(*m.ext)) {
                 const Type* t = types_.Get(m.ext->returnType);
                 HeapValue value;
@@ -2743,6 +2867,10 @@ namespace UdonLuau {
             const Type* returnType = m.returnType;
             if (m.returnGeneric) returnType = m.returnGenericArray ? types_.ArrayOf(r.typeArgument) : r.typeArgument;
             if (m.ext->isConstructor) returnType = types_.Get(m.ext->returnType);
+            uint32_t externSlot = emit_.ExternSlot(m.ext->signature);
+            bool stable = receiver && returnType && refResults.empty() && IsStableRead(*m.ext, receiver->type);
+            if (stable)
+                if (auto cached = emit_.CachedRead(externSlot, pushes.front())) return { Value::OfSlot(*cached, returnType) };
             if (returnType) {
                 uint32_t t = emit_.Temp(returnType);
                 pushes.push_back(t);
@@ -2750,7 +2878,8 @@ namespace UdonLuau {
             }
 
             for (uint32_t s : pushes) emit_.Push(s);
-            emit_.Extern(emit_.ExternSlot(m.ext->signature), returnType != nullptr);
+            emit_.Extern(externSlot, returnType != nullptr, refResults.empty() && HasNoSideEffects(*m.ext, receiver.has_value()));
+            if (stable) emit_.RememberRead(externSlot, pushes.front(), results.front().slot);
             if (!returnType) results.push_back(Value::OfNil());
             for (Value& v : refResults) results.push_back(std::move(v));
             return results;

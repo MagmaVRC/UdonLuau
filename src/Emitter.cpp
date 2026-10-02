@@ -67,6 +67,20 @@ namespace UdonLuau::Detail {
     void Emitter::ResetTemps() {
         freeTemps_.clear();
         liveTemps_.clear();
+        reads_.clear();
+    }
+
+    std::optional<uint32_t> Emitter::CachedRead(uint32_t externSlot, uint32_t receiver) const {
+        if (auto it = reads_.find({ externSlot, receiver }); it != reads_.end()) return it->second;
+        return std::nullopt;
+    }
+
+    void Emitter::RememberRead(uint32_t externSlot, uint32_t receiver, uint32_t result) {
+        if (receiver != result) reads_[{ externSlot, receiver }] = result;
+    }
+
+    void Emitter::Forget(uint32_t slot) {
+        std::erase_if(reads_, [slot](const auto& entry) { return entry.first.second == slot || entry.second == slot; });
     }
 
     void Emitter::Promote(uint32_t slot) {
@@ -127,6 +141,7 @@ namespace UdonLuau::Detail {
             uint32_t slot = liveTemps_.back();
             liveTemps_.pop_back();
             freeTemps_[slotTypes_[slot]].push_back(slot);
+            Forget(slot);
         }
     }
 
@@ -142,6 +157,7 @@ namespace UdonLuau::Detail {
     void Emitter::Bind(Label label) {
         labels_[label.id] = Here();
         lastResultOperand_.reset();
+        reads_.clear();
     }
 
     std::optional<uint32_t> Emitter::AddressOf(Label label) const {
@@ -167,9 +183,13 @@ namespace UdonLuau::Detail {
         Push(source);
         Push(destination);
         Emit(OpCode::Copy);
+        Forget(destination);
     }
 
-    void Emitter::CopyFromStack() { Emit(OpCode::Copy); }
+    void Emitter::CopyFromStack() {
+        Emit(OpCode::Copy);
+        reads_.clear();
+    }
 
     void Emitter::Jump(Label target) {
         Emit(OpCode::Jump, 0xFFFFFFFCu);
@@ -186,10 +206,12 @@ namespace UdonLuau::Detail {
 
     void Emitter::JumpIndirect(uint32_t slot) { Emit(OpCode::JumpIndirect, slot); }
 
-    void Emitter::Extern(uint32_t externSlot, bool lastPushIsResult) {
+    void Emitter::Extern(uint32_t externSlot, bool lastPushIsResult, bool pure) {
         bool resultPushed = lastPushIsResult && code_.size() >= 2 && code_[code_.size() - 2] == static_cast<uint32_t>(OpCode::Push);
         size_t operand = code_.size() - 1;
         Emit(OpCode::Extern, externSlot);
+        if (!pure || !resultPushed) reads_.clear();
+        else Forget(code_[operand]);
         if (resultPushed) lastResultOperand_ = operand;
     }
 
@@ -198,6 +220,8 @@ namespace UdonLuau::Detail {
         if (slotTypes_[from] != slotTypes_[to]) return false;
         code_[*lastResultOperand_] = to;
         lastResultOperand_.reset();
+        Forget(from);
+        Forget(to);
         return true;
     }
 

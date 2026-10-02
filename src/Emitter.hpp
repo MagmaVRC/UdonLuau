@@ -47,7 +47,10 @@ namespace UdonLuau::Detail {
         void JumpTo(uint32_t address);
         void JumpIfFalse(uint32_t condition, Label target);
         void JumpIndirect(uint32_t slot);
-        void Extern(uint32_t externSlot, bool lastPushIsResult);
+        void Extern(uint32_t externSlot, bool lastPushIsResult, bool pure = false);
+
+        [[nodiscard]] std::optional<uint32_t> CachedRead(uint32_t externSlot, uint32_t receiver) const;
+        void RememberRead(uint32_t externSlot, uint32_t receiver, uint32_t result);
 
         bool RetargetLastResult(uint32_t from, uint32_t to);
 
@@ -62,6 +65,7 @@ namespace UdonLuau::Detail {
         void Emit(OpCode op);
         void Emit(OpCode op, uint32_t operand);
         std::string Unique(std::string base);
+        void Forget(uint32_t slot);
 
         std::vector<uint32_t>                       code_;
         std::vector<HeapSlot>                       heap_;
@@ -78,6 +82,7 @@ namespace UdonLuau::Detail {
         std::vector<std::pair<size_t, int>>         codeFixups_;
         std::vector<std::pair<uint32_t, int>>       slotFixups_;
         std::optional<size_t>                       lastResultOperand_;
+        std::map<std::pair<uint32_t, uint32_t>, uint32_t> reads_;
     };
 
 } // namespace UdonLuau::Detail
