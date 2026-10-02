@@ -1,0 +1,139 @@
+# UdonLuau
+
+A compiler from [Luau](https://luau.org) to VRChat Udon bytecode, written in C++20.
+
+UdonLuau knows nothing about any particular SDK version. The host fills a `Catalog` with the
+types, extern signatures and events it exposes, normally by enumerating the live Udon wrapper
+modules, and the compiler resolves every member access, operator and overload against it. When
+VRChat exposes a new extern, it is usable from Luau the moment the host sees it.
+
+## Layout
+
+| path | contents |
+|---|---|
+| `include/UdonLuau/` | public C++ API (`Catalog.hpp`, `Compiler.hpp`, `Program.hpp`) and the C API (`UdonLuau.h`) |
+| `src/` | the compiler |
+| `tests/` | end-to-end tests that execute compiled programs on a reference interpreter |
+| `projects/` | Visual Studio projects; open `UdonLuau.slnx` |
+| `extern/luau` | Luau, as a submodule (only the parser is used) |
+
+Projects:
+
+- **UdonLuau.Core**: static library with the compiler.
+- **Luau.Ast**: static library with the Luau parser. It is kept separate so hosts that already build Luau can link Core alone.
+- **UdonLuau.Native**: `UdonLuau.dll`, exposing the C API for P/Invoke.
+- **UdonLuau.Tests**: console test runner.
+
+## Building
+
+Requires Visual Studio 2022 or later with the C++ workload, and Windows.
+
+```
+git clone --recursive https://github.com/MagmaVRC/UdonLuau
+```
+
+Open `UdonLuau.slnx`, choose `Release|x64` and build.
+
+## Usage
+
+```cpp
+UdonLuau::Catalog catalog;
+catalog.AddStandardEvents();
+catalog.AddType({ .fullName = "UnityEngine.Transform", .kind = UdonLuau::TypeKind::Class, .baseType = "UnityEngineComponent" });
+catalog.AddExtern("UnityEngineTransform.__get_position__UnityEngineVector3", 2);
+
+UdonLuau::CompileResult result = UdonLuau::Compile(catalog, source);
+if (result.Succeeded()) {
+    const UdonLuau::Program& program = *result.program;
+    // program.ByteCode(), program.heap, program.entryPoints, program.sync
+}
+```
+
+The operand count passed to `AddExtern` is what the wrapper module reports for the signature. It
+tells the compiler whether the extern takes a receiver.
+
+A `Program` holds everything needed to build an `IUdonProgram`:
+
+- the big-endian bytecode;
+- one heap slot per symbol, with its Udon type name and initial value;
+- the exported entry points;
+- the sync metadata.
+
+## The language
+
+UdonLuau compiles a statically typed subset of Luau. Each file becomes one UdonBehaviour program.
+
+```lua
+-- @export
+local speed: number = 2
+-- @sync linear
+local height: number = 0
+
+local function wave(t: number): number
+    return Mathf.Sin(t * speed)
+end
+
+function Update()
+    height = wave(Time.time)
+    local p = transform.position
+    p.y = height
+    transform.position = p
+end
+
+function OnPlayerJoined(player: VRCPlayerApi)
+    print(`{player.displayName} joined`)
+end
+
+function Reset()
+    height = 0
+end
+```
+
+### Declarations
+
+- Module-level `local`s are behaviour variables; their initializers must be constants.
+- `-- @export` exposes a variable in the inspector.
+- `-- @sync`, `-- @sync linear` and `-- @sync smooth` add sync metadata.
+- Global functions are entry points:
+  - a function named after a VRChat event (`Start`, `Update`, `Interact`, `OnPlayerJoined`, ...) receives that event, with its parameters;
+  - any other global function is a custom event, callable through `SendCustomEvent`.
+- `local function`s are internal and may take parameters and return values. Parameters and return values need type annotations.
+- `this`, `gameObject` and `transform` refer to the behaviour itself.
+
+### Types
+
+- **Numeric aliases:** `int`, `uint`, `long`, `ulong`, `short`, `ushort`, `byte`, `sbyte`, `float` (also `number`), `double`.
+- **Other built-in types:** `boolean`, `string`, `any`.
+- **Engine and SDK types:** short names (`Vector3`, `Transform`, `VRCPlayerApi`). A name shared by several namespaces must be qualified (`UnityEngine.Object`).
+- **Arrays:** `{T}`, built with `{a, b, c}` or iterated with `for i, v in array do`. Indices start at 0, as everywhere in Udon.
+- **Inference:** locals take the type of their initializer. Integer literals are `int` and other number literals are `float`, unless the context needs another numeric type.
+- **Conversions:** widening numeric conversions are implicit. Narrowing ones are written `value :: int`.
+
+### Expressions
+
+- **Members:** `obj.Property`, `obj:Method(args)`, `Type.StaticMember`, `Type.new(args)` (constructors) and `Enum.Member`.
+- **Generic methods:** pass the type as the last argument, `obj:GetComponent(Rigidbody)`, or explicitly with `obj:GetComponent<<Rigidbody>>()`.
+- **Out parameters:** these become extra return values, for example `local hit, info = Physics.Raycast(origin, direction)`.
+- **Operators:** they map to the operator externs. `/` on integers divides as floats, `//` divides as integers, `..` and backtick strings concatenate, `#` gives `Length` or `Count`, and `and`, `or` and `not` short-circuit on booleans.
+- **Truthiness:** an object in a condition means "is not nil".
+- **Built-ins:** `print`, `warn` and `tostring`.
+
+### Not supported
+
+- Closures and anonymous functions.
+- Coroutines.
+- Metatables.
+- Varargs.
+- Recursion.
+- General tables used as maps.
+- `ipairs` and `pairs`: iterate arrays directly instead.
+
+## C API
+
+`UdonLuau.h` exposes the same pipeline for hosts that cannot use C++:
+
+1. Build a catalog with `ul_catalog_*`.
+2. Compile with `ul_compile`.
+3. Read the program back with the `ul_result_*` functions.
+
+Every string a result returns stays valid until `ul_result_destroy`.
