@@ -29,6 +29,7 @@ namespace Magma.VRC.UdonLuau
     {
         public string Name;
         public bool Singleton;
+        public string TypeName;
         public readonly List<ScriptVariable> Fields = new List<ScriptVariable>();
         public readonly List<ScriptMethod> Methods = new List<ScriptMethod>();
 
@@ -172,6 +173,7 @@ namespace Magma.VRC.UdonLuau
                     cached = new CachedInterface { Key = key, Interface = main, Statics = statics };
                     LuauCache[group.Key] = cached;
                 }
+                cached.Interface.TypeName = ProxyGenerator.UdonSharpTypeName(name);
                 interfaces.Add(cached.Interface);
                 if (cached.Statics != null) interfaces.Add(cached.Statics);
             }
@@ -180,7 +182,9 @@ namespace Magma.VRC.UdonLuau
             {
                 if (owners[entry.Key].Count != 1) continue;
                 ScriptInterface description = UdonSharpScripts.Describe(entry.Key, entry.Value);
-                if (description != null) interfaces.Add(description);
+                if (description == null) continue;
+                description.TypeName = entry.Value.FullName;
+                interfaces.Add(description);
             }
 
             foreach (ScriptInterface script in interfaces) Register(catalog, script);
@@ -260,6 +264,7 @@ namespace Magma.VRC.UdonLuau
             byte[] name = Native.Utf8(script.Name);
             Native.ul_catalog_add_script(catalog.Handle, name);
             if (script.Singleton) Native.ul_catalog_set_script_singleton?.Invoke(catalog.Handle, name, 1);
+            if (!string.IsNullOrEmpty(script.TypeName)) Native.ul_catalog_set_script_type_name?.Invoke(catalog.Handle, name, Native.Utf8(script.TypeName));
             foreach (ScriptVariable f in script.Fields)
                 Native.ul_catalog_add_script_field(catalog.Handle, name, Native.Utf8(f.Name), Native.Utf8(f.UdonType), Native.Utf8(f.Script), Native.Utf8(f.Symbol));
             foreach (ScriptMethod m in script.Methods)

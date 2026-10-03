@@ -48,6 +48,13 @@ namespace Magma.VRC.UdonLuau
         public string script;
     }
 
+    [Serializable]
+    internal struct LuauLine
+    {
+        public uint address;
+        public int line;
+    }
+
     internal sealed class LuauCompileResult
     {
         /// <summary>The program, or null when compilation or program construction failed.</summary>
@@ -58,6 +65,9 @@ namespace Magma.VRC.UdonLuau
         public readonly List<LuauAnnotation> ModuleAnnotations = new List<LuauAnnotation>();
         public readonly List<LuauScriptReference> ScriptReferences = new List<LuauScriptReference>();
         public readonly List<NetworkCallingEntrypointMetadata> NetworkCallables = new List<NetworkCallingEntrypointMetadata>();
+
+        /// <summary>The code address where each statement starts and its zero-based source line, sorted by address.</summary>
+        public readonly List<LuauLine> Lines = new List<LuauLine>();
 
         /// <summary>Max events per second declared with @networkcallable(n) by entry point; 0 means the SDK default.</summary>
         public readonly Dictionary<string, int> NetworkRates = new Dictionary<string, int>();
@@ -124,6 +134,7 @@ namespace Magma.VRC.UdonLuau
             if (Native.ul_result_sync_mode != null) output.SyncMode = (UdonSharp.BehaviourSyncMode)Native.ul_result_sync_mode(result);
             output.ModuleAnnotations.AddRange(ReadAnnotations(result, -1));
             output.Disassembly = Native.Read(Native.ul_result_disassembly(result)) ?? "";
+            ReadLines(result, output);
 
             try
             {
@@ -141,6 +152,9 @@ namespace Magma.VRC.UdonLuau
 
         private static ResultHandle Invoke(LuauCatalog catalog, byte[] source, string defines, string scriptName, bool staticPart)
         {
+            if (Native.ul_compile_with_options != null)
+                return new ResultHandle(Native.ul_compile_with_options(catalog.Handle, source, (UIntPtr)source.Length, Native.Utf8(defines ?? ""), Native.Utf8(scriptName ?? ""), staticPart ? 1 : 0,
+                    LuauSettings.instance.CompatibleExitReturn ? 1u : 0u));
             if (Native.ul_compile_part != null)
                 return new ResultHandle(Native.ul_compile_part(catalog.Handle, source, (UIntPtr)source.Length, Native.Utf8(defines ?? ""), Native.Utf8(scriptName ?? ""), staticPart ? 1 : 0));
             IntPtr result = Native.ul_compile_with_defines != null
@@ -169,6 +183,14 @@ namespace Magma.VRC.UdonLuau
                 output.NetworkCallables.Add(new NetworkCallingEntrypointMetadata(entry, attribute, parameters));
                 output.NetworkRates[entry] = callable.MaxEventsPerSecond;
             }
+        }
+
+        private static void ReadLines(ResultHandle result, LuauCompileResult output)
+        {
+            if (Native.ul_result_line_count == null || Native.ul_result_line == null) return;
+            int count = Native.ul_result_line_count(result);
+            for (int i = 0; i < count; i++)
+                if (Native.ul_result_line(result, i, out uint address, out int line) != 0) output.Lines.Add(new LuauLine { address = address, line = line });
         }
 
         internal static List<LuauAnnotation> ReadAnnotations(ResultHandle result, int address)

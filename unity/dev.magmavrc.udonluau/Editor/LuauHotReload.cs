@@ -127,6 +127,7 @@ namespace Magma.VRC.UdonLuau
 
             var holder = UnityEngine.ScriptableObject.CreateInstance<SerializedUdonProgramAsset>();
             holder.StoreProgram(result.Program, result.NetworkCallables.Count > 0 ? result.NetworkCallables.ToArray() : null);
+            asset.ReplaceLines(result.Lines);
 
             int count = 0;
             foreach (UdonBehaviour behaviour in Object.FindObjectsByType<UdonBehaviour>(UnityEngine.FindObjectsInactive.Include, UnityEngine.FindObjectsSortMode.None))

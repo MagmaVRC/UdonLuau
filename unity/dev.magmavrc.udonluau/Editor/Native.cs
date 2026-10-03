@@ -182,11 +182,13 @@ namespace Magma.VRC.UdonLuau
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate void AddSyncableType(IntPtr catalog, byte[] udonName, int linear, int smooth);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int SetScriptMethodFlag(IntPtr catalog, byte[] script, byte[] method, int value);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int SetScriptFlag(IntPtr catalog, byte[] script, int value);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int SetScriptText(IntPtr catalog, byte[] script, byte[] value);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int GetNetworkCallable(IntPtr result, int index, out NativeNetworkCallable callable);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int GetNetworkParameter(IntPtr result, int index, int parameter, out NativeNetworkParameter value);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate IntPtr CompileSource(IntPtr catalog, byte[] source, UIntPtr length);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate IntPtr CompileWithDefines(IntPtr catalog, byte[] source, UIntPtr length, byte[] defines);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate IntPtr CompilePart(IntPtr catalog, byte[] source, UIntPtr length, byte[] defines, byte[] scriptName, int staticPart);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate IntPtr CompileWithOptions(IntPtr catalog, byte[] source, UIntPtr length, byte[] defines, byte[] scriptName, int staticPart, uint flags);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int ResultInt(IntPtr result);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int ResultAt(IntPtr result, int index);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate IntPtr ResultText(IntPtr result);
@@ -201,6 +203,7 @@ namespace Magma.VRC.UdonLuau
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int GetInterfaceField(IntPtr result, int index, out NativeScriptVariable variable);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int GetInterfaceMethod(IntPtr result, int index, out NativeScriptMethod method);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int GetInterfaceMethodValue(IntPtr result, int method, int isReturn, int index, out NativeScriptVariable variable);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int GetLine(IntPtr result, int index, out uint address, out int line);
 
         public static Create ul_catalog_create;
         public static Destroy ul_catalog_destroy;
@@ -216,6 +219,7 @@ namespace Magma.VRC.UdonLuau
         public static AddScriptMethodValue ul_catalog_add_script_method_value;
         public static SetScriptMethodFlag ul_catalog_set_script_method_network_callable;
         public static SetScriptFlag ul_catalog_set_script_singleton;
+        public static SetScriptText ul_catalog_set_script_type_name;
         public static ResultInt ul_result_interface_singleton;
         public static AddSyncableType ul_catalog_add_syncable_type;
         public static ResultText ul_catalog_definitions;
@@ -228,6 +232,7 @@ namespace Magma.VRC.UdonLuau
         public static CompileSource ul_compile;
         public static CompileWithDefines ul_compile_with_defines;
         public static CompilePart ul_compile_part;
+        public static CompileWithOptions ul_compile_with_options;
         public static CompilePart ul_extract_interface_part;
         public static ResultInt ul_result_has_statics;
         public static Destroy ul_result_destroy;
@@ -254,6 +259,8 @@ namespace Magma.VRC.UdonLuau
         public static GetInterfaceMethod ul_result_interface_method;
         public static GetInterfaceMethodValue ul_result_interface_method_value;
         public static ResultText ul_result_disassembly;
+        public static ResultInt ul_result_line_count;
+        public static GetLine ul_result_line;
 
         private static IntPtr _module;
 

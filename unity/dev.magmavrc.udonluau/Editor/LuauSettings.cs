@@ -14,6 +14,18 @@ namespace Magma.VRC.UdonLuau
         [SerializeField] private string defines = "DEBUG=false";
         [SerializeField] private bool treatLuaAsLuau = true;
         [SerializeField] private bool generateEditorSetup = true;
+        [SerializeField] private bool compatibleExitReturn;
+
+        /// <summary>Whether programs begin every entry point with UdonSharp's exit marker and leave through the return trampoline, for tools that expect UdonSharp's layout.</summary>
+        public bool CompatibleExitReturn
+        {
+            get => compatibleExitReturn;
+            set
+            {
+                compatibleExitReturn = value;
+                Save(true);
+            }
+        }
 
         /// <summary>Whether UdonLuau.d.luau and the VS Code luau-lsp settings are written to the project root.</summary>
         public bool GenerateEditorSetup
@@ -97,6 +109,14 @@ namespace Magma.VRC.UdonLuau
                 {
                     instance.GenerateEditorSetup = setup;
                     if (setup) EditorSetup.Regenerate();
+                }
+
+                EditorGUI.BeginChangeCheck();
+                bool exit = EditorGUILayout.Toggle(new GUIContent("Compatible exit return", "Starts every event with UdonSharp's exit marker and returns through the trampoline, so tools that expect UdonSharp's program layout can read UdonLuau programs. Costs a few instructions per event."), instance.CompatibleExitReturn);
+                if (EditorGUI.EndChangeCheck())
+                {
+                    instance.CompatibleExitReturn = exit;
+                    LuauEditorHooks.CompileAll();
                 }
             },
         };

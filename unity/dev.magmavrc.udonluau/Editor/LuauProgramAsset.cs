@@ -59,6 +59,7 @@ namespace Magma.VRC.UdonLuau
         [SerializeField] private BehaviourSyncMode behaviourSyncMode = BehaviourSyncMode.Any;
         [SerializeField] private string interfaceText = "";
         [SerializeField] private string disassembly = "";
+        [SerializeField] private List<LuauLine> lines = new List<LuauLine>();
 
         [NonSerialized] private bool _showDisassembly;
         [NonSerialized] private bool _showMethods;
@@ -128,6 +129,7 @@ namespace Magma.VRC.UdonLuau
             diagnostics.Clear();
             fieldAnnotations.Clear();
             scriptReferences.Clear();
+            lines.Clear();
             _networkCallables = null;
             behaviourSyncMode = BehaviourSyncMode.Any;
             disassembly = "";
@@ -174,6 +176,7 @@ namespace Magma.VRC.UdonLuau
         {
             fieldAnnotations.AddRange(result.Fields);
             scriptReferences.AddRange(result.ScriptReferences);
+            lines.AddRange(result.Lines);
             _networkCallables = result.NetworkCallables.Count > 0 ? result.NetworkCallables.ToArray() : null;
             disassembly = result.Disassembly;
             behaviourSyncMode = result.SyncMode;
@@ -223,20 +226,42 @@ namespace Magma.VRC.UdonLuau
         /// <inheritdoc />
         protected override NetworkCallingEntrypointMetadata[] GetLastNetworkCallingMetadata() => _networkCallables;
 
+        internal void ReplaceLines(IEnumerable<LuauLine> table)
+        {
+            lines.Clear();
+            lines.AddRange(table);
+        }
+
+        /// <summary>Returns the zero-based source line of the statement containing a program counter, or -1.</summary>
+        internal int SourceLine(uint programCounter)
+        {
+            int line = -1;
+            foreach (LuauLine entry in lines)
+            {
+                if (entry.address > programCounter) break;
+                line = entry.line;
+            }
+            return line;
+        }
+
         private void LogDiagnostics()
         {
             string path = AssetDatabase.GetAssetPath(sourceScript);
             foreach (LuauDiagnostic d in diagnostics)
-            {
-                string text = $"[UdonLuau] {path}({d.line},{d.column}): {(d.isWarning ? "warning" : "error")}: {d.message}";
-                MethodInfo log = d.isWarning ? LogFileWarning : LogFileError;
-                if (log != null)
-                    log.Invoke(null, new object[] { text, path, d.line, d.column });
-                else if (d.isWarning)
-                    Debug.LogWarning(text, this);
-                else
-                    Debug.LogError(text, this);
-            }
+                LogAt(path, d.line, d.column, d.isWarning, d.message, this);
+        }
+
+        /// <summary>Logs a message that opens the given file position when clicked in the console.</summary>
+        internal static void LogAt(string path, int line, int column, bool isWarning, string message, UnityEngine.Object context)
+        {
+            string text = $"[UdonLuau] {path}({line},{column}): {(isWarning ? "warning" : "error")}: {message}";
+            MethodInfo log = isWarning ? LogFileWarning : LogFileError;
+            if (log != null)
+                log.Invoke(null, new object[] { text, path, line, column });
+            else if (isWarning)
+                Debug.LogWarning(text, context);
+            else
+                Debug.LogError(text, context);
         }
 
         /// <inheritdoc />
