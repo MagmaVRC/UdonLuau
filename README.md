@@ -65,9 +65,10 @@ Releases are published by pushing a `v<version>` tag that matches the package ve
 - Imports scripts as `.lua` files (`.luau` is accepted too). Assets > Create > VRChat > UdonLuau Script creates a script and its program asset.
 - Recompiles when a script changes, after a domain reload, and before a world build. A build with script errors is blocked.
 - Reports errors in the console with file and line, so double-clicking opens the script.
+- Maps Udon runtime errors back to the Luau line that caused them, using a line table compiled into each program asset.
 - Draws exported variables with `@header`, `@space`, `@tooltip`, `@range`, `@hideininspector` and `@multiline`.
 - Applies the script's sync mode to the UdonBehaviour, and shows a sync method picker when the mode is `any`.
-- Holds project-wide defines in Project Settings > UdonLuau.
+- Holds project-wide defines in Project Settings > UdonLuau, and the **Compatible exit return** option. It makes every entry point start with UdonSharp's `0xFFFFFFFF` exit marker and leave through the return trampoline, so tools that expect UdonSharp's layout (such as obfuscators) can read the programs. It costs a few instructions per event, so it is off by default.
 
 When working from source, copy `build/Release/UdonLuau.dll` to `Editor/Plugins/x86_64/` in the package; `tools/package.ps1` does this too. The editor loads a private copy of it from `Library/UdonLuau/`, so a new build is picked up on the next domain reload, or through Tools > UdonLuau > Reload Native Compiler, without restarting Unity.
 
@@ -153,6 +154,7 @@ end
   | `manual` | Sync method Manual | No `linear`/`smooth` interpolation |
 
   Which types can be synced, and which support interpolation, comes from the SDK through the host (`Catalog::AddSyncableType`).
+- `-- @onchange(OnScoreChanged)` above a variable calls that function whenever another behaviour or the network changes the variable (`SetProgramVariable`, or a synced value arriving). The function takes no parameters, or one: the previous value. Writes from the script's own code don't trigger it.
 - Any other `-- @name(args)` annotation directly above a variable is kept on its heap slot for the host, for example `@range(0, 10)`, `@header("Motion")` or `@tooltip("...")`. The compiler does not interpret these; the editor decides what they mean.
 - Functions:
   - A global function named after a VRChat event (`Start`, `Update`, `Interact`, `OnPlayerJoined`, ...) receives that event, with its parameters.
@@ -199,13 +201,15 @@ end
 
 ### Standard library
 
-Luau's `math`, `string` and `table` libraries are compiled onto Udon externs. Where Udon has no direct equivalent, the compiler emits a short inline routine instead. Array positions are 0-based, as everywhere else.
+Luau's `math`, `string`, `table`, `bit32` and `utf8` libraries are compiled onto Udon externs. Where Udon has no direct equivalent, the compiler emits a short inline routine instead. Array positions are 0-based, as everywhere else.
 
 | Library | Functions | Notes |
 |---|---|---|
-| `math` | `abs`, `floor`, `ceil`, `sqrt`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan(y [, x])`, `exp`, `log(x [, base])`, `log10`, `pow`, `min`, `max` (any count), `clamp`, `sign`, `round`, `fmod`, `lerp`, `map`, `random`, `pi`, `huge` | `round` rounds halves away from zero, as in Luau. `random(m, n)` includes both bounds. `floor`, `ceil` and `round` of an integer return it unchanged. |
-| `string` | `format`, `len`, `upper`, `lower`, `rep`, `split` | `format` takes a literal format string. It is translated to `String.Format` when compiling and supports `%d %i %s %f %.Nf %g %e %x %X %%`, widths and `-`/`0` flags. For anything else, use the string's own methods (`s:Substring(0, 3)`). |
-| `table` | `insert`, `remove`, `find`, `create`, `clone`, `clear`, `concat`, `sort`, `move` | Udon arrays have a fixed size. `insert` and `remove` build a new array and store it back into the variable or field you passed, so other references keep the old array. `find` returns -1 when the value is missing. `create(n, value)` fills by doubling copies, so it costs about 5·log2(n) externs rather than n. `sort` takes no comparison function. |
+| `math` | `abs`, `floor`, `ceil`, `sqrt`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan(y [, x])`, `exp`, `log(x [, base])`, `log10`, `pow`, `min`, `max` (any count), `clamp`, `sign`, `round`, `fmod`, `lerp`, `map`, `random`, `noise`, `pi`, `huge` | `round` rounds halves away from zero, as in Luau. `random(m, n)` includes both bounds. `floor`, `ceil` and `round` of an integer return it unchanged. `noise(x [, y])` is `Mathf.PerlinNoise` scaled to -1..1. |
+| `string` | `format`, `len`, `upper`, `lower`, `rep`, `split`, `sub`, `find`, `byte`, `char`, `reverse`, `trim`, `startswith`, `endswith` | `format` takes a literal format string. It is translated to `String.Format` when compiling and supports `%d %i %s %f %.Nf %g %e %x %X %%`, widths and `-`/`0` flags. `sub`, `find` and `byte` use Luau's 1-based positions, and `sub` accepts negative ones. `find` searches plain text only (pass `plain = true` for text with pattern characters) and returns `0, 0` when nothing is found. Comparisons are ordinal. For anything else, use the string's own methods (`s:Substring(0, 3)`). |
+| `table` | `insert`, `remove`, `find`, `create`, `clone`, `clear`, `concat`, `sort`, `move` | Udon arrays have a fixed size. `insert` and `remove` build a new array and store it back into the variable or field you passed, so other references keep the old array. `find` returns -1 when the value is missing. `create(n, value)` fills by doubling copies, so it costs about 5·log2(n) externs rather than n. `sort(t, less)` takes an optional comparison, which must be a named local function; it then runs an insertion sort. |
+| `bit32` | `band`, `bor`, `bxor`, `bnot`, `lshift`, `rshift`, `arshift`, `btest` | On `int`. `rshift` is logical and `arshift` arithmetic, as in Luau. Constant arguments are folded. |
+| `utf8` | `len`, `char` | `len` counts code points, treating surrogate pairs as one. |
 
 Every polyfilled function is listed in one registry, `src/Polyfills.hpp`, together with its Luau signature. The registry decides which library calls the compiler accepts, produces the "available: ..." list in error messages, and generates the luau-lsp declarations for libraries Luau does not have (such as `Delay`). To add a polyfill, add a registry entry and handle the call in the matching `Call*` function in `Compiler.cpp`.
 
@@ -242,6 +246,106 @@ end
 - **Repeating calls:** a function can delay a call to itself, as in a repeating tick. Functions used this way are compiled as real functions rather than inlined.
 - **Cost:** queuing a call costs about 3 externs per argument. Delivering it costs about 4 per argument.
 
+### Coroutines
+
+Any event or function can wait in the middle of its body. The `task` library follows Roblox:
+
+```lua
+function Interact()
+    door:Play("Open")
+    task.wait(2)                 -- seconds; task.wait() waits one frame
+    collider.enabled = false
+    task.waitFrames(1, EventTiming.LateUpdate)
+    task.waitUntil(door.closed)  -- re-checked once per frame
+    sound:Play()
+end
+
+local function blink(times: int)
+    for i = 1, times do
+        light.enabled = not light.enabled
+        task.wait(0.25)
+    end
+end
+
+function Start()
+    task.spawn(blink, 6)         -- runs now until its first wait, then Start continues
+    task.delay(10, blink, 2)     -- starts in 10 seconds
+    task.defer(blink, 1)         -- starts next frame
+end
+```
+
+| Call | What it does | Cost |
+|---|---|---|
+| `task.wait(seconds [, timing])` | Suspends; returns the seconds actually waited when you use the result | 1 extern to suspend, plus 2 when the result is used |
+| `task.waitFrames(n [, timing])` | Suspends for `n` frames | 1 extern |
+| `task.waitUntil(condition)` | Checks the condition now, then once per frame until true | the condition, plus 1 extern per frame while waiting |
+| `task.spawn(fn, ...)` | Runs `fn` now until its first wait, then returns | the arguments only |
+| `task.defer(fn, ...)`, `task.delay(seconds, fn, ...)` | Starts `fn` next frame or after a delay, through `Delay` | as `Delay` |
+| `task.cancel(fn)` | Stops `fn`'s suspended run | a few copies |
+
+How it works: Udon locals already live on the behaviour's heap, so a suspended function keeps its state for free. Each wait schedules a private event (`__coN`) with `SendCustomEventDelayedSeconds`/`Frames` and ends the current run; that event jumps back to the statement after the wait. Nothing runs while a coroutine waits.
+
+- **Where waits work:** in events, public methods, and functions they call. A function that waits makes its callers wait too; it is inlined into each caller, so two callers never share its locals. Mark it `-- @noinline` to compile it once instead: it then serves one caller at a time, a second caller skips the call (logged in debug builds), and only callers with `@reentry(ignore)` that are never cancelled may use it.
+- **Triggered again while waiting:** a waiting function is still the same function with the same locals, so a second trigger has to be decided. `-- @reentry(mode)` above the function picks:
+
+  | mode | second trigger | runtime cost |
+  |---|---|---|
+  | `ignore` (default) | Dropped. Debug builds log `Door.Interact ignored: still waiting at line 14`. | 2 copies per run |
+  | `restart` | Stops the waiting run and starts again: a cooldown that resets, a timer that restarts | a few copies per run, about 4 more externs per timed wait |
+  | `overlap` | Both runs continue, **sharing their locals**. Only timed waits; no signal or event waits, and no `task.cancel` | none |
+
+  A function that is still running (not waiting) is never entered twice: a trigger that arrives during its own run is dropped in every mode. A run that gets cancelled by an event it triggered itself ends as soon as control comes back to it.
+- **Event arguments** are copied when the event starts, so `player` in `OnPlayerJoined(player)` keeps its value across waits.
+- **Public methods that wait cannot return values**, since callers get control back at the first wait. Waits are local to each client; they are not synced.
+- **Differences from Roblox:** `task.cancel` takes the function rather than a thread. `task.defer` waits one frame. `task.waitUntil` is UdonLuau's own: the condition is an expression that is evaluated again every frame.
+
+### Signals and events
+
+A `Signal` is an event a script declares, fires and waits on, with typed values:
+
+```lua
+export local opened: Signal<VRCPlayerApi> = Signal()   -- export: other scripts can use it too
+local hit: Signal<number, Vector3> = Signal()
+
+local function onHit(damage: number, at: Vector3)
+    health -= damage
+end
+
+function Start()
+    hit:Connect(onHit)
+end
+
+export function Watch()
+    while true do
+        local damage, at = hit:Wait()
+        print(`took {damage} at {at}`)
+    end
+end
+
+function Interact()
+    hit:Fire(10, transform.position)
+    opened:Fire(Networking.LocalPlayer)
+end
+```
+
+- `Fire` runs every waiting coroutine and connected function before it returns, in source order. A waiter that waits again on the same signal is resumed by the next `Fire`, not the current one.
+- `Connect(fn)` and `Disconnect(fn)` take a named function of the script whose parameters match the signal. Connecting the same function twice connects it once.
+- **Cost within a script:** signals have no heap value of their own. The compiler knows every place that waits or connects, so `Fire` is a few copies and one jump per waiter, with no externs and no event dispatch.
+- **Across scripts:** `door.opened:Wait()`, `door.opened:Connect(fn)` and `door.opened:Fire(player)` work on another script's `export local` signal through a typed reference. The waiting script registers once per wait (2 `SetProgramVariable` and 1 `SendCustomEvent`); `Fire` costs one `SetProgramVariable` per value plus one `SendCustomEvent` per waiting or connected behaviour. Destroyed behaviours are skipped.
+- **Firing during delivery:** firing a signal while that signal is still delivering a `Fire` (from a waiter or connected function) is skipped, and logged in debug builds. A handler that leads back into the function that fired is reported as recursion when compiling.
+
+`Events` waits for VRChat events without writing a handler:
+
+```lua
+export function Greet()
+    local player = Events.OnPlayerJoined:Wait()
+    print(`hello {player.displayName}`)
+end
+```
+
+- The script's own handler for the event, if it has one, runs first, then the waiters.
+- `Events.Update:Wait()`, `LateUpdate`, `FixedUpdate` and `PostLateUpdate` are frame waits with the matching timing, so they add no per-frame event.
+- Waiting for `Interact`, `OnCollision*`, `OnAnimatorMove`, `OnRenderObject` or `OnOwnershipRequest` needs a handler in the script, because declaring those events changes how VRChat treats the object (an `Interact` handler makes it interactable, and an ownership request needs an answer).
 ### Lists
 
 `List<T>` is a growable list compiled to an array and a count, with the capacity doubling as it fills:
@@ -317,6 +421,17 @@ UdonSharp properties read and write like fields (`manager.Ready`, `manager.Level
 
 Names, argument counts and types are checked when compiling. Typed references are also usable in arrays (`{Door}`). Arrays of behaviours are stored as `Component[]`, as UdonSharp does, because Udon has no `UdonBehaviour[]` externs. A plain `UdonBehaviour` still has every SDK member (`SendCustomEvent`, `GetProgramVariable`, ...), and converts to a script type with `behaviour :: Door`.
 
+`GetComponent(Door)`, `GetComponentInChildren(Door)` and `GetComponentInParent(Door)` return the behaviour running that script. A GameObject can hold several UdonBehaviours, so the compiler loops over them and compares each one's `__refl_typename`, the same type name UdonSharp uses.
+
+UdonSharp code can't take a Luau script in an inspector field typed as the script's generated class, because UdonSharp's serializer clears it. Use a plain `UdonBehaviour` field and cast it once:
+
+```csharp
+public UdonBehaviour doorBehaviour;
+private UdonLuau.Scripts.Door door;
+
+void Start() => door = (UdonLuau.Scripts.Door)(Component)doorBehaviour;
+```
+
 The host registers scripts with `Catalog::AddScript`. `ExtractInterface` reads a Luau module's public interface without compiling it, so scripts that reference each other can all be registered before any is compiled.
 
 ### Singletons
@@ -384,6 +499,7 @@ end
 ### Compile time
 
 - `const NAME = value` declares a constant that takes no heap slot. Module-level constants must be known at compile time. Constants include literals, defines, arithmetic on them, and struct constructors with literal arguments (`const UP = Vector3.new(0, 1, 0)`).
+- `const State = {Idle = 0, Opening = 1, Open = 2}` is a compile-time table, used like an enum: `State.Open` is replaced by `2`, so it costs nothing at run time.
 - Defines come from the host (`CompileOptions::defines`, or `ul_compile_with_defines`) or from `-- @define(NAME, value)` at the top of the file. A define is substituted wherever its name is used.
 - Conditions known at compile time remove code: in `if DEBUG then ... end`, the branch that is not taken is never compiled, like `#if`.
 - `assert(condition, "message")` with a constant condition is a compile-time check, like `static_assert`. Any other `assert` runs only when `DEBUG` is true and logs an error; otherwise it is removed with its arguments.
@@ -403,11 +519,12 @@ Every optimization targets what costs time in VRChat's own Udon VM. In order of 
 - Loops test their condition at the bottom, which saves one jump per iteration. Loops with constant bounds skip the first test.
 - An `if`/`elseif` chain comparing one `int` against eight or more constants becomes a jump table: two bounds checks, an array read and an indirect jump.
 - Events that no other code calls return with a single jump instead of the call/return trampoline.
+- Coroutines and signals use the operand stack the way UdonSharp's return trampoline does: each run keeps one return address there, and waiting or finishing jumps to it. A same-script `Fire` jumps straight into each waiter instead of dispatching an event.
 
 ### Not supported
 
 - Closures and anonymous functions.
-- Coroutines.
+- Lua's `coroutine` library; use `task` and `Signal` instead.
 - Metatables.
 - Varargs.
 - Recursion.
