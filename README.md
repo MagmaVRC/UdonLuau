@@ -292,9 +292,9 @@ How it works: Udon locals already live on the behaviour's heap, so a suspended f
   |---|---|---|
   | `ignore` (default) | Dropped. Debug builds log `Door.Interact ignored: still waiting at line 14`. | 2 copies per run |
   | `restart` | Stops the waiting run and starts again: a cooldown that resets, a timer that restarts | a few copies per run, about 4 more externs per timed wait |
-  | `overlap` | Both runs continue, **sharing their locals**. Only timed waits; no signal or event waits, and no `task.cancel` | none |
+  | `overlap(n)` | Starts another run, up to `n` at once; each run has its own locals and parameters. With all `n` busy, the trigger is dropped (logged in debug builds). | the function is compiled `n` times; picking a free run is one branch per run, with no externs |
 
-  A function that is still running (not waiting) is never entered twice: a trigger that arrives during its own run is dropped in every mode. A run that gets cancelled by an event it triggered itself ends as soon as control comes back to it.
+  A run is never entered twice: a trigger that arrives while a run is executing (not waiting), for example through a `SendCustomEvent` back into the script, is dropped, or with `overlap(n)` takes another free run. `task.cancel(fn)` stops every run of `fn`. A run that gets cancelled by an event it triggered itself ends as soon as control comes back to it.
 - **Event arguments** are copied when the event starts, so `player` in `OnPlayerJoined(player)` keeps its value across waits.
 - **Public methods that wait cannot return values**, since callers get control back at the first wait. Waits are local to each client; they are not synced.
 - **Differences from Roblox:** `task.cancel` takes the function rather than a thread. `task.defer` waits one frame. `task.waitUntil` is UdonLuau's own: the condition is an expression that is evaluated again every frame.

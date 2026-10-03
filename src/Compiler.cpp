@@ -46,6 +46,17 @@ namespace UdonLuau {
 
         enum class Reentry : uint8_t { Ignore, Restart, Overlap };
 
+        constexpr int kMaxOverlap = 64;
+
+        struct CoroutineRun {
+            uint32_t              freeSlot = 0;
+            uint32_t              lineSlot = 0;
+            uint32_t              cancelReturn = 0;
+            Label                 cancelRoutine;
+            Label                 start;
+            std::vector<uint32_t> waitFlags;
+        };
+
         struct Function {
             std::string              name;
             AstExprFunction*         node = nullptr;
@@ -73,11 +84,8 @@ namespace UdonLuau {
             bool                     entered = false;
             bool                     cancelTarget = false;
             Reentry                  reentry = Reentry::Ignore;
-            uint32_t                 freeSlot = 0;
-            uint32_t                 lineSlot = 0;
-            uint32_t                 cancelReturn = 0;
-            Label                    cancelRoutine;
-            std::vector<uint32_t>    waitFlags;
+            int                      overlap = 1;
+            std::vector<CoroutineRun> runs;
             uint32_t                 returnAddress = 0;
 
             [[nodiscard]] bool IsRoot() const { return async && (exported || entered); }
@@ -423,6 +431,7 @@ namespace UdonLuau {
                 while (open < text.size() && (text[open] == ' ' || text[open] == '\t')) ++open;
                 if (open < text.size() && text[open] == '(') {
                     char quote = 0;
+                    int depth = 0;
                     size_t close = open + 1;
                     for (; close < text.size(); ++close) {
                         char c = text[close];
@@ -431,8 +440,11 @@ namespace UdonLuau {
                             else if (c == quote) quote = 0;
                         } else if (c == '"' || c == '\'') {
                             quote = c;
+                        } else if (c == '(') {
+                            ++depth;
                         } else if (c == ')') {
-                            break;
+                            if (depth == 0) break;
+                            --depth;
                         }
                     }
                     attribute.arguments = SplitArguments(text.substr(open + 1, close - open - 1));
@@ -731,9 +743,9 @@ namespace UdonLuau {
             std::vector<Value> EmitWait(bool frames, const Value& amount, const Value& timing, size_t want, const Location& location);
             void EnterRoot(Function* f, std::vector<Value> args, const Location& location);
             void CallCancel(Function& f);
-            void EmitRootPrologue(Function& f, Label reject);
+            void CompileRun(Function& f, CoroutineRun& run);
             void EmitRootReject(Function& f, Label reject);
-            void EmitCancelRoutine(Function& f);
+            void EmitCancelRoutine(const CoroutineRun& run, const Location& location);
             void EmitAliveCheck();
             bool DeclareSignal(AstLocal* var, AstExpr* init, bool exported);
             SignalInfo* SignalOf(AstExpr* expr);
@@ -871,6 +883,7 @@ namespace UdonLuau {
             std::vector<LoopLabels>                        loops_;
             Function*                                      current_ = nullptr;
             Function*                                      root_ = nullptr;
+            CoroutineRun*                                  run_ = nullptr;
             int                                            waitSites_ = 0;
             int                                            fireDepth_ = 0;
             std::deque<ListenSite>                         listenSites_;
@@ -985,8 +998,8 @@ namespace UdonLuau {
                 if (singleton_) result.program->updateOrder = std::numeric_limits<int>::min() / 2;
                 for (const auto& f : functions_) {
                     if (!f->IsRoot() && !f->Shared()) continue;
-                    std::string_view mode = f->Shared() ? "shared" : f->reentry == Reentry::Restart ? "restart" : f->reentry == Reentry::Overlap ? "overlap" : "ignore";
-                    result.program->coroutines.push_back({ f->name, std::string(mode) });
+                    std::string mode = f->Shared() ? "shared" : f->reentry == Reentry::Restart ? "restart" : f->reentry == Reentry::Overlap ? std::format("overlap({})", f->overlap) : "ignore";
+                    result.program->coroutines.push_back({ f->name, std::move(mode) });
                 }
                 for (const auto& f : functions_) {
                     if (!f->networkCallable) continue;
@@ -1465,16 +1478,26 @@ namespace UdonLuau {
                     if (a.name == "noinline") f->noInline = true;
                     if (a.name != "reentry") continue;
                     std::string_view mode = a.arguments.size() == 1 ? std::string_view(a.arguments[0]) : std::string_view{};
-                    if (mode == "ignore") f->reentry = Reentry::Ignore;
-                    else if (mode == "restart") f->reentry = Reentry::Restart;
-                    else if (mode == "overlap") f->reentry = Reentry::Overlap;
-                    else Report(f->location, "@reentry takes ignore, restart or overlap");
+                    if (mode == "ignore") {
+                        f->reentry = Reentry::Ignore;
+                    } else if (mode == "restart") {
+                        f->reentry = Reentry::Restart;
+                    } else if (mode.starts_with("overlap(") && mode.ends_with(")")) {
+                        std::string count(mode.substr(8, mode.size() - 9));
+                        char* end = nullptr;
+                        long n = std::strtol(count.c_str(), &end, 10);
+                        if (count.empty() || *end || n < 2 || n > kMaxOverlap) Report(f->location, std::format("overlap takes the most runs at once, from 2 to {}, e.g. @reentry(overlap(4))", kMaxOverlap));
+                        else {
+                            f->reentry = Reentry::Overlap;
+                            f->overlap = static_cast<int>(n);
+                        }
+                    } else {
+                        Report(f->location, "@reentry takes ignore, restart or overlap(n), where n is the most runs at once");
+                    }
                     if (!f->async) Report(f->location, std::format("@reentry has no effect: '{}' never waits", f->name), Severity::Warning);
                 }
                 if (f->async && f->exported && !f->returns.empty())
                     Report(f->location, std::format("'{}' waits, so it cannot return values: callers get control back at its first wait", f->name));
-                if (f->reentry == Reentry::Overlap && f->cancelTarget)
-                    Report(f->location, std::format("'{}' uses @reentry(overlap), so its runs cannot be told apart and task.cancel cannot stop one", f->name));
                 if (f->async && f->exported && f->noInline)
                     Report(f->location, std::format("@noinline is ignored on '{}': public functions that wait are inlined into same-script callers", f->name), Severity::Warning);
                 if (f->Shared() && (f->entered || f->cancelTarget || f->reentry != Reentry::Ignore))
@@ -1484,11 +1507,17 @@ namespace UdonLuau {
                 HeapValue yes;
                 yes.kind = ValueKind::Boolean;
                 yes.boolean = true;
-                f->freeSlot = emit_.AddSlot(std::format("__co_{}_free", f->name), types_.Boolean, yes);
-                if (DebugBuild()) f->lineSlot = emit_.AddSlot(std::format("__co_{}_line", f->name), types_.Int32);
-                if (f->Cancellable()) {
-                    f->cancelRoutine = emit_.NewLabel();
-                    f->cancelReturn = emit_.Hidden(types_.UInt32);
+                f->runs.resize(static_cast<size_t>(f->overlap));
+                for (size_t k = 0; k < f->runs.size(); ++k) {
+                    CoroutineRun& run = f->runs[k];
+                    std::string suffix = k ? std::format("{}", k) : std::string();
+                    run.freeSlot = emit_.AddSlot(std::format("__co_{}{}_free", f->name, suffix), types_.Boolean, yes);
+                    if (DebugBuild()) run.lineSlot = emit_.AddSlot(std::format("__co_{}{}_line", f->name, suffix), types_.Int32);
+                    run.start = emit_.NewLabel();
+                    if (f->Cancellable()) {
+                        run.cancelRoutine = emit_.NewLabel();
+                        run.cancelReturn = emit_.Hidden(types_.UInt32);
+                    }
                 }
             }
         }
@@ -1768,6 +1797,7 @@ namespace UdonLuau {
                 if (p.type->IsList()) Fail(f.location, std::format("'{}' takes a List, so it must be inlined; mark it '-- @inline'", f.name));
             current_ = &f;
             root_ = root ? &f : nullptr;
+            run_ = nullptr;
             emit_.ResetTemps();
             for (size_t i = 0; i < f.parameters.size(); ++i) {
                 AstLocal* arg = f.node->args.data[i];
@@ -1784,41 +1814,71 @@ namespace UdonLuau {
                 EmitEntryPrologue(f);
             }
             emit_.Bind(f.entry);
+            if (!root) {
+                AstStat* tail = nullptr;
+                CompileBody(f.node->body, tail);
+                emit_.Bind(f.epilogue);
+                if (f.trampoline) EmitYield();
+                else emit_.JumpTo(0xFFFFFFFFu);
+                current_ = nullptr;
+                return;
+            }
+
             Label reject = emit_.NewLabel();
-            if (root) EmitRootPrologue(f, reject);
-            AstStat* tail = nullptr;
-            CompileBody(f.node->body, tail);
-            emit_.Bind(f.epilogue);
-            if (root) emit_.Copy(TruthySlot(Value::OfBoolean(true), f.location), f.freeSlot);
-            if (shared) emit_.JumpIndirect(f.returnAddress);
-            else if (f.trampoline) EmitYield();
-            else emit_.JumpTo(0xFFFFFFFFu);
-            if (root) {
+            if (f.runs.size() == 1) {
+                emit_.JumpIfFalse(f.runs[0].freeSlot, reject);
+            } else {
+                for (const CoroutineRun& run : f.runs) {
+                    Label next = emit_.NewLabel();
+                    emit_.JumpIfFalse(run.freeSlot, next);
+                    emit_.Jump(run.start);
+                    emit_.Bind(next);
+                }
                 EmitRootReject(f, reject);
-                if (f.Cancellable()) EmitCancelRoutine(f);
+            }
+            for (size_t k = 0; k < f.runs.size(); ++k) {
+                if (k) {
+                    emit_.ResetTemps();
+                    f.epilogue = emit_.NewLabel();
+                }
+                CompileRun(f, f.runs[k]);
+                if (f.runs.size() == 1) EmitRootReject(f, reject);
             }
             current_ = nullptr;
             root_ = nullptr;
+            run_ = nullptr;
         }
 
-        void Compiler::EmitRootPrologue(Function& f, Label reject) {
-            emit_.JumpIfFalse(f.freeSlot, reject);
+        void Compiler::CompileRun(Function& f, CoroutineRun& run) {
+            root_ = &f;
+            run_ = &run;
+            emit_.Bind(run.start);
             if (f.reentry == Reentry::Restart) CallCancel(f);
-            emit_.Copy(TruthySlot(Value::OfBoolean(false), f.location), f.freeSlot);
+            emit_.Copy(TruthySlot(Value::OfBoolean(false), f.location), run.freeSlot);
             for (size_t i = 0; i < f.parameters.size(); ++i) {
                 AstLocal* arg = f.node->args.data[i];
                 Variable own{ emit_.Local(arg->name.value, f.parameters[i].type), f.parameters[i].type };
                 emit_.Copy(f.parameters[i].slot, own.slot);
+                aliases_.erase(arg);
                 variables_[arg] = own;
             }
+            AstStat* tail = nullptr;
+            CompileBody(f.node->body, tail);
+            emit_.Bind(f.epilogue);
+            emit_.Copy(TruthySlot(Value::OfBoolean(true), f.location), run.freeSlot);
+            if (f.Shared()) emit_.JumpIndirect(f.returnAddress);
+            else EmitYield();
+            if (f.Cancellable()) EmitCancelRoutine(run, f.location);
         }
 
         void Compiler::EmitRootReject(Function& f, Label reject) {
             emit_.Bind(reject);
             if (DebugBuild()) {
                 std::string who = options_.scriptName.empty() ? f.name : options_.scriptName + "." + f.name;
-                Value message = f.reentry == Reentry::Ignore
-                    ? ConcatValues({ Value::OfString(std::format("[UdonLuau] {} ignored: still waiting at line ", who)), Value::OfSlot(f.lineSlot, types_.Int32),
+                Value message = f.reentry == Reentry::Overlap
+                    ? Value::OfString(std::format("[UdonLuau] {} ignored: all {} runs are busy (@reentry(overlap({})))", who, f.overlap, f.overlap))
+                    : f.reentry == Reentry::Ignore
+                    ? ConcatValues({ Value::OfString(std::format("[UdonLuau] {} ignored: still waiting at line ", who)), Value::OfSlot(f.runs[0].lineSlot, types_.Int32),
                                        Value::OfString(" (@reentry(ignore))") }, f.location)
                     : Value::OfString(std::format("[UdonLuau] {} ignored: it was triggered again while running", who));
                 CallStatic(types_.Get("UnityEngineDebug"), "LogWarning", { message }, nullptr, f.location);
@@ -1828,19 +1888,21 @@ namespace UdonLuau {
         }
 
         void Compiler::CallCancel(Function& f) {
-            Label back = emit_.NewLabel();
-            emit_.Copy(emit_.AddressConstant(back), f.cancelReturn);
-            emit_.Jump(f.cancelRoutine);
-            emit_.Bind(back);
+            for (const CoroutineRun& run : f.runs) {
+                Label back = emit_.NewLabel();
+                emit_.Copy(emit_.AddressConstant(back), run.cancelReturn);
+                emit_.Jump(run.cancelRoutine);
+                emit_.Bind(back);
+            }
         }
 
-        void Compiler::EmitCancelRoutine(Function& f) {
-            emit_.Bind(f.cancelRoutine);
-            uint32_t yes = TruthySlot(Value::OfBoolean(true), f.location);
-            uint32_t no = TruthySlot(Value::OfBoolean(false), f.location);
-            emit_.Copy(yes, f.freeSlot);
-            for (uint32_t flag : f.waitFlags) emit_.Copy(no, flag);
-            emit_.JumpIndirect(f.cancelReturn);
+        void Compiler::EmitCancelRoutine(const CoroutineRun& run, const Location& location) {
+            emit_.Bind(run.cancelRoutine);
+            uint32_t yes = TruthySlot(Value::OfBoolean(true), location);
+            uint32_t no = TruthySlot(Value::OfBoolean(false), location);
+            emit_.Copy(yes, run.freeSlot);
+            for (uint32_t flag : run.waitFlags) emit_.Copy(no, flag);
+            emit_.JumpIndirect(run.cancelReturn);
         }
 
         std::vector<Value> Compiler::CallTask(AstExprCall* call, std::string_view name, size_t want) {
@@ -1920,7 +1982,7 @@ namespace UdonLuau {
                 waiting = { emit_.Hidden(types_.Boolean), types_.Boolean };
                 pending = { emit_.Hidden(types_.Int32), types_.Int32 };
                 due = { emit_.Hidden(clock), clock };
-                root->waitFlags.push_back(waiting.slot);
+                run_->waitFlags.push_back(waiting.slot);
                 emit_.Copy(flag(true), waiting.slot);
                 Store(CompileArithmetic(AstExprBinary::Add, Value::OfSlot(pending.slot, types_.Int32), Value::OfInteger(1), location), pending, location);
                 Value span = amount;
@@ -1933,8 +1995,8 @@ namespace UdonLuau {
                 Store(CompileArithmetic(AstExprBinary::Add, now(), span, location), due, location);
             }
             CallMember(SelfValue("this"), frames ? "SendCustomEventDelayedFrames" : "SendCustomEventDelayedSeconds", { Value::OfString(entry), amount, timing }, nullptr, location);
-            if (root->lineSlot) emit_.Copy(Materialize(Value::OfInteger(location.begin.line + 1), types_.Int32, location), root->lineSlot);
-            if (root->reentry != Reentry::Ignore) emit_.Copy(flag(true), root->freeSlot);
+            if (run_->lineSlot) emit_.Copy(Materialize(Value::OfInteger(location.begin.line + 1), types_.Int32, location), run_->lineSlot);
+            if (root->reentry == Reentry::Restart) emit_.Copy(flag(true), run_->freeSlot);
             EmitYield();
 
             Label resume = emit_.NewLabel();
@@ -1958,7 +2020,7 @@ namespace UdonLuau {
                 EmitYield();
                 emit_.Bind(go);
             }
-            if (root->reentry != Reentry::Ignore) emit_.Copy(flag(false), root->freeSlot);
+            if (root->reentry == Reentry::Restart) emit_.Copy(flag(false), run_->freeSlot);
             if (!start) return {};
             Value elapsed = CompileArithmetic(AstExprBinary::Sub, CallStatic(types_.Get("UnityEngineTime"), "get_timeAsDouble", {}, nullptr, location).at(0), Value::OfSlot(start->slot, types_.Double), location);
             return { Value::OfSlot(Convert(elapsed.slot, types_.Double, types_.Single, location), types_.Single) };
@@ -2135,23 +2197,22 @@ namespace UdonLuau {
         std::vector<Value> Compiler::EmitListen(const std::vector<const Type*>& types, std::vector<ListenSite*>& registry, size_t want, const Location& location) {
             Function* root = root_;
             if (!root) Fail(location, "waits can only be used in events, public methods and functions they call or start");
-            if (root->reentry == Reentry::Overlap) Fail(location, "signal and event waits track one waiting run per place, so they cannot be used with @reentry(overlap)");
             ListenSite& site = listenSites_.emplace_back();
             site.root = root;
             site.waiting = emit_.Hidden(types_.Boolean);
             site.taken = emit_.Hidden(types_.Boolean);
             site.direct = emit_.NewLabel();
             for (const Type* t : types) site.results.push_back({ emit_.Hidden(t), t });
-            root->waitFlags.push_back(site.waiting);
-            root->waitFlags.push_back(site.taken);
+            run_->waitFlags.push_back(site.waiting);
+            run_->waitFlags.push_back(site.taken);
             registry.push_back(&site);
 
             emit_.Copy(TruthySlot(Value::OfBoolean(true), location), site.waiting);
-            if (root->lineSlot) emit_.Copy(Materialize(Value::OfInteger(location.begin.line + 1), types_.Int32, location), root->lineSlot);
-            if (root->reentry != Reentry::Ignore) emit_.Copy(TruthySlot(Value::OfBoolean(true), location), root->freeSlot);
+            if (run_->lineSlot) emit_.Copy(Materialize(Value::OfInteger(location.begin.line + 1), types_.Int32, location), run_->lineSlot);
+            if (root->reentry == Reentry::Restart) emit_.Copy(TruthySlot(Value::OfBoolean(true), location), run_->freeSlot);
             EmitYield();
             emit_.Bind(site.direct);
-            if (root->reentry != Reentry::Ignore) emit_.Copy(TruthySlot(Value::OfBoolean(false), location), root->freeSlot);
+            if (root->reentry == Reentry::Restart) emit_.Copy(TruthySlot(Value::OfBoolean(false), location), run_->freeSlot);
             std::vector<Value> out;
             for (size_t i = 0; i < std::min(want, site.results.size()); ++i) out.push_back(Value::OfSlot(site.results[i].slot, site.results[i].type));
             return out;
@@ -2215,6 +2276,7 @@ namespace UdonLuau {
         void Compiler::EmitFireBlock(const FireSite& fire) {
             current_ = fire.from;
             root_ = nullptr;
+            run_ = nullptr;
             emit_.ResetTemps();
             if (fire.from && !fire.from->IsRoot())
                 for (const ListenSite* site : fire.signal->sites) fire.from->callees.push_back(site->root);
@@ -2234,6 +2296,7 @@ namespace UdonLuau {
         void Compiler::EmitEventDispatch(EventListeners& listeners) {
             current_ = nullptr;
             root_ = nullptr;
+            run_ = nullptr;
             emit_.ResetTemps();
             Location location;
             if (listeners.handler) {
@@ -2269,11 +2332,10 @@ namespace UdonLuau {
                 if (call->args.size) Fail(location, "Wait takes no arguments");
                 Function* root = root_;
                 if (!root) Fail(location, "waits can only be used in events, public methods and functions they call or start");
-                if (root->reentry == Reentry::Overlap) Fail(location, "signal and event waits track one waiting run per place, so they cannot be used with @reentry(overlap)");
                 std::string entry = std::format("__co{}", waitSites_++);
                 uint32_t waiting = emit_.Hidden(types_.Boolean);
                 uint32_t registeredWith = emit_.Hidden(types_.Behaviour());
-                root->waitFlags.push_back(waiting);
+                run_->waitFlags.push_back(waiting);
                 std::vector<Variable> results;
                 for (const Type* t : types) results.push_back({ emit_.Hidden(t), t });
 
@@ -2287,8 +2349,8 @@ namespace UdonLuau {
                 emit_.Copy(receiver.slot, registeredWith);
                 emit_.Bind(enlisted);
                 emit_.Copy(yes, waiting);
-                if (root->lineSlot) emit_.Copy(Materialize(Value::OfInteger(location.begin.line + 1), types_.Int32, location), root->lineSlot);
-                if (root->reentry != Reentry::Ignore) emit_.Copy(yes, root->freeSlot);
+                if (run_->lineSlot) emit_.Copy(Materialize(Value::OfInteger(location.begin.line + 1), types_.Int32, location), run_->lineSlot);
+                if (root->reentry == Reentry::Restart) emit_.Copy(yes, run_->freeSlot);
                 EmitYield();
 
                 Label resume = emit_.NewLabel();
@@ -2305,7 +2367,7 @@ namespace UdonLuau {
                 emit_.Bind(stale);
                 EmitYield();
                 emit_.Bind(go);
-                if (root->reentry != Reentry::Ignore) emit_.Copy(no, root->freeSlot);
+                if (root->reentry == Reentry::Restart) emit_.Copy(no, run_->freeSlot);
                 std::vector<Value> out;
                 for (size_t i = 0; i < std::min(want, results.size()); ++i) out.push_back(Value::OfSlot(results[i].slot, results[i].type));
                 return out;
@@ -2468,9 +2530,9 @@ namespace UdonLuau {
         }
 
         void Compiler::EmitAliveCheck() {
-            if (!root_ || !root_->Cancellable()) return;
+            if (!root_ || !run_ || !root_->Cancellable()) return;
             Label alive = emit_.NewLabel();
-            emit_.JumpIfFalse(root_->freeSlot, alive);
+            emit_.JumpIfFalse(run_->freeSlot, alive);
             EmitYield();
             emit_.Bind(alive);
         }
@@ -5146,7 +5208,7 @@ namespace UdonLuau {
                 for (size_t i = 0; i < std::min(want, f->returns.size()); ++i) results.push_back(Value::OfSlot(emit_.Temp(f->returns[i]), f->returns[i]));
                 Label busy = emit_.NewLabel();
                 Label done = emit_.NewLabel();
-                emit_.JumpIfFalse(f->freeSlot, busy);
+                emit_.JumpIfFalse(f->runs[0].freeSlot, busy);
                 for (size_t i = 0; i < args.size(); ++i) Store(args[i], f->parameters[i], location);
                 if (current_) current_->callees.push_back(f);
                 Label back = emit_.NewLabel();

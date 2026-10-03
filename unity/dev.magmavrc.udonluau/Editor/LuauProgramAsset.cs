@@ -364,9 +364,9 @@ namespace Magma.VRC.UdonLuau
                     string mode = c.mode switch
                     {
                         "restart" => "restarts when triggered while waiting",
-                        "overlap" => "runs again alongside, sharing locals",
                         "shared" => "one caller at a time; others skip the call",
-                        _ => "ignores triggers while waiting",
+                        "ignore" => "ignores triggers while waiting",
+                        _ => $"{c.mode}: up to that many runs at once, each with its own locals",
                     };
                     EditorGUILayout.LabelField(c.function, mode, EditorStyles.miniLabel);
                 }

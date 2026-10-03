@@ -1948,7 +1948,58 @@ function Start()
     announce(3)
 end
 )", "recursion"), "recursion through a signal handler is reported");
-        Check(HasError(f, "local s = Signal()\n-- @reentry(overlap)\nexport function W()\n s:Wait()\nend", "overlap"), "signal waits reject overlap mode");
+        auto overlapped = Build(f, R"(
+export local lit = 0
+export local done = 0
+local go = Signal()
+-- @reentry(overlap(2))
+export function Flash(n: int)
+    lit += n
+    task.wait(1)
+    lit -= n
+end
+-- @reentry(overlap(2))
+export function Pump()
+    go:Wait()
+    done += 1
+end
+export function Go()
+    go:Fire()
+end
+export function Stop()
+    task.cancel(Flash)
+end
+)",
+            { .defines = { { "DEBUG", "true" } } });
+        Check(overlapped.has_value(), "overlap(n) compiles");
+        if (overlapped) {
+            Check(overlapped->coroutines.size() == 2 && overlapped->coroutines[0].mode == "overlap(2)", "overlap is listed with its run count");
+            Machine m(f, *overlapped);
+            f.log.clear();
+            for (int n : { 1, 10, 100 }) {
+                m.Var("__0_n__param") = int32_t{ n };
+                m.Run("__0__Flash");
+            }
+            Check(std::get<int32_t>(m.Var("lit")) == 11 && f.log.size() == 3 && f.log[2].find("all 2 runs are busy") != std::string::npos,
+                std::format("two runs wait at once and a third is ignored ({})", log()));
+            m.Run("__co0");
+            Check(std::get<int32_t>(m.Var("lit")) == 10, "the first run keeps its own argument");
+            m.Run("__co1");
+            Check(std::get<int32_t>(m.Var("lit")) == 0, "the second run keeps its own argument");
+            for (int n : { 3, 4 }) {
+                m.Var("__0_n__param") = int32_t{ n };
+                m.Run("__0__Flash");
+            }
+            m.Run("_Stop");
+            m.Run("__co0");
+            m.Run("__co1");
+            Check(std::get<int32_t>(m.Var("lit")) == 7, "task.cancel stops every overlapping run");
+            m.Run("_Pump");
+            m.Run("_Pump");
+            m.Run("_Go");
+            Check(std::get<int32_t>(m.Var("done")) == 2, "a signal resumes every overlapping run");
+        }
+        Check(HasError(f, "-- @reentry(overlap)\nexport function W()\n task.wait(1)\nend", "overlap(n)"), "overlap needs its run count");
 
         Check(HasError(f, "export function Get(): int\n task.wait(1)\n return 1\nend", "cannot return values"), "public methods that wait cannot return values");
         Check(HasError(f, "local function go()\n task.wait(1)\nend\nfunction Start()\n task.cancel(print)\nend", "function of this script"), "task.cancel takes a script function");
