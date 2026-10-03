@@ -1059,6 +1059,57 @@ end
             "static code cannot use instance fields");
     });
 
+    Case("const tables, bit32 and more string functions", [] {
+        Fixture f = MakeFixture();
+        Binary<int32_t>(f, "SystemInt32", "op_LogicalAnd", "SystemInt32", "SystemInt32", [](int32_t a, int32_t b) { return a & b; });
+        Binary<int32_t>(f, "SystemInt32", "op_LogicalOr", "SystemInt32", "SystemInt32", [](int32_t a, int32_t b) { return a | b; });
+        Binary<int32_t>(f, "SystemInt32", "op_LogicalXor", "SystemInt32", "SystemInt32", [](int32_t a, int32_t b) { return a ^ b; });
+        Binary<int32_t>(f, "SystemInt32", "op_LeftShift", "SystemInt32", "SystemInt32", [](int32_t a, int32_t b) { return static_cast<int32_t>(static_cast<uint32_t>(a) << (b & 31)); });
+        Binary<int32_t>(f, "SystemInt32", "op_RightShift", "SystemInt32", "SystemInt32", [](int32_t a, int32_t b) { return a >> (b & 31); });
+        f.Extern("UnityEngineMathf.__Max__SystemInt32_SystemInt32__SystemInt32", false, [](auto& h, auto& p) { h[p[2]] = std::max(As<int32_t>(h, p[0]), As<int32_t>(h, p[1])); });
+        f.Extern("SystemString.__Substring__SystemInt32_SystemInt32__SystemString", true, [](auto& h, auto& p) {
+            h[p[3]] = As<std::string>(h, p[0]).substr(static_cast<size_t>(As<int32_t>(h, p[1])), static_cast<size_t>(As<int32_t>(h, p[2])));
+        });
+        f.Type("System.StringComparison", TypeKind::Enum, {}, {}, { { "Ordinal", 4 } });
+        f.Extern("SystemString.__IndexOf__SystemString_SystemInt32_SystemStringComparison__SystemInt32", true, [](auto& h, auto& p) {
+            size_t at = As<std::string>(h, p[0]).find(As<std::string>(h, p[1]), static_cast<size_t>(As<int32_t>(h, p[2])));
+            h[p[4]] = at == std::string::npos ? -1 : static_cast<int32_t>(at);
+        });
+        auto p = Build(f, R"(
+const State = {Idle = 0, Open = 1, Closed = 2}
+local flags = 6
+local masked = 0
+local shifted = 0
+local state = State.Closed
+local part = ""
+local first = 0
+local last = 0
+local folded = 0
+local codepoints = 0
+function Start()
+    masked = bit32.band(flags, 3) + bit32.bor(flags, 1) * 10
+    shifted = bit32.rshift(-16, 28)
+    if state == State.Closed then
+        state = State.Open
+    end
+    part = string.sub("hello world", 7, -1)
+    first, last = string.find("hello world", "o w", 1, true)
+    folded = bit32.lshift(1, 4) + string.byte("A")
+    codepoints = utf8.len("héllo")
+end
+)");
+        Check(p.has_value(), "compiles");
+        if (!p) return;
+        Machine m(f, *p);
+        m.Run("_start");
+        Check(std::get<int32_t>(m.Var("masked")) == 72, std::format("band and bor ({})", std::get<int32_t>(m.Var("masked"))));
+        Check(std::get<int32_t>(m.Var("shifted")) == 15, std::format("rshift is logical ({})", std::get<int32_t>(m.Var("shifted"))));
+        Check(std::get<int32_t>(m.Var("state")) == 1, "const table members fold to numbers");
+        Check(std::get<std::string>(m.Var("part")) == "world", std::format("string.sub with a negative end ('{}')", std::get<std::string>(m.Var("part"))));
+        Check(std::get<int32_t>(m.Var("first")) == 5 && std::get<int32_t>(m.Var("last")) == 7, "string.find returns 1-based start and end");
+        Check(std::get<int32_t>(m.Var("folded")) == 81 && std::get<int32_t>(m.Var("codepoints")) == 5, "constant bit32, string.byte and utf8.len fold");
+    });
+
     Case("change callbacks and GetComponent by script type", [] {
         Fixture f = MakeFixture();
         f.Extern("UnityEngineComponent.__GetComponents__SystemType__UnityEngineComponentArray", true);

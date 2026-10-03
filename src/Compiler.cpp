@@ -650,6 +650,7 @@ namespace UdonLuau {
             std::vector<Value> CallDelayed(const Value& receiver, std::string_view name, std::vector<Value> args, const Location& location);
             void CompileDelaySite(const DelaySite& site);
             void EmitReturn();
+            void DeclareConstTable(AstLocal* var, AstExprTable* table);
             Value FindBehaviour(const Value& receiver, std::string_view getter, const Type* wanted, const Location& location);
             void RecordChangeHandler(const Annotations& annotations, const std::string& field, const Variable& variable, const Location& location);
             void CompileChangeHandler(const ChangeHandler& handler);
@@ -663,6 +664,8 @@ namespace UdonLuau {
             std::vector<Value> CallLibrary(std::string_view library, std::string_view name, AstExprCall* call, std::vector<Value> args, const Type* typeArg, const Variable* into);
             std::vector<Value> CallMath(std::string_view name, std::vector<Value> args, const Location& location);
             std::vector<Value> CallString(std::string_view name, std::vector<Value> args, const Location& location);
+            std::vector<Value> CallBit32(std::string_view name, std::vector<Value> args, const Location& location);
+            std::vector<Value> CallUtf8(std::string_view name, std::vector<Value> args, const Location& location);
             std::vector<Value> CallTable(std::string_view name, AstExprCall* call, std::vector<Value> args, const Type* typeArg, const Variable* into);
             std::string TranslateFormat(std::string_view format, size_t count, const Location& location);
             Value ArrayArgument(const std::vector<Value>& args, size_t index, std::string_view function, const Location& location);
@@ -732,6 +735,7 @@ namespace UdonLuau {
             bool                                           hasStatics_ = false;
             uint32_t                                       eventReturnSlot_ = 0;
             std::vector<ChangeHandler>                     changeHandlers_;
+            std::unordered_map<AstLocal*, std::map<std::string, Value, std::less<>>> constTables_;
             std::set<std::string, std::less<>>             entryNames_;
             std::unordered_map<AstLocal*, std::string>     staticFields_;
             std::unordered_map<AstLocal*, std::string>     staticFunctions_;
@@ -1315,6 +1319,11 @@ namespace UdonLuau {
                     continue;
                 }
 
+                if (stat->isConst && i < stat->values.size)
+                    if (auto* table = Unwrap(stat->values.data[i])->as<AstExprTable>()) {
+                        DeclareConstTable(var, table);
+                        continue;
+                    }
                 const Type* type = var->annotation ? ResolveType(var->annotation) : nullptr;
                 if (type && type->IsList()) {
                     if (options_.staticPart) Fail(var->location, "a List cannot be static; use an array");
@@ -1613,6 +1622,11 @@ namespace UdonLuau {
         }
 
         void Compiler::CompileLocal(AstStatLocal* stat) {
+            if (stat->isConst && stat->vars.size == 1 && stat->values.size == 1)
+                if (auto* table = Unwrap(stat->values.data[0])->as<AstExprTable>()) {
+                    DeclareConstTable(stat->vars.data[0], table);
+                    return;
+                }
             std::vector<const Type*> expected;
             for (AstLocal* var : stat->vars) expected.push_back(var->annotation ? ResolveType(var->annotation) : nullptr);
             if (std::ranges::any_of(expected, [](const Type* t) { return t && t->IsList(); })) {
@@ -1910,6 +1924,10 @@ namespace UdonLuau {
                 if (auto it = defines_.find(e->name.value); it != defines_.end()) return it->second;
                 return std::nullopt;
             }
+            if (auto* e = expr->as<AstExprIndexName>())
+                if (auto* owner = Unwrap(e->expr)->as<AstExprLocal>())
+                    if (auto it = constTables_.find(owner->local); it != constTables_.end())
+                        if (auto member = it->second.find(e->index.value); member != it->second.end()) return member->second;
             if (auto* e = expr->as<AstExprIfElse>()) {
                 auto c = e->hasElse ? TryConstant(e->condition) : std::nullopt;
                 if (!c) return std::nullopt;
@@ -2339,7 +2357,27 @@ namespace UdonLuau {
             Fail(expr->location, std::format("unknown name '{}'", name));
         }
 
+        void Compiler::DeclareConstTable(AstLocal* var, AstExprTable* table) {
+            std::map<std::string, Value, std::less<>> members;
+            for (const AstExprTable::Item& item : table->items) {
+                if (item.kind != AstExprTable::Item::Kind::Record) Fail(table->location, "a constant table needs named members, e.g. const State = {Idle = 0, Open = 1}");
+                auto* key = item.key->as<AstExprConstantString>();
+                std::string name(key->value.data, key->value.size);
+                auto constant = TryConstant(item.value);
+                if (!constant) Fail(item.value->location, std::format("'{}' needs a value known at compile time", name));
+                if (!members.emplace(name, *constant).second) Fail(item.value->location, std::format("'{}' is declared twice", name));
+            }
+            aliases_.erase(var);
+            constTables_[var] = std::move(members);
+        }
+
         Value Compiler::CompileIndexName(AstExprIndexName* expr) {
+            if (auto* local = Unwrap(expr->expr)->as<AstExprLocal>())
+                if (auto it = constTables_.find(local->local); it != constTables_.end()) {
+                    auto member = it->second.find(expr->index.value);
+                    if (member == it->second.end()) Fail(expr->location, std::format("'{}' has no member '{}'", local->local->name.value, expr->index.value));
+                    return member->second;
+                }
             if (auto library = LibraryName(expr->expr)) {
                 std::string_view name = expr->index.value;
                 if (*library == "math" && name == "pi") return Value::OfReal(static_cast<double>(3.14159265358979f));
@@ -3301,6 +3339,8 @@ namespace UdonLuau {
             if (library == "math") return CallMath(name, std::move(args), call->location);
             if (library == "string") return CallString(name, std::move(args), call->location);
             if (library == "Delay") return CallDelay(name, std::move(args), call->location);
+            if (library == "bit32") return CallBit32(name, std::move(args), call->location);
+            if (library == "utf8") return CallUtf8(name, std::move(args), call->location);
             return CallTable(name, call, std::move(args), typeArg, into);
         }
 
@@ -3343,6 +3383,11 @@ namespace UdonLuau {
             if (name == "log") {
                 arity(1, 2);
                 return CallStatic(mathf, "Log", std::move(args), nullptr, location);
+            }
+            if (name == "noise") {
+                arity(1, 2);
+                Value noise = args.size() == 2 ? CallStatic(mathf, "PerlinNoise", std::move(args), nullptr, location).at(0) : CallStatic(mathf, "PerlinNoise1D", std::move(args), nullptr, location).at(0);
+                return { CompileArithmetic(AstExprBinary::Sub, CompileArithmetic(AstExprBinary::Mul, noise, Value::OfReal(2), location), Value::OfReal(1), location) };
             }
             if (name == "sign") {
                 arity(1, 1);
@@ -3414,7 +3459,184 @@ namespace UdonLuau {
                 for (size_t i = 0; i < values.size(); ++i) CallMember(array, "Set", { Value::OfInteger(static_cast<int64_t>(i)), values[i] }, nullptr, location);
                 return CallStatic(string, "Format", { format, array }, nullptr, location);
             }
+            const Type* stringComparison = types_.Get("SystemStringComparison");
+            auto ordinal = [&] { return Value::OfInteger(4, stringComparison); };
+            auto held = [&](const Value& v, const Type* type) {
+                if (v.kind != Value::Kind::Slot || !emit_.IsTemp(v.slot)) return v;
+                Variable h{ emit_.Hidden(type), type };
+                Store(v, h, location);
+                return Value::OfSlot(h.slot, type);
+            };
+            auto ascii = [](const std::string& s) { return std::ranges::all_of(s, [](char c) { return static_cast<unsigned char>(c) < 0x80; }); };
+            if (name == "trim") return CallMember(text(0), "Trim", {}, nullptr, location);
+            if (name == "startswith" || name == "endswith") {
+                if (args.size() != 2) Fail(location, std::format("string.{} takes a string and the text to look for", name));
+                return CallMember(text(0), name == "startswith" ? "StartsWith" : "EndsWith", { text(1), ordinal() }, nullptr, location);
+            }
+            if (name == "reverse") {
+                if (args.size() == 1 && args[0].kind == Value::Kind::String && ascii(args[0].text)) return { Value::OfString(std::string(args[0].text.rbegin(), args[0].text.rend())) };
+                Value chars = CallMember(text(0), "ToCharArray", {}, nullptr, location).at(0);
+                CallStatic(types_.Get("SystemArray"), "Reverse", { chars }, nullptr, location);
+                return CallStatic(types_.String, "ctor", { chars }, nullptr, location);
+            }
+            if (name == "byte") {
+                if (args.empty() || args.size() > 2) Fail(location, "string.byte takes a string and an optional position");
+                Value at = args.size() == 2 ? args[1] : Value::OfInteger(1);
+                if (args[0].kind == Value::Kind::String && at.kind == Value::Kind::Integer && ascii(args[0].text) && at.integer >= 1 && at.integer <= static_cast<int64_t>(args[0].text.size()))
+                    return { Value::OfInteger(static_cast<unsigned char>(args[0].text[static_cast<size_t>(at.integer - 1)])) };
+                Value chars = CallMember(text(0), "ToCharArray", { CompileArithmetic(AstExprBinary::Sub, at, Value::OfInteger(1), location), Value::OfInteger(1) }, nullptr, location).at(0);
+                Value c = CallMember(chars, "Get", { Value::OfInteger(0) }, nullptr, location).at(0);
+                return CallStatic(types_.Get("SystemConvert"), "ToInt32", { c }, nullptr, location);
+            }
+            if (name == "char") return CallUtf8("char", std::move(args), location);
+            if (name == "sub") {
+                if (args.size() < 2 || args.size() > 3) Fail(location, "string.sub takes a string, a start and an optional end");
+                Value s = held(text(0), types_.String);
+                Value len = held(CallMember(s, "get_Length", {}, nullptr, location).at(0), types_.Int32);
+                auto normalize = [&](const Value& index, bool start) {
+                    Variable out{ emit_.Hidden(types_.Int32), types_.Int32 };
+                    Label negative = emit_.NewLabel();
+                    Label done = emit_.NewLabel();
+                    emit_.JumpIfFalse(TruthySlot(CompareValues(AstExprBinary::CompareGe, index, Value::OfInteger(0), location), location), negative);
+                    Store(index, out, location);
+                    emit_.Jump(done);
+                    emit_.Bind(negative);
+                    Store(CompileArithmetic(AstExprBinary::Add, CompileArithmetic(AstExprBinary::Add, len, index, location), Value::OfInteger(1), location), out, location);
+                    emit_.Bind(done);
+                    Value v = Value::OfSlot(out.slot, types_.Int32);
+                    const Type* mathf = types_.Get("UnityEngineMathf");
+                    Value clamped = start ? CallStatic(mathf, "Max", { v, Value::OfInteger(1) }, nullptr, location).at(0) : CallStatic(mathf, "Min", { v, len }, nullptr, location).at(0);
+                    Store(clamped, out, location);
+                    return v;
+                };
+                Value first = normalize(args[1], true);
+                Value last = args.size() == 3 ? normalize(args[2], false) : len;
+                Variable result{ emit_.Hidden(types_.String), types_.String };
+                Store(Value::OfString(""), result, location);
+                Label empty = emit_.NewLabel();
+                Value count = held(CompileArithmetic(AstExprBinary::Add, CompileArithmetic(AstExprBinary::Sub, last, first, location), Value::OfInteger(1), location), types_.Int32);
+                emit_.JumpIfFalse(TruthySlot(CompareValues(AstExprBinary::CompareGt, count, Value::OfInteger(0), location), location), empty);
+                Store(CallMember(s, "Substring", { CompileArithmetic(AstExprBinary::Sub, first, Value::OfInteger(1), location), count }, nullptr, location).at(0), result, location);
+                emit_.Bind(empty);
+                return { Value::OfSlot(result.slot, types_.String) };
+            }
+            if (name == "find") {
+                if (args.size() < 2 || args.size() > 4) Fail(location, "string.find takes a string, the text to find, an optional start and plain");
+                bool plain = args.size() == 4 && args[3].kind == Value::Kind::Boolean && args[3].boolean;
+                if (!plain && (args[1].kind != Value::Kind::String || args[1].text.find_first_of("^$*+?.()[]%-") != std::string::npos))
+                    Fail(location, "string.find only does plain text search; pass plain = true, e.g. string.find(s, \"a.b\", 1, true)");
+                Value s = held(text(0), types_.String);
+                Value needle = held(text(1), types_.String);
+                Value from = args.size() >= 3 && args[2].kind != Value::Kind::Nil ? CompileArithmetic(AstExprBinary::Sub, args[2], Value::OfInteger(1), location) : Value::OfInteger(0);
+                Value index = held(CallMember(s, "IndexOf", { needle, from, ordinal() }, nullptr, location).at(0), types_.Int32);
+                Variable start{ emit_.Hidden(types_.Int32), types_.Int32 };
+                Variable end{ emit_.Hidden(types_.Int32), types_.Int32 };
+                Store(Value::OfInteger(0), start, location);
+                Store(Value::OfInteger(0), end, location);
+                Label missing = emit_.NewLabel();
+                emit_.JumpIfFalse(TruthySlot(CompareValues(AstExprBinary::CompareGe, index, Value::OfInteger(0), location), location), missing);
+                Store(CompileArithmetic(AstExprBinary::Add, index, Value::OfInteger(1), location), start, location);
+                Store(CompileArithmetic(AstExprBinary::Add, index, CallMember(needle, "get_Length", {}, nullptr, location).at(0), location), end, location);
+                emit_.Bind(missing);
+                return { Value::OfSlot(start.slot, types_.Int32), Value::OfSlot(end.slot, types_.Int32) };
+            }
             Fail(location, std::format("string.{} is not supported; use the string's own methods, e.g. s:Substring(0, 3)", name));
+        }
+
+        std::vector<Value> Compiler::CallBit32(std::string_view name, std::vector<Value> args, const Location& location) {
+            auto integer = [&](const Value& v) {
+                if (v.kind == Value::Kind::Integer && !v.type) return v;
+                if (v.kind == Value::Kind::Slot && v.type == types_.Int32) return v;
+                if (Cost(v, types_.Int32) < 0) Fail(location, std::format("bit32.{} works on int values, got {}", name, Describe(v)));
+                return Value::OfSlot(Materialize(v, types_.Int32, location), types_.Int32);
+            };
+            auto op = [&](std::string_view method, const Value& a, const Value& b, int32_t (*fold)(int32_t, int32_t)) {
+                if (a.kind == Value::Kind::Integer && b.kind == Value::Kind::Integer)
+                    return Value::OfInteger(fold(static_cast<int32_t>(a.integer), static_cast<int32_t>(b.integer)));
+                return InvokeOperator(method, { types_.Int32 }, { integer(a), integer(b) }, location).at(0);
+            };
+            auto chain = [&](std::string_view method, int32_t (*fold)(int32_t, int32_t)) {
+                if (args.empty()) Fail(location, std::format("bit32.{} takes at least one value", name));
+                Value result = integer(args[0]);
+                for (size_t i = 1; i < args.size(); ++i) result = op(method, result, args[i], fold);
+                return result;
+            };
+            int32_t (*band)(int32_t, int32_t) = [](int32_t a, int32_t b) { return a & b; };
+            int32_t (*bor)(int32_t, int32_t) = [](int32_t a, int32_t b) { return a | b; };
+            int32_t (*bxor)(int32_t, int32_t) = [](int32_t a, int32_t b) { return a ^ b; };
+            int32_t (*shl)(int32_t, int32_t) = [](int32_t a, int32_t b) { return static_cast<int32_t>(static_cast<uint32_t>(a) << (b & 31)); };
+            int32_t (*sar)(int32_t, int32_t) = [](int32_t a, int32_t b) { return a >> (b & 31); };
+            if (name == "band") return { chain("op_LogicalAnd", band) };
+            if (name == "bor") return { chain("op_LogicalOr", bor) };
+            if (name == "bxor") return { chain("op_LogicalXor", bxor) };
+            if (name == "btest") return { CompareValues(AstExprBinary::CompareNe, chain("op_LogicalAnd", band), Value::OfInteger(0), location) };
+            if (name == "bnot") {
+                if (args.size() != 1) Fail(location, "bit32.bnot takes one value");
+                return { op("op_LogicalXor", args[0], Value::OfInteger(-1), bxor) };
+            }
+            if (args.size() != 2) Fail(location, std::format("bit32.{} takes a value and a shift", name));
+            if (name == "lshift") return { op("op_LeftShift", args[0], args[1], shl) };
+            if (name == "arshift") return { op("op_RightShift", args[0], args[1], sar) };
+            if (name == "rshift") {
+                if (args[0].kind == Value::Kind::Integer && args[1].kind == Value::Kind::Integer)
+                    return { Value::OfInteger(static_cast<int32_t>(static_cast<uint32_t>(args[0].integer) >> (args[1].integer & 31))) };
+                Value shifted = op("op_RightShift", args[0], args[1], sar);
+                Value top = op("op_LeftShift", Value::OfInteger(-1), CompileArithmetic(AstExprBinary::Sub, Value::OfInteger(31), args[1], location), shl);
+                Value mask = op("op_LogicalXor", op("op_LeftShift", top, Value::OfInteger(1), shl), Value::OfInteger(-1), bxor);
+                return { op("op_LogicalAnd", shifted, mask, band) };
+            }
+            Fail(location, std::format("bit32.{} is not supported", name));
+        }
+
+        std::vector<Value> Compiler::CallUtf8(std::string_view name, std::vector<Value> args, const Location& location) {
+            if (name == "char") {
+                bool literals = std::ranges::all_of(args, [](const Value& v) { return v.kind == Value::Kind::Integer && v.integer >= 0 && v.integer <= 0x10FFFF; });
+                if (literals) {
+                    std::string out;
+                    for (const Value& v : args) {
+                        auto cp = static_cast<uint32_t>(v.integer);
+                        if (cp < 0x80) out += static_cast<char>(cp);
+                        else if (cp < 0x800) out += { static_cast<char>(0xC0 | (cp >> 6)), static_cast<char>(0x80 | (cp & 0x3F)) };
+                        else if (cp < 0x10000) out += { static_cast<char>(0xE0 | (cp >> 12)), static_cast<char>(0x80 | ((cp >> 6) & 0x3F)), static_cast<char>(0x80 | (cp & 0x3F)) };
+                        else out += { static_cast<char>(0xF0 | (cp >> 18)), static_cast<char>(0x80 | ((cp >> 12) & 0x3F)), static_cast<char>(0x80 | ((cp >> 6) & 0x3F)), static_cast<char>(0x80 | (cp & 0x3F)) };
+                    }
+                    return { Value::OfString(out) };
+                }
+                std::vector<Value> parts;
+                for (const Value& v : args) parts.push_back(CallStatic(types_.Get("SystemChar"), "ConvertFromUtf32", { v }, nullptr, location).at(0));
+                if (parts.empty()) return { Value::OfString("") };
+                return { ConcatValues(std::move(parts), location) };
+            }
+            if (name == "len") {
+                if (args.size() != 1 || NaturalType(args[0]) != types_.String) Fail(location, "utf8.len takes a string");
+                if (args[0].kind == Value::Kind::String)
+                    return { Value::OfInteger(static_cast<int64_t>(std::ranges::count_if(args[0].text, [](char c) { return (static_cast<unsigned char>(c) & 0xC0) != 0x80; }))) };
+                Variable chars{ emit_.Hidden(types_.ArrayOf(types_.Get("SystemChar"))), types_.ArrayOf(types_.Get("SystemChar")) };
+                Store(CallMember(args[0], "ToCharArray", {}, nullptr, location).at(0), chars, location);
+                Value array = Value::OfSlot(chars.slot, chars.type);
+                Variable count{ emit_.Hidden(types_.Int32), types_.Int32 };
+                Store(CallMember(array, "get_Length", {}, nullptr, location).at(0), count, location);
+                Variable i{ emit_.Hidden(types_.Int32), types_.Int32 };
+                Store(Value::OfInteger(0), i, location);
+                Value index = Value::OfSlot(i.slot, types_.Int32);
+                Value total = Value::OfSlot(count.slot, types_.Int32);
+                Variable length{ emit_.Hidden(types_.Int32), types_.Int32 };
+                Store(total, length, location);
+                Label top = emit_.NewLabel();
+                Label next = emit_.NewLabel();
+                Label done = emit_.NewLabel();
+                emit_.Bind(top);
+                emit_.JumpIfFalse(TruthySlot(CompareValues(AstExprBinary::CompareLt, index, Value::OfSlot(length.slot, types_.Int32), location), location), done);
+                Value low = CallStatic(types_.Get("SystemChar"), "IsLowSurrogate", { CallMember(array, "Get", { index }, nullptr, location).at(0) }, nullptr, location).at(0);
+                emit_.JumpIfFalse(low.slot, next);
+                Store(CompileArithmetic(AstExprBinary::Sub, total, Value::OfInteger(1), location), count, location);
+                emit_.Bind(next);
+                Store(CompileArithmetic(AstExprBinary::Add, index, Value::OfInteger(1), location), i, location);
+                emit_.Jump(top);
+                emit_.Bind(done);
+                return { total };
+            }
+            Fail(location, std::format("utf8.{} is not supported", name));
         }
 
         std::string Compiler::TranslateFormat(std::string_view format, size_t count, const Location& location) {

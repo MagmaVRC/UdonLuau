@@ -35,6 +35,7 @@ namespace UdonLuau::Detail {
         { "math", "lerp", "(a: number, b: number, t: number) -> number" },
         { "math", "map", "(x: number, inMin: number, inMax: number, outMin: number, outMax: number) -> number" },
         { "math", "random", "(m: number?, n: number?) -> number" },
+        { "math", "noise", "(x: number, y: number?) -> number" },
         { "math", "pi", "number" },
         { "math", "huge", "number" },
         { "string", "format", "(format: string, ...any) -> string" },
@@ -43,6 +44,24 @@ namespace UdonLuau::Detail {
         { "string", "lower", "(s: string) -> string" },
         { "string", "rep", "(s: string, n: number) -> string" },
         { "string", "split", "(s: string, separator: string?) -> { string }" },
+        { "string", "sub", "(s: string, i: number, j: number?) -> string" },
+        { "string", "find", "(s: string, pattern: string, init: number?, plain: boolean?) -> (number, number)" },
+        { "string", "byte", "(s: string, i: number?) -> number" },
+        { "string", "char", "(...number) -> string" },
+        { "string", "reverse", "(s: string) -> string" },
+        { "string", "trim", "(s: string) -> string" },
+        { "string", "startswith", "(s: string, prefix: string) -> boolean" },
+        { "string", "endswith", "(s: string, suffix: string) -> boolean" },
+        { "bit32", "band", "(...number) -> number" },
+        { "bit32", "bor", "(...number) -> number" },
+        { "bit32", "bxor", "(...number) -> number" },
+        { "bit32", "bnot", "(x: number) -> number" },
+        { "bit32", "lshift", "(x: number, disp: number) -> number" },
+        { "bit32", "rshift", "(x: number, disp: number) -> number" },
+        { "bit32", "arshift", "(x: number, disp: number) -> number" },
+        { "bit32", "btest", "(...number) -> boolean" },
+        { "utf8", "len", "(s: string) -> number" },
+        { "utf8", "char", "(...number) -> string" },
         { "table", "insert", "<T>(t: { T }, pos: number | T, value: T?) -> ()" },
         { "table", "remove", "<T>(t: { T }, pos: number?) -> T" },
         { "table", "find", "<T>(t: { T }, value: T, init: number?) -> number" },
@@ -57,7 +76,7 @@ namespace UdonLuau::Detail {
     };
 
     [[nodiscard]] constexpr bool IsStandardLibrary(std::string_view library) {
-        return library == "math" || library == "string" || library == "table";
+        return library == "math" || library == "string" || library == "table" || library == "bit32" || library == "utf8";
     }
 
     [[nodiscard]] constexpr bool IsPolyfillLibrary(std::string_view library) {
