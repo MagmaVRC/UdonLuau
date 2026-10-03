@@ -174,6 +174,21 @@ namespace {
             auto it = std::ranges::find(xs, As<int32_t>(h, p[1]));
             h[p[2]] = it == xs.end() ? -1 : static_cast<int32_t>(it - xs.begin());
         });
+        f.Type("System.Array", TypeKind::Class);
+        f.Extern("SystemArray.__Copy__SystemArray_SystemInt32_SystemArray_SystemInt32_SystemInt32__SystemVoid", false, [](auto& h, auto& p) {
+            auto& from = *As<IntArray>(h, p[0]);
+            auto& to = *As<IntArray>(h, p[2]);
+            int32_t s = As<int32_t>(h, p[1]), d = As<int32_t>(h, p[3]), n = As<int32_t>(h, p[4]);
+            std::vector<int32_t> chunk(from.begin() + s, from.begin() + s + n);
+            std::ranges::copy(chunk, to.begin() + d);
+        });
+        f.Extern("SystemArray.__IndexOf__SystemArray_SystemObject__SystemInt32", false, [](auto& h, auto& p) {
+            auto& xs = *As<IntArray>(h, p[0]);
+            auto it = std::ranges::find(xs, As<int32_t>(h, p[1]));
+            h[p[2]] = it == xs.end() ? -1 : static_cast<int32_t>(it - xs.begin());
+        });
+        f.Extern("UnityEngineMathf.__Min__SystemInt32_SystemInt32__SystemInt32", false, [](auto& h, auto& p) { h[p[2]] = std::min(As<int32_t>(h, p[0]), As<int32_t>(h, p[1])); });
+        f.Extern("SystemString.__Format__SystemString_SystemObject_SystemObject__SystemString", false);
         f.Extern("UnityEngineComponent.__GetComponent__T", true);
         f.Extern("UnityEngineComponent.__GetComponent__SystemType__UnityEngineComponent", true);
         f.Type("VRC.Udon.Common.Interfaces.NetworkEventTarget", TypeKind::Enum, {}, {}, { { "All", 0 }, { "Owner", 1 } });
@@ -746,6 +761,38 @@ end
         m.Run("_start");
         Check(std::get<float>(m.Var("y")) == 9.0f, std::format("value ({})", std::get<float>(m.Var("y"))));
         Check(m.counters.externs == 5, std::format("v.y read once before the write ({} externs)", m.counters.externs));
+    });
+
+    Case("table, math and string library", [] {
+        Fixture f = MakeFixture();
+        auto p = Build(f, R"(
+local xs: {int}
+local filled: {int}
+local n = 0
+local found = 0
+local label = ""
+function Start()
+    xs = {1, 2}
+    table.insert(xs, 3)
+    table.insert(xs, 0, 9)
+    local r = table.remove(xs, 1)
+    local last = table.remove(xs)
+    found = table.find(xs, 2)
+    n = #xs * 100 + r * 10 + last
+    filled = table.create(5, 7)
+    n += filled[4] * 1000 + math.min(4, 2, 3) * 10000
+end
+export function Describe()
+    label = string.format("%d items, %.2f%% {x}", n, 1.5)
+end
+)");
+        Check(p.has_value(), "compiles");
+        if (!p) return;
+        Machine m(f, *p);
+        m.Run("_start");
+        Check(std::get<int32_t>(m.Var("n")) == 27213, std::format("insert, remove, create and min ({})", std::get<int32_t>(m.Var("n"))));
+        Check(std::get<int32_t>(m.Var("found")) == 1, "find");
+        Check(std::ranges::any_of(p->heap, [](const HeapSlot& s) { return s.value.text == "{0} items, {1:F2}% {{x}}"; }), "format string translated");
     });
 
     Case("negated conditions branch without an extern", [] {

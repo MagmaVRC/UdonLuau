@@ -112,6 +112,11 @@ namespace UdonLuau {
                     else break;
                 }
                 onCall(func);
+                if (auto* index = func->as<AstExprIndexName>(); index && !c->self && c->args.size > 0) {
+                    auto* library = index->expr->as<AstExprGlobal>();
+                    std::string_view member = index->index.value;
+                    if (library && std::string_view(library->name.value) == "table" && (member == "insert" || member == "remove")) Target(c->args.data[0]);
+                }
                 if (auto* index = func->as<AstExprIndexName>(); index && c->self) {
                     AstExpr* owner = index->expr;
                     while (auto* g = owner->as<AstExprGroup>()) owner = g->expr;
@@ -143,7 +148,7 @@ namespace UdonLuau {
         }
 
         bool IsPureStaticCall(AstExprCall* c) {
-            static const std::set<std::string, std::less<>> types{ "Mathf", "math", "Vector2", "Vector3", "Vector4", "Quaternion", "Color", "Vector2Int", "Vector3Int" };
+            static const std::set<std::string, std::less<>> types{ "Mathf", "math", "string", "Vector2", "Vector3", "Vector4", "Quaternion", "Color", "Vector2Int", "Vector3Int" };
             if (c->self) return false;
             auto* index = CallTarget(c)->as<AstExprIndexName>();
             if (!index) return false;
@@ -567,6 +572,15 @@ namespace UdonLuau {
             void Store(const Value& value, const Variable& destination, const Location& location);
             Value Evaluate(const Value& value);
             Function* Callee(AstExpr* func) const;
+            std::optional<std::string_view> LibraryName(AstExpr* expr) const;
+            std::vector<Value> CallLibrary(std::string_view library, std::string_view name, AstExprCall* call, std::vector<Value> args, const Type* typeArg, const Variable* into);
+            std::vector<Value> CallMath(std::string_view name, std::vector<Value> args, const Location& location);
+            std::vector<Value> CallString(std::string_view name, std::vector<Value> args, const Location& location);
+            std::vector<Value> CallTable(std::string_view name, AstExprCall* call, std::vector<Value> args, const Type* typeArg, const Variable* into);
+            std::string TranslateFormat(std::string_view format, size_t count, const Location& location);
+            Value ArrayArgument(const std::vector<Value>& args, size_t index, std::string_view function, const Location& location);
+            Value NewArray(const Type* arrayType, const Value& length, const Location& location);
+            void CopyRange(const Value& source, const Value& sourceIndex, const Value& destination, const Value& destinationIndex, const Value& length, const Location& location);
             bool CannotWrite(AstExprCall* call) const;
             bool HasCall(AstExpr* expr) const;
 
@@ -1991,6 +2005,12 @@ namespace UdonLuau {
         }
 
         Value Compiler::CompileIndexName(AstExprIndexName* expr) {
+            if (auto library = LibraryName(expr->expr)) {
+                std::string_view name = expr->index.value;
+                if (*library == "math" && name == "pi") return Value::OfReal(static_cast<double>(3.14159265358979f));
+                if (*library == "math" && name == "huge") return Value::OfReal(std::numeric_limits<double>::infinity());
+                Fail(expr->location, std::format("{}.{} must be called", *library, name));
+            }
             return ReadMember(CompileExpr(expr->expr), expr->index.value, expr->location);
         }
 
@@ -2482,6 +2502,8 @@ namespace UdonLuau {
             }
 
             if (auto* index = func->as<AstExprIndexName>()) {
+                if (auto library = LibraryName(index->expr))
+                    return CallLibrary(*library, index->index.value, call, std::move(args), typeArg, into);
                 Value owner = CompileExpr(index->expr);
                 if (owner.kind == Value::Kind::TypeRef) {
                     std::string_view name = index->index.value;
@@ -2541,6 +2563,330 @@ namespace UdonLuau {
             }
             handled = false;
             return {};
+        }
+
+        std::optional<std::string_view> Compiler::LibraryName(AstExpr* expr) const {
+            auto* g = Unwrap(expr)->as<AstExprGlobal>();
+            if (!g || globalFunctions_.contains(g->name.value)) return std::nullopt;
+            for (std::string_view library : { "math", "string", "table" })
+                if (library == g->name.value) return library;
+            return std::nullopt;
+        }
+
+        std::vector<Value> Compiler::CallLibrary(std::string_view library, std::string_view name, AstExprCall* call, std::vector<Value> args, const Type* typeArg, const Variable* into) {
+            if (call->self) Fail(call->location, std::format("use '{}.{}(...)'", library, name));
+            if (library == "math") return CallMath(name, std::move(args), call->location);
+            if (library == "string") return CallString(name, std::move(args), call->location);
+            return CallTable(name, call, std::move(args), typeArg, into);
+        }
+
+        std::vector<Value> Compiler::CallMath(std::string_view name, std::vector<Value> args, const Location& location) {
+            static const std::map<std::string_view, std::string_view> direct{
+                { "abs", "Abs" }, { "sqrt", "Sqrt" }, { "sin", "Sin" }, { "cos", "Cos" }, { "tan", "Tan" }, { "asin", "Asin" }, { "acos", "Acos" },
+                { "exp", "Exp" }, { "log10", "Log10" }, { "clamp", "Clamp" }, { "pow", "Pow" }, { "lerp", "LerpUnclamped" } };
+            const Type* mathf = types_.Get("UnityEngineMathf");
+            const Type* math = types_.Get("SystemMath");
+            auto arity = [&](size_t low, size_t high) {
+                if (args.size() < low || args.size() > high)
+                    Fail(location, low == high ? std::format("math.{} takes {} argument(s)", name, low) : std::format("math.{} takes {} to {} arguments", name, low, high));
+            };
+            auto integral = [&](const Value& v) {
+                const Type* t = NaturalType(v);
+                return t && t->IsIntegral();
+            };
+
+            if (auto it = direct.find(name); it != direct.end()) {
+                size_t count = name == "clamp" || name == "lerp" ? 3 : name == "pow" ? 2 : 1;
+                arity(count, count);
+                return CallStatic(mathf, it->second, std::move(args), nullptr, location);
+            }
+            if (name == "floor" || name == "ceil") {
+                arity(1, 1);
+                if (integral(args[0])) return { args[0] };
+                return CallStatic(mathf, name == "floor" ? "Floor" : "Ceil", std::move(args), nullptr, location);
+            }
+            if (name == "min" || name == "max") {
+                if (args.size() < 2) Fail(location, std::format("math.{} takes at least two arguments", name));
+                Value result = args[0];
+                for (size_t i = 1; i < args.size(); ++i) result = CallStatic(mathf, name == "min" ? "Min" : "Max", { result, args[i] }, nullptr, location).at(0);
+                return { result };
+            }
+            if (name == "atan") {
+                arity(1, 2);
+                std::string_view method = args.size() == 2 ? "Atan2" : "Atan";
+                return CallStatic(mathf, method, std::move(args), nullptr, location);
+            }
+            if (name == "log") {
+                arity(1, 2);
+                return CallStatic(mathf, "Log", std::move(args), nullptr, location);
+            }
+            if (name == "sign") {
+                arity(1, 1);
+                return CallStatic(math, "Sign", std::move(args), nullptr, location);
+            }
+            if (name == "fmod") {
+                arity(2, 2);
+                return { CompileArithmetic(AstExprBinary::Mod, args[0], args[1], location) };
+            }
+            if (name == "round") {
+                arity(1, 1);
+                if (integral(args[0])) return { args[0] };
+                const Type* type = NaturalType(args[0]);
+                Value rounded = CallStatic(math, "Round", { args[0], Value::OfInteger(1, types_.Get("SystemMidpointRounding")) }, nullptr, location).at(0);
+                if (type == types_.Double) return { rounded };
+                return { Value::OfSlot(Convert(rounded.slot, types_.Double, types_.Single, location), types_.Single) };
+            }
+            if (name == "map") {
+                arity(5, 5);
+                Value scaled = CompileArithmetic(AstExprBinary::Mul, CompileArithmetic(AstExprBinary::Sub, args[0], args[1], location),
+                                                 CompileArithmetic(AstExprBinary::Sub, args[4], args[3], location), location);
+                return { CompileArithmetic(AstExprBinary::Add, CompileArithmetic(AstExprBinary::Div, scaled, CompileArithmetic(AstExprBinary::Sub, args[2], args[1], location), location),
+                                           args[3], location) };
+            }
+            if (name == "random") {
+                arity(0, 2);
+                const Type* random = types_.Get("UnityEngineRandom");
+                if (args.empty()) return CallStatic(random, "get_value", {}, nullptr, location);
+                Value low = args.size() == 2 ? args[0] : Value::OfInteger(1);
+                Value high = args.back();
+                if (!integral(low) || !integral(high)) Fail(location, "math.random takes integer bounds");
+                return CallStatic(random, "Range", { low, CompileArithmetic(AstExprBinary::Add, high, Value::OfInteger(1), location) }, nullptr, location);
+            }
+            Fail(location, std::format("math.{} is not supported", name));
+        }
+
+        std::vector<Value> Compiler::CallString(std::string_view name, std::vector<Value> args, const Location& location) {
+            auto text = [&](size_t i) {
+                if (i >= args.size() || NaturalType(args[i]) != types_.String) Fail(location, std::format("argument {} of string.{} must be a string", i + 1, name));
+                return args[i].kind == Value::Kind::Slot ? args[i] : Value::OfSlot(Materialize(args[i], types_.String, location), types_.String);
+            };
+            if (name == "len") return CallMember(text(0), "get_Length", {}, nullptr, location);
+            if (name == "upper") return CallMember(text(0), "ToUpperInvariant", {}, nullptr, location);
+            if (name == "lower") return CallMember(text(0), "ToLowerInvariant", {}, nullptr, location);
+            if (name == "split") {
+                Value separator = args.size() > 1 ? text(1) : Value::OfString(",");
+                return CallMember(text(0), "Split", { separator, Value::OfInteger(0, types_.Get("SystemStringSplitOptions")) }, nullptr, location);
+            }
+            if (name == "rep") {
+                if (args.size() != 2) Fail(location, "string.rep takes a string and a count");
+                const Type* builder = types_.Get("SystemTextStringBuilder");
+                Value sb = CallStatic(builder, "ctor", {}, nullptr, location).at(0);
+                Value filled = CallMember(sb, "Insert", { Value::OfInteger(0), text(0), args[1] }, nullptr, location).at(0);
+                return CallMember(filled, "ToString", {}, nullptr, location);
+            }
+            if (name == "format") {
+                if (args.empty() || args[0].kind != Value::Kind::String) Fail(location, "string.format needs a literal format string");
+                std::vector<Value> values(args.begin() + 1, args.end());
+                Value format = Value::OfString(TranslateFormat(args[0].text, values.size(), location));
+                const Type* string = types_.String;
+                if (values.empty()) return { format };
+                if (values.size() <= 3) {
+                    std::vector<Value> all{ format };
+                    all.insert(all.end(), values.begin(), values.end());
+                    return CallStatic(string, "Format", std::move(all), nullptr, location);
+                }
+                const Type* objects = types_.ArrayOf(types_.Object);
+                Value array = NewArray(objects, Value::OfInteger(static_cast<int64_t>(values.size())), location);
+                for (size_t i = 0; i < values.size(); ++i) CallMember(array, "Set", { Value::OfInteger(static_cast<int64_t>(i)), values[i] }, nullptr, location);
+                return CallStatic(string, "Format", { format, array }, nullptr, location);
+            }
+            Fail(location, std::format("string.{} is not supported; use the string's own methods, e.g. s:Substring(0, 3)", name));
+        }
+
+        std::string Compiler::TranslateFormat(std::string_view format, size_t count, const Location& location) {
+            std::string out;
+            size_t next = 0;
+            for (size_t i = 0; i < format.size(); ++i) {
+                char c = format[i];
+                if (c == '{' || c == '}') {
+                    out += std::string(2, c);
+                    continue;
+                }
+                if (c != '%') {
+                    out += c;
+                    continue;
+                }
+                if (++i >= format.size()) Fail(location, "string.format: '%' at the end of the format");
+                if (format[i] == '%') {
+                    out += '%';
+                    continue;
+                }
+                bool left = false;
+                bool zero = false;
+                for (; i < format.size() && (format[i] == '-' || format[i] == '0' || format[i] == '+' || format[i] == ' '); ++i) {
+                    left |= format[i] == '-';
+                    zero |= format[i] == '0';
+                }
+                int width = 0;
+                for (; i < format.size() && std::isdigit(static_cast<unsigned char>(format[i])); ++i) width = width * 10 + (format[i] - '0');
+                int precision = -1;
+                if (i < format.size() && format[i] == '.') {
+                    precision = 0;
+                    for (++i; i < format.size() && std::isdigit(static_cast<unsigned char>(format[i])); ++i) precision = precision * 10 + (format[i] - '0');
+                }
+                if (i >= format.size()) Fail(location, "string.format: incomplete format specifier");
+                if (next >= count) Fail(location, std::format("string.format: the format needs more than {} value(s)", count));
+                std::string spec;
+                bool padded = false;
+                char conversion = format[i];
+                switch (conversion) {
+                    case 'd': case 'i': case 'x': case 'X':
+                        padded = zero && width && !left;
+                        if (conversion == 'd' || conversion == 'i') spec = padded ? std::format("D{}", width) : "";
+                        else spec = padded ? std::format("{}{}", conversion, width) : std::string(1, conversion);
+                        break;
+                    case 's': break;
+                    case 'f': spec = std::format("F{}", precision < 0 ? 6 : precision); break;
+                    case 'g': spec = "G"; break;
+                    case 'e': spec = precision < 0 ? "e6" : std::format("e{}", precision); break;
+                    default: Fail(location, std::format("string.format: '%{}' is not supported", conversion));
+                }
+                out += std::format("{{{}", next++);
+                if (width && !padded) out += std::format(",{}", left ? -width : width);
+                if (!spec.empty()) out += ":" + spec;
+                out += '}';
+            }
+            if (next != count) Fail(location, std::format("string.format: the format uses {} value(s) but {} were given", next, count));
+            return out;
+        }
+
+        Value Compiler::ArrayArgument(const std::vector<Value>& args, size_t index, std::string_view function, const Location& location) {
+            if (index >= args.size() || args[index].kind != Value::Kind::Slot || args[index].type->kind != TypeKind::Array)
+                Fail(location, std::format("argument {} of table.{} must be an array", index + 1, function));
+            return args[index];
+        }
+
+        Value Compiler::NewArray(const Type* arrayType, const Value& length, const Location& location) {
+            return CallStatic(arrayType, "ctor", { length }, nullptr, location).at(0);
+        }
+
+        void Compiler::CopyRange(const Value& source, const Value& sourceIndex, const Value& destination, const Value& destinationIndex, const Value& length, const Location& location) {
+            CallStatic(types_.Get("SystemArray"), "Copy", { source, sourceIndex, destination, destinationIndex, length }, nullptr, location);
+        }
+
+        std::vector<Value> Compiler::CallTable(std::string_view name, AstExprCall* call, std::vector<Value> args, const Type* typeArg, const Variable* into) {
+            const Location& location = call->location;
+            auto writable = [&](size_t i) {
+                AstExpr* target = Unwrap(call->args.data[i]);
+                if (!target->is<AstExprLocal>() && !target->is<AstExprIndexName>() && !target->is<AstExprIndexExpr>())
+                    Fail(location, std::format("table.{} replaces the array, so its first argument must be a variable or field", name));
+                return call->args.data[i];
+            };
+            auto add = [&](const Value& a, const Value& b) { return CompileArithmetic(AstExprBinary::Add, a, b, location); };
+            auto sub = [&](const Value& a, const Value& b) { return CompileArithmetic(AstExprBinary::Sub, a, b, location); };
+            auto hold = [&](const Value& v, const Type* type) {
+                if (v.kind != Value::Kind::Slot || emit_.IsConstant(v.slot)) return v;
+                Variable h{ emit_.Hidden(type), type };
+                Store(v, h, location);
+                return Value::OfSlot(h.slot, type);
+            };
+            auto length = [&](const Value& array) { return hold(CallMember(array, "get_Length", {}, nullptr, location).at(0), types_.Int32); };
+
+            if (name == "insert") {
+                if (args.size() != 2 && args.size() != 3) Fail(location, "table.insert takes an array, an optional position and a value");
+                Value array = ArrayArgument(args, 0, name, location);
+                AstExpr* target = writable(0);
+                Value len = length(array);
+                Value grown = hold(NewArray(array.type, add(len, Value::OfInteger(1)), location), array.type);
+                if (args.size() == 2) {
+                    CopyRange(array, Value::OfInteger(0), grown, Value::OfInteger(0), len, location);
+                    CallMember(grown, "Set", { len, args[1] }, nullptr, location);
+                } else {
+                    Value at = hold(args[1], types_.Int32);
+                    CopyRange(array, Value::OfInteger(0), grown, Value::OfInteger(0), at, location);
+                    CopyRange(array, at, grown, add(at, Value::OfInteger(1)), sub(len, at), location);
+                    CallMember(grown, "Set", { at, args[2] }, nullptr, location);
+                }
+                AssignTo(target, grown);
+                return { Value::OfNil() };
+            }
+            if (name == "remove") {
+                if (args.empty() || args.size() > 2) Fail(location, "table.remove takes an array and an optional position");
+                Value array = ArrayArgument(args, 0, name, location);
+                AstExpr* target = writable(0);
+                Value last = hold(sub(length(array), Value::OfInteger(1)), types_.Int32);
+                Value at = args.size() == 2 ? hold(args[1], types_.Int32) : last;
+                Value removed = hold(CallMember(array, "Get", { at }, nullptr, location).at(0), array.type->element);
+                Value shrunk = hold(NewArray(array.type, last, location), array.type);
+                if (args.size() == 2) {
+                    CopyRange(array, Value::OfInteger(0), shrunk, Value::OfInteger(0), at, location);
+                    CopyRange(array, add(at, Value::OfInteger(1)), shrunk, at, sub(last, at), location);
+                } else {
+                    CopyRange(array, Value::OfInteger(0), shrunk, Value::OfInteger(0), last, location);
+                }
+                AssignTo(target, shrunk);
+                return { removed };
+            }
+            if (name == "create") {
+                if (args.empty() || args.size() > 2) Fail(location, "table.create takes a length and an optional value");
+                const Type* arrayType = nullptr;
+                if (typeArg) arrayType = typeArg->kind == TypeKind::Array ? typeArg : types_.ArrayOf(typeArg);
+                else if (into && into->type && into->type->kind == TypeKind::Array) arrayType = into->type;
+                else if (args.size() == 2 && NaturalType(args[1])) arrayType = types_.ArrayOf(NaturalType(args[1]));
+                if (!arrayType) Fail(location, "table.create needs the element type: annotate the variable ('local xs: {int} = table.create(8)') or pass a value");
+                Value count = hold(args[0], types_.Int32);
+                Value array = hold(NewArray(arrayType, count, location), arrayType);
+                if (args.size() == 2) {
+                    Label done = emit_.NewLabel();
+                    Label top = emit_.NewLabel();
+                    if (!(count.kind == Value::Kind::Integer && count.integer > 0))
+                        emit_.JumpIfFalse(TruthySlot(CompareValues(AstExprBinary::CompareGt, count, Value::OfInteger(0), location), location), done);
+                    CallMember(array, "Set", { Value::OfInteger(0), args[1] }, nullptr, location);
+                    Variable filled{ emit_.Hidden(types_.Int32), types_.Int32 };
+                    Store(Value::OfInteger(1), filled, location);
+                    Value filledValue = Value::OfSlot(filled.slot, types_.Int32);
+                    emit_.Bind(top);
+                    emit_.JumpIfFalse(TruthySlot(CompareValues(AstExprBinary::CompareLt, filledValue, count, location), location), done);
+                    Value chunk = CallStatic(types_.Get("UnityEngineMathf"), "Min", { filledValue, sub(count, filledValue) }, nullptr, location).at(0);
+                    CopyRange(array, Value::OfInteger(0), array, filledValue, chunk, location);
+                    Store(add(filledValue, filledValue), filled, location);
+                    emit_.Jump(top);
+                    emit_.Bind(done);
+                }
+                return { array };
+            }
+            if (name == "find") {
+                if (args.size() < 2 || args.size() > 3) Fail(location, "table.find takes an array, a value and an optional start index");
+                ArrayArgument(args, 0, name, location);
+                std::vector<const Method*> methods = StaticMethods({ types_.Get("SystemArray") }, "IndexOf");
+                std::erase_if(methods, [](const Method* m) { return m->ext->isGeneric; });
+                Resolution r = Resolve(methods, args, nullptr, location, "table.find");
+                return Invoke(r, std::nullopt, args, location);
+            }
+            if (name == "clear") {
+                if (args.size() != 1) Fail(location, "table.clear takes an array");
+                Value array = ArrayArgument(args, 0, name, location);
+                CallStatic(types_.Get("SystemArray"), "Clear", { array, Value::OfInteger(0), length(array) }, nullptr, location);
+                return { Value::OfNil() };
+            }
+            if (name == "clone") {
+                if (args.size() != 1) Fail(location, "table.clone takes an array");
+                Value array = ArrayArgument(args, 0, name, location);
+                Value len = length(array);
+                Value copy = hold(NewArray(array.type, len, location), array.type);
+                CopyRange(array, Value::OfInteger(0), copy, Value::OfInteger(0), len, location);
+                return { copy };
+            }
+            if (name == "move") {
+                if (args.size() != 4 && args.size() != 5) Fail(location, "table.move takes a source, first and last index, a destination index and an optional destination");
+                Value source = ArrayArgument(args, 0, name, location);
+                Value destination = args.size() == 5 ? ArrayArgument(args, 4, name, location) : source;
+                Value first = hold(args[1], types_.Int32);
+                CopyRange(source, first, destination, args[3], add(sub(args[2], first), Value::OfInteger(1)), location);
+                return { destination };
+            }
+            if (name == "concat") {
+                if (args.empty() || args.size() > 2) Fail(location, "table.concat takes an array and an optional separator");
+                Value array = ArrayArgument(args, 0, name, location);
+                if (array.type->element != types_.String) Fail(location, "table.concat needs an array of strings");
+                return CallStatic(types_.String, "Join", { args.size() == 2 ? args[1] : Value::OfString(""), array }, nullptr, location);
+            }
+            if (name == "sort") {
+                if (args.size() != 1) Fail(location, "table.sort takes an array; comparison functions are not supported");
+                CallStatic(types_.Get("SystemArray"), "Sort", { ArrayArgument(args, 0, name, location) }, nullptr, location);
+                return { Value::OfNil() };
+            }
+            Fail(location, std::format("table.{} is not supported", name));
         }
 
         std::vector<Value> Compiler::Inline(Function* f, std::vector<Value> args, size_t want, const Location& location, const Variable* into) {
