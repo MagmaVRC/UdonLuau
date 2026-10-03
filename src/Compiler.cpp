@@ -2104,7 +2104,8 @@ namespace UdonLuau {
         }
 
         void Compiler::CompileReturn(AstStatReturn* stat) {
-            InlineFrame* frame = inlineStack_.empty() ? nullptr : &inlineStack_.back();
+            std::optional<InlineFrame> frame;
+            if (!inlineStack_.empty()) frame = inlineStack_.back();
             Function& f = frame ? *frame->function : *current_;
             if (stat->list.size && f.returns.empty()) {
                 if (f.event) Fail(stat->location, "events cannot return values");

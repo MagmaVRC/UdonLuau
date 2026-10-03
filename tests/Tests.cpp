@@ -658,6 +658,55 @@ end
         Check(std::get<int32_t>(m.Var("result")) == 50 && m.counters.indirect == 0, "clamp inlined without call overhead");
     });
 
+    Case("returns of nested inlined calls", [] {
+        Fixture f = MakeFixture();
+        auto p = Build(f, R"(
+local result = 0
+local function a(x: int): int
+    return x + 1
+end
+local function b(x: int): int
+    if x > 100 then
+        return 0
+    end
+    return a(x) + 1
+end
+local function c(x: int): int
+    if x > 100 then
+        return 0
+    end
+    return b(x) + 1
+end
+local function d(x: int): int
+    if x > 100 then
+        return 0
+    end
+    return c(x) + 1
+end
+local function e(x: int): int
+    if x > 100 then
+        return 0
+    end
+    return d(x) + 1
+end
+local function g(x: int): int
+    if x > 100 then
+        return 0
+    end
+    return e(x) + 1
+end
+export function Run(x: int)
+    result = g(x) + g(x + 1)
+end
+)");
+        Check(p.has_value(), "compiles");
+        if (!p) return;
+        Machine m(f, *p);
+        m.Var("__0_x__param") = int32_t{ 1 };
+        m.Run("__0__Run");
+        Check(std::get<int32_t>(m.Var("result")) == 15, std::format("result ({})", std::get<int32_t>(m.Var("result"))));
+    });
+
     Case("noinline keeps real calls", [] {
         Fixture f = MakeFixture();
         auto p = Build(f, R"(
