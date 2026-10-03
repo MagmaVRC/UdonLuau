@@ -1,5 +1,6 @@
 #include "UdonLuau/Definitions.hpp"
 
+#include "Polyfills.hpp"
 #include "TypeSystem.hpp"
 
 #include <algorithm>
@@ -271,6 +272,15 @@ namespace UdonLuau {
                     "    [number]: T,\n"
                     "}\n"
                     "declare List: { new: <T>(capacity: number?) -> List<T> }\n\n";
+            std::string library;
+            for (const Polyfill& p : kPolyfills) {
+                if (IsStandardLibrary(p.library) || p.library == library) continue;
+                library = p.library;
+                out_ += std::format("declare {}: {{\n", library);
+                for (const Polyfill& member : kPolyfills)
+                    if (member.library == library) out_ += std::format("    {}: {},\n", member.name, member.signature);
+                out_ += "}\n\n";
+            }
 
             Collect();
             const Type* behaviour = types_.Behaviour();

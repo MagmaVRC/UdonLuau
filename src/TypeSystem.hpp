@@ -105,6 +105,7 @@ namespace UdonLuau::Detail {
         std::unordered_map<const ExternInfo*, Method>      methods_;
         std::unordered_map<const ScriptInfo*, const Type*> scripts_;
         std::unordered_map<const Type*, const Type*>       lists_;
+        std::unordered_map<const Type*, const Type*>       behaviourArrays_;
     };
 
 } // namespace UdonLuau::Detail

@@ -147,15 +147,15 @@ namespace UdonLuau::Detail {
     }
 
     const Type* TypeTable::ArrayOf(const Type* element) {
-        const Type* plain = Get(element->udonName + std::string(kArraySuffix));
-        if (!element->script) return plain;
-        auto key = reinterpret_cast<const ScriptInfo*>(reinterpret_cast<uintptr_t>(element->script) | 1);
-        if (auto it = scripts_.find(key); it != scripts_.end()) return it->second;
+        bool behaviour = element->script || element == Behaviour();
+        if (!behaviour) return Get(element->udonName + std::string(kArraySuffix));
+        if (auto it = behaviourArrays_.find(element); it != behaviourArrays_.end()) return it->second;
+        const Type* plain = Get("UnityEngineComponentArray");
         Type& type = storage_.emplace_back(*plain);
         type.element = element;
         type.base = plain;
         type.displayName = "{" + element->displayName + "}";
-        scripts_.emplace(key, &type);
+        behaviourArrays_.emplace(element, &type);
         return &type;
     }
 

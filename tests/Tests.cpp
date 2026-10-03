@@ -28,7 +28,8 @@ namespace {
     };
 
     using IntArray = std::shared_ptr<std::vector<int32_t>>;
-    using Cell = std::variant<std::monostate, bool, int32_t, uint32_t, int64_t, float, double, std::string, Vec3, IntArray, std::vector<uint32_t>, BehaviourRef>;
+    using RefArray = std::shared_ptr<std::vector<BehaviourRef>>;
+    using Cell = std::variant<std::monostate, bool, int32_t, uint32_t, int64_t, float, double, std::string, Vec3, IntArray, std::vector<uint32_t>, BehaviourRef, RefArray>;
     using Impl = std::function<void(std::vector<Cell>&, const std::vector<uint32_t>&)>;
 
     void RunOn(const Cell& behaviour, const std::string& entry);
@@ -176,11 +177,13 @@ namespace {
         });
         f.Type("System.Array", TypeKind::Class);
         f.Extern("SystemArray.__Copy__SystemArray_SystemInt32_SystemArray_SystemInt32_SystemInt32__SystemVoid", false, [](auto& h, auto& p) {
-            auto& from = *As<IntArray>(h, p[0]);
-            auto& to = *As<IntArray>(h, p[2]);
             int32_t s = As<int32_t>(h, p[1]), d = As<int32_t>(h, p[3]), n = As<int32_t>(h, p[4]);
-            std::vector<int32_t> chunk(from.begin() + s, from.begin() + s + n);
-            std::ranges::copy(chunk, to.begin() + d);
+            auto move = [&](auto& from, auto& to) {
+                std::vector chunk(from.begin() + s, from.begin() + s + n);
+                std::ranges::copy(chunk, to.begin() + d);
+            };
+            if (std::holds_alternative<RefArray>(h[p[0]])) move(*As<RefArray>(h, p[0]), *As<RefArray>(h, p[2]));
+            else move(*As<IntArray>(h, p[0]), *As<IntArray>(h, p[2]));
         });
         f.Extern("SystemArray.__IndexOf__SystemArray_SystemObject__SystemInt32", false, [](auto& h, auto& p) {
             auto& xs = *As<IntArray>(h, p[0]);
@@ -188,9 +191,22 @@ namespace {
             h[p[2]] = it == xs.end() ? -1 : static_cast<int32_t>(it - xs.begin());
         });
         f.Extern("SystemArray.__Copy__SystemArray_SystemArray_SystemInt32__SystemVoid", false, [](auto& h, auto& p) {
-            auto& from = *As<IntArray>(h, p[0]);
-            std::copy_n(from.begin(), As<int32_t>(h, p[2]), As<IntArray>(h, p[1])->begin());
+            if (std::holds_alternative<RefArray>(h[p[0]])) {
+                std::copy_n(As<RefArray>(h, p[0])->begin(), As<int32_t>(h, p[2]), As<RefArray>(h, p[1])->begin());
+                return;
+            }
+            std::copy_n(As<IntArray>(h, p[0])->begin(), As<int32_t>(h, p[2]), As<IntArray>(h, p[1])->begin());
         });
+        f.Extern("UnityEngineComponentArray.__ctor__SystemInt32__UnityEngineComponentArray", false, [](auto& h, auto& p) {
+            h[p[1]] = std::make_shared<std::vector<BehaviourRef>>(static_cast<size_t>(As<int32_t>(h, p[0])), BehaviourRef{ -1 });
+        });
+        f.Extern("UnityEngineComponentArray.__Get__SystemInt32__UnityEngineComponent", true, [](auto& h, auto& p) { h[p[2]] = As<RefArray>(h, p[0])->at(static_cast<size_t>(As<int32_t>(h, p[1]))); });
+        f.Extern("UnityEngineComponentArray.__Set__SystemInt32_UnityEngineComponent__SystemVoid", true, [](auto& h, auto& p) {
+            BehaviourRef value = std::holds_alternative<BehaviourRef>(h[p[2]]) ? std::get<BehaviourRef>(h[p[2]]) : BehaviourRef{ -1 };
+            As<RefArray>(h, p[0])->at(static_cast<size_t>(As<int32_t>(h, p[1]))) = value;
+        });
+        f.Extern("UnityEngineComponentArray.__get_Length__SystemInt32", true, [](auto& h, auto& p) { h[p[1]] = static_cast<int32_t>(As<RefArray>(h, p[0])->size()); });
+        f.Extern("UnityEngineTime.__get_frameCount__SystemInt32", false, [](auto& h, auto& p) { h[p[0]] = int32_t{ 100 }; });
         f.Extern("SystemArray.__IndexOf__SystemArray_SystemObject_SystemInt32_SystemInt32__SystemInt32", false, [](auto& h, auto& p) {
             auto& xs = *As<IntArray>(h, p[0]);
             int32_t start = As<int32_t>(h, p[2]), n = As<int32_t>(h, p[3]);
@@ -217,6 +233,13 @@ namespace {
                 log.push_back(std::format("net:{}:{}", As<int32_t>(h, p[1]), As<std::string>(h, p[2])));
                 NetworkRunOn(h[p[0]], As<std::string>(h, p[2]), { h[p[3]] });
             });
+        f.Type("VRC.Udon.Common.Enums.EventTiming", TypeKind::Enum, {}, {}, { { "Update", 0 }, { "LateUpdate", 1 } });
+        f.Extern("VRCUdonCommonInterfacesIUdonEventReceiver.__SendCustomEventDelayedSeconds__SystemString_SystemSingle_VRCUdonCommonEnumsEventTiming__SystemVoid", true,
+            [&log = f.log](auto& h, auto& p) { log.push_back(std::format("delay:{}:{}", As<std::string>(h, p[1]), As<float>(h, p[2]))); });
+        f.Extern("VRCUdonCommonInterfacesIUdonEventReceiver.__SendCustomEventDelayedFrames__SystemString_SystemInt32_VRCUdonCommonEnumsEventTiming__SystemVoid", true,
+            [&log = f.log](auto& h, auto& p) { log.push_back(std::format("frames:{}:{}", As<std::string>(h, p[1]), As<int32_t>(h, p[2]))); });
+        f.Type("UnityEngine.Time", TypeKind::Class);
+        f.Extern("UnityEngineTime.__get_time__SystemSingle", false, [](auto& h, auto& p) { h[p[0]] = 10.0f; });
         f.Extern("VRCUdonCommonInterfacesIUdonEventReceiver.__SetProgramVariable__SystemString_SystemObject__SystemVoid", true, [](auto& h, auto& p) {
             VarOn(h[p[0]], As<std::string>(h, p[1])) = h[p[2]];
         });
@@ -243,6 +266,7 @@ namespace {
                 return scratch.back();
             }
             case ValueKind::Array: {
+                if (t == "UnityEngineComponentArray") return std::make_shared<std::vector<BehaviourRef>>(v.arguments.size(), BehaviourRef{ -1 });
                 if (t == "SystemInt32Array") {
                     auto ints = std::make_shared<std::vector<int32_t>>();
                     for (const HeapValue& e : v.arguments) ints->push_back(static_cast<int32_t>(e.integer));
@@ -1087,6 +1111,70 @@ end
         Check(f.log.size() == 2 && f.log[0] == "net:0:Open" && f.log[1] == "net:1:Hit", "SendCustomNetworkEvent with NetworkEventTarget.All and .Owner");
         Check(HasError(f, "export local door: Door\nfunction Start()\n door:Close()\nend", "no member 'Close'"), "unknown method");
         Check(HasError(f, "export local door: Door\nfunction Start()\n Network.All(door):Add(1, 2)\nend", "not network callable"), "unmarked methods cannot be called over the network");
+
+        auto delayed = Build(f, R"(
+export local door: Door
+local hits = 0
+local waitFrames = 3
+local function bump(n: int)
+    hits += n
+end
+function Start()
+    Delay.Seconds(1, this):bump(2)
+    Delay.Seconds(1, this):bump(3)
+    Delay.Frames(2, Network.All(door)):Hit(7)
+    Delay.Frames(waitFrames, door):Add(1, 2)
+    Delay.Seconds(0.5, door):Open()
+end
+)");
+        Check(delayed.has_value(), "delayed calls compile");
+        if (!delayed) return;
+        doorMachine.Var("opened") = int32_t{ 0 };
+        Machine later(f, *delayed);
+        g_machines = { &doorMachine, &later };
+        later.Var("door") = BehaviourRef{ 0 };
+        f.log.clear();
+        later.Run("_start");
+        Check(f.log.size() == 5 && f.log[0] == "delay:__delay0:1" && f.log[1] == "delay:__delay1:1" && f.log[2] == "frames:__delay2:2" && f.log[3] == "frames:__delay3:3" &&
+                  f.log[4] == "delay:Open:0.5",
+            std::format("scheduled through the SDK ({})", [&] {
+                std::string all;
+                for (const std::string& line : f.log) all += line + " ";
+                return all;
+            }()));
+        later.Run("__delay0");
+        Check(std::get<int32_t>(later.Var("hits")) == 2, "first delayed call gets its own argument");
+        later.Run("__delay1");
+        Check(std::get<int32_t>(later.Var("hits")) == 5, "second delayed call gets its own argument");
+        later.Run("__delay0");
+        Check(std::get<int32_t>(later.Var("hits")) == 5, "a stub fired with an empty queue does nothing");
+        later.Run("__delay2");
+        Check(std::get<int32_t>(doorMachine.Var("opened")) == 7 && f.log.back() == "net:0:Hit", "delayed network call with an argument");
+        later.Run("__delay3");
+        Check(std::get<int32_t>(doorMachine.Var("__0___0__Add__ret")) == 3, "delayed call with a variable delay reaches the target");
+
+        auto ticking = Build(f, R"(
+local total = 0
+local function tick(n: int)
+    total += n
+    if n < 3 then
+        Delay.Seconds(1, this):tick(n + 1)
+    end
+end
+function Start()
+    Delay.Seconds(1, this):tick(1)
+end
+)");
+        Check(ticking.has_value(), "a function that delays a call to itself compiles");
+        if (ticking) {
+            Machine ticker(f, *ticking);
+            ticker.Run("_start");
+            for (int i = 0; i < 3; ++i) ticker.Run(i == 0 ? "__delay1" : "__delay0");
+            Check(std::get<int32_t>(ticker.Var("total")) == 6, std::format("repeating delayed call ({})", std::get<int32_t>(ticker.Var("total"))));
+        }
+        Check(HasError(f, "local function go(n: int, t: EventTiming)\n    Delay.Frames(1, this, t):go(n, t)\nend\nfunction Start()\n    go(1, EventTiming.Update)\nend\n",
+                  "constant EventTiming"),
+            "a variable EventTiming is rejected for calls with arguments");
         Check(HasError(f, "-- @networkcallable\nexport function Get(): int\n return 1\nend", "cannot return values"), "network callable methods cannot return");
         Check(HasError(f, "-- @networkcallable\nlocal function Hidden()\nend", "only 'export function'"), "network callable must be public");
         g_machines.clear();

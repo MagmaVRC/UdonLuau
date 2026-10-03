@@ -1,6 +1,7 @@
 #include "UdonLuau/Compiler.hpp"
 
 #include "Emitter.hpp"
+#include "Polyfills.hpp"
 #include "TypeSystem.hpp"
 
 #include "Luau/Ast.h"
@@ -14,6 +15,7 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <unordered_map>
@@ -62,6 +64,7 @@ namespace UdonLuau {
             bool                     noInline = false;
             bool                     inlined = false;
             bool                     trampoline = true;
+            bool                     delayTarget = false;
             bool                     networkCallable = false;
             int                      maxEventsPerSecond = 0;
         };
@@ -190,8 +193,10 @@ namespace UdonLuau {
             }
         };
 
+        struct DelaySpec;
+
         struct Value {
-            enum class Kind { None, Slot, Integer, Real, Boolean, String, Nil, TypeRef, Namespace, Function, Network };
+            enum class Kind { None, Slot, Integer, Real, Boolean, String, Nil, TypeRef, Namespace, Function, Network, Delayed };
 
             Kind        kind = Kind::None;
             const Type* type = nullptr;
@@ -202,6 +207,7 @@ namespace UdonLuau {
             std::string text;
             Function*   function = nullptr;
             const Type* targetType = nullptr;
+            std::shared_ptr<const DelaySpec> delay;
 
             static Value OfSlot(uint32_t slot, const Type* type) {
                 Value v;
@@ -263,6 +269,25 @@ namespace UdonLuau {
                 return kind == Kind::Integer || kind == Kind::Real || kind == Kind::Boolean || kind == Kind::String || kind == Kind::Nil;
             }
             [[nodiscard]] bool IsNumberLiteral() const { return (kind == Kind::Integer && !type) || kind == Kind::Real; }
+        };
+
+        struct DelaySpec {
+            Value                amount;
+            bool                 frames = false;
+            std::optional<Value> timing;
+            Value                target;
+        };
+
+        struct DelaySite {
+            std::string          entry;
+            Label                label;
+            Location             location;
+            Value                target;
+            std::string          method;
+            bool                 queuedTarget = false;
+            std::vector<Value>   queues;
+            std::optional<Value> due;
+            Function*            own = nullptr;
         };
 
         struct Annotations {
@@ -581,6 +606,10 @@ namespace UdonLuau {
             Variable DeclareListStorage(const std::string& name, const Type* type, bool field, HeapValue array, int64_t count);
             void InitList(const Value& list, AstExpr* init, const Location& location);
             Value ListArray(const Value& list) const { return Value::OfSlot(list.slot, list.type->listArray); }
+            Value Narrow(Value item, const Type* element) const {
+                if (item.kind == Value::Kind::Slot && element && item.type != element && types_.ReferenceDistance(element, item.type) >= 0) item.type = element;
+                return item;
+            }
             Variable ListCount(const Value& list) const { return { list.slot + 1, types_.Int32 }; }
             Variable ListCapacity(const Value& list) const { return { list.slot + 2, types_.Int32 }; }
             void GrowList(const Value& list, const Value& needed, const Location& location);
@@ -589,7 +618,12 @@ namespace UdonLuau {
             void ListRemoveAt(const Value& list, const Value& index, const Location& location);
             std::vector<Value> CallList(const Value& list, std::string_view name, std::vector<Value> args, const Location& location);
             std::vector<Value> TableOnList(std::string_view name, std::vector<Value> args, const Location& location);
-            std::optional<std::string_view> LibraryName(AstExpr* expr) const;
+            const ScriptMethod* NetworkMethod(const Value& receiver, std::string_view name, size_t argc, const Location& location);
+            std::vector<Value> SendNetwork(const Value& receiver, std::string_view name, std::vector<Value> args, const Location& location);
+            std::vector<Value> CallDelay(std::string_view name, std::vector<Value> args, const Location& location);
+            std::vector<Value> CallDelayed(const Value& receiver, std::string_view name, std::vector<Value> args, const Location& location);
+            void CompileDelaySite(const DelaySite& site);
+            std::optional<std::string_view> LibraryName(AstExpr* expr);
             std::vector<Value> CallLibrary(std::string_view library, std::string_view name, AstExprCall* call, std::vector<Value> args, const Type* typeArg, const Variable* into);
             std::vector<Value> CallMath(std::string_view name, std::vector<Value> args, const Location& location);
             std::vector<Value> CallString(std::string_view name, std::vector<Value> args, const Location& location);
@@ -643,6 +677,7 @@ namespace UdonLuau {
             std::unordered_map<std::string, Value>         defines_;
             std::unordered_set<AstLocal*>                  assigned_;
             std::unordered_set<const Function*>            pure_;
+            std::vector<DelaySite>                         delaySites_;
             std::unordered_set<AstLocal*>                  memberAssigned_;
             bool Immutable(AstLocal* local, const Type* type) const {
                 return !assigned_.contains(local) && (!memberAssigned_.contains(local) || (type && type->IsReference()));
@@ -715,6 +750,13 @@ namespace UdonLuau {
             for (auto& f : functions_) {
                 try {
                     CompileFunction(*f);
+                } catch (const CompileError& e) {
+                    Report(e.location, e.message);
+                }
+            }
+            for (size_t i = 0; i < delaySites_.size(); ++i) {
+                try {
+                    CompileDelaySite(DelaySite(delaySites_[i]));
                 } catch (const CompileError& e) {
                     Report(e.location, e.message);
                 }
@@ -1021,6 +1063,27 @@ namespace UdonLuau {
             Analysis analysis(assigned_, memberAssigned_, record);
             root->visit(&analysis);
 
+            class DelayTargets : public AstVisitor {
+            public:
+                std::set<std::string, std::less<>> names;
+                bool visit(AstExprCall* c) override {
+                    auto* index = c->self ? Unwrap(c->func)->as<AstExprIndexName>() : nullptr;
+                    auto* inner = index ? Unwrap(index->expr)->as<AstExprCall>() : nullptr;
+                    auto* library = inner && inner->args.size >= 2 ? Unwrap(inner->func)->as<AstExprIndexName>() : nullptr;
+                    auto* owner = library ? Unwrap(library->expr)->as<AstExprGlobal>() : nullptr;
+                    auto* target = owner && std::string_view(owner->name.value) == "Delay" ? Unwrap(inner->args.data[1])->as<AstExprGlobal>() : nullptr;
+                    if (target && std::string_view(target->name.value) == "this") names.insert(index->index.value);
+                    return true;
+                }
+            };
+            DelayTargets delayed;
+            root->visit(&delayed);
+            for (auto& f : functions_) {
+                if (f->event || !delayed.names.contains(f->name)) continue;
+                f->delayTarget = true;
+                ++f->calls;
+            }
+
             for (bool changed = true; changed;) {
                 changed = false;
                 for (auto& f : functions_) {
@@ -1043,7 +1106,7 @@ namespace UdonLuau {
                     if (a.name == "noinline") f->noInline = true;
                 }
                 if (f->forceInline && f->noInline) Report(f->location, std::format("'{}' cannot be both @inline and @noinline", f->name));
-                f->inlined = !f->noInline && f->calls > 0 && (f->forceInline || f->size <= kInlineBudget || (f->calls == 1 && !f->exported));
+                f->inlined = !f->noInline && !f->delayTarget && f->calls > 0 && (f->forceInline || f->size <= kInlineBudget || (f->calls == 1 && !f->exported));
                 f->trampoline = !f->exported || (f->calls > 0 && !f->inlined);
             }
         }
@@ -1537,7 +1600,7 @@ namespace UdonLuau {
             if (owner.type->IsList()) return CallList(owner, "Get", { key }, location).at(0);
             std::string_view method = owner.type->kind == TypeKind::Array ? "Get" : "get_Item";
             Value item = CallMember(owner, method, { key }, nullptr, location).at(0);
-            if (owner.type->kind == TypeKind::Array && owner.type->element && owner.type->element->script) item.type = owner.type->element;
+            if (owner.type->kind == TypeKind::Array) item = Narrow(item, owner.type->element);
             return item;
         }
 
@@ -1935,7 +1998,7 @@ namespace UdonLuau {
             if (!keyIsIndex) emit_.Copy(index.slot, key.slot);
             if (item.type) {
                 std::vector<Value> got = CallMember(Value::OfSlot(array.slot, arrayType), "Get", { Value::OfSlot(index.slot, types_.Int32) }, nullptr, stat->location);
-                if (item.type->script) got.at(0).type = item.type;
+                got.at(0) = Narrow(got.at(0), item.type);
                 Store(got.at(0), item, stat->location);
             }
             CompileLoopBody(stat->body, { end, increment });
@@ -2383,8 +2446,7 @@ namespace UdonLuau {
             for (const AstExprTable::Item& item : expr->items)
                 if (item.kind != AstExprTable::Item::Kind::List) Fail(expr->location, "only array-style tables are supported");
 
-            std::vector<Value> ctorArgs{ Value::OfInteger(static_cast<int64_t>(expr->items.size)) };
-            Value array = CallStatic(expected, "ctor", ctorArgs, nullptr, expr->location).at(0);
+            Value array = NewArray(expected, Value::OfInteger(static_cast<int64_t>(expr->items.size)), expr->location);
             for (size_t i = 0; i < expr->items.size; ++i) {
                 Value element = CompileExpr(expr->items.data[i].value, expected->element);
                 CallMember(array, "Set", { Value::OfInteger(static_cast<int64_t>(i)), element }, nullptr, expr->location);
@@ -2540,33 +2602,8 @@ namespace UdonLuau {
                 Value receiver = *selfReceiver;
                 std::string_view name = index->index.value;
                 if (receiver.kind == Value::Kind::Slot && receiver.type->IsList()) return CallList(receiver, name, std::move(args), call->location);
-                if (receiver.kind == Value::Kind::Network) {
-                    std::string entry(name);
-                    std::vector<Value> sent{ Value::OfInteger(receiver.integer, receiver.targetType), Value::OfString(entry) };
-                    if (const ScriptInfo* script = receiver.type->script) {
-                        auto method = std::ranges::find(script->methods, name, &ScriptMethod::name);
-                        if (method == script->methods.end()) Fail(call->location, std::format("{} has no public method '{}'", script->name, name));
-                        if (!method->networkCallable)
-                            Fail(call->location, std::format("{}.{} is not network callable; mark it with '-- @networkcallable'", script->name, name));
-                        if (args.size() != method->parameters.size())
-                            Fail(call->location, std::format("'{}' takes {} argument(s), got {}", name, method->parameters.size(), args.size()));
-                        sent[1] = Value::OfString(method->entryPoint);
-                        for (size_t i = 0; i < args.size(); ++i) {
-                            const Type* type = VariableType(method->parameters[i]);
-                            if (Cost(args[i], type) < 0)
-                                Fail(call->location, std::format("argument {} of '{}' must be {}, got {}", i + 1, name, type->displayName, Describe(args[i])));
-                            Value arg = args[i].IsLiteral() ? Value::OfSlot(Materialize(args[i], type, call->location), type) : args[i];
-                            if (arg.kind == Value::Kind::Slot && arg.type != type && arg.type->IsNumeric() && type->IsNumeric())
-                                arg = Value::OfSlot(Convert(arg.slot, arg.type, type, call->location), type);
-                            sent.push_back(arg);
-                        }
-                    } else {
-                        for (const Value& a : args) sent.push_back(a);
-                    }
-                    if (sent.size() > 10) Fail(call->location, "networked calls take at most 8 arguments");
-                    Value self = Value::OfSlot(receiver.slot, types_.Behaviour());
-                    return CallMember(self, "SendCustomNetworkEvent", sent, nullptr, call->location);
-                }
+                if (receiver.kind == Value::Kind::Network) return SendNetwork(receiver, name, std::move(args), call->location);
+                if (receiver.kind == Value::Kind::Delayed) return CallDelayed(receiver, name, std::move(args), call->location);
                 if (receiver.kind == Value::Kind::Slot && receiver.type->script) {
                     const ScriptInfo* script = receiver.type->script;
                     auto method = std::ranges::find(script->methods, name, &ScriptMethod::name);
@@ -2602,6 +2639,207 @@ namespace UdonLuau {
             Value callee = CompileExpr(func);
             if (callee.kind == Value::Kind::Function) return CallFunction(callee.function, std::move(args), want, call->location, into);
             Fail(call->location, "this expression cannot be called");
+        }
+
+        const ScriptMethod* Compiler::NetworkMethod(const Value& receiver, std::string_view name, size_t argc, const Location& location) {
+            const ScriptInfo* script = receiver.type->script;
+            if (!script) return nullptr;
+            auto method = std::ranges::find(script->methods, name, &ScriptMethod::name);
+            if (method == script->methods.end()) Fail(location, std::format("{} has no public method '{}'", script->name, name));
+            if (!method->networkCallable) Fail(location, std::format("{}.{} is not network callable; mark it with '-- @networkcallable'", script->name, name));
+            if (argc != method->parameters.size()) Fail(location, std::format("'{}' takes {} argument(s), got {}", name, method->parameters.size(), argc));
+            return &*method;
+        }
+
+        std::vector<Value> Compiler::SendNetwork(const Value& receiver, std::string_view name, std::vector<Value> args, const Location& location) {
+            std::vector<Value> sent{ Value::OfInteger(receiver.integer, receiver.targetType), Value::OfString(std::string(name)) };
+            if (const ScriptMethod* method = NetworkMethod(receiver, name, args.size(), location)) {
+                sent[1] = Value::OfString(method->entryPoint);
+                for (size_t i = 0; i < args.size(); ++i) {
+                    const Type* type = VariableType(method->parameters[i]);
+                    if (Cost(args[i], type) < 0) Fail(location, std::format("argument {} of '{}' must be {}, got {}", i + 1, name, type->displayName, Describe(args[i])));
+                    Value arg = args[i].IsLiteral() ? Value::OfSlot(Materialize(args[i], type, location), type) : args[i];
+                    if (arg.kind == Value::Kind::Slot && arg.type != type && arg.type->IsNumeric() && type->IsNumeric())
+                        arg = Value::OfSlot(Convert(arg.slot, arg.type, type, location), type);
+                    sent.push_back(arg);
+                }
+            } else {
+                for (const Value& a : args) sent.push_back(a);
+            }
+            if (sent.size() > 10) Fail(location, "networked calls take at most 8 arguments");
+            Value self = Value::OfSlot(receiver.slot, types_.Behaviour());
+            return CallMember(self, "SendCustomNetworkEvent", sent, nullptr, location);
+        }
+
+        std::vector<Value> Compiler::CallDelay(std::string_view name, std::vector<Value> args, const Location& location) {
+            if (name != "Seconds" && name != "Frames") Fail(location, std::format("Delay.{} does not exist; use Delay.Seconds or Delay.Frames", name));
+            if (args.size() < 2 || args.size() > 3) Fail(location, std::format("Delay.{} takes the delay, the target and an optional EventTiming", name));
+            auto spec = std::make_shared<DelaySpec>();
+            spec->frames = name == "Frames";
+            const Type* amountType = spec->frames ? types_.Int32 : types_.Single;
+            if (Cost(args[0], amountType) < 0) Fail(location, std::format("the delay must be {}", amountType->displayName));
+            spec->amount = args[0].IsLiteral() ? CoerceLiteral(args[0], amountType, location) : args[0];
+            if (spec->amount.kind == Value::Kind::Slot && emit_.IsTemp(spec->amount.slot)) {
+                Variable held{ emit_.Hidden(amountType), amountType };
+                Store(spec->amount, held, location);
+                spec->amount = Value::OfSlot(held.slot, amountType);
+            }
+            if (args.size() == 3) spec->timing = args[2];
+            const Value& target = args[1];
+            bool behaviour = target.kind == Value::Kind::Slot && types_.ReferenceDistance(target.type, types_.Behaviour()) >= 0;
+            if (target.kind != Value::Kind::Network && !behaviour)
+                Fail(location, std::format("Delay.{} needs a behaviour or a Network target, got {}", name, Describe(target)));
+            spec->target = target;
+            Value v;
+            v.kind = Value::Kind::Delayed;
+            v.delay = std::move(spec);
+            return { v };
+        }
+
+        std::vector<Value> Compiler::CallDelayed(const Value& receiver, std::string_view name, std::vector<Value> args, const Location& location) {
+            const DelaySpec& spec = *receiver.delay;
+            const Value& target = spec.target;
+            const Value self = SelfValue("this");
+            bool network = target.kind == Value::Kind::Network;
+            bool toSelf = !network && target.slot == self.slot;
+
+            std::vector<const Type*> types;
+            Function* own = nullptr;
+            std::string entry(name);
+            if (network) {
+                if (const ScriptMethod* method = NetworkMethod(target, name, args.size(), location)) {
+                    for (const ScriptVariable& p : method->parameters) types.push_back(VariableType(p));
+                } else {
+                    for (const Value& a : args) types.push_back(NaturalType(a));
+                }
+            } else if (toSelf) {
+                for (const auto& f : functions_)
+                    if (f->name == name && !f->event) own = f.get();
+                if (!own) Fail(location, std::format("this script has no function '{}'", name));
+                if (args.size() != own->parameters.size()) Fail(location, std::format("'{}' takes {} argument(s), got {}", name, own->parameters.size(), args.size()));
+                for (const Variable& p : own->parameters) types.push_back(p.type);
+            } else if (const ScriptInfo* script = target.type->script) {
+                auto method = std::ranges::find(script->methods, name, &ScriptMethod::name);
+                if (method == script->methods.end()) Fail(location, std::format("{} has no public method '{}'", script->name, name));
+                if (args.size() != method->parameters.size()) Fail(location, std::format("'{}' takes {} argument(s), got {}", name, method->parameters.size(), args.size()));
+                for (const ScriptVariable& p : method->parameters) types.push_back(VariableType(p));
+                entry = method->entryPoint;
+            } else if (!args.empty()) {
+                Fail(location, "a delayed call with arguments needs a typed script reference; a plain UdonBehaviour only takes delayed calls without arguments");
+            }
+            for (size_t i = 0; i < args.size(); ++i) {
+                if (!types[i]) Fail(location, std::format("cannot tell the type of argument {}", i + 1));
+                if (types[i]->IsList()) Fail(location, "a List cannot be passed to a delayed call");
+                if (Cost(args[i], types[i]) < 0) Fail(location, std::format("argument {} of '{}' must be {}, got {}", i + 1, name, types[i]->displayName, Describe(args[i])));
+            }
+
+            std::vector<Value> schedule{ Value(), spec.amount, spec.timing ? *spec.timing : Value::OfInteger(0, types_.Get("VRCUdonCommonEnumsEventTiming")) };
+            std::string_view scheduler = spec.frames ? "SendCustomEventDelayedFrames" : "SendCustomEventDelayedSeconds";
+            if (own && own->exported && args.empty()) entry = own->entryName;
+            if (!network && (!own || own->exported) && args.empty()) {
+                schedule[0] = Value::OfString(entry);
+                CallMember(Value::OfSlot(target.slot, types_.Behaviour()), scheduler, std::move(schedule), nullptr, location);
+                return { Value::OfNil() };
+            }
+
+            if (spec.timing && !spec.timing->IsLiteral())
+                Fail(location, "delayed calls with arguments need a constant EventTiming, such as EventTiming.LateUpdate");
+            DelaySite site;
+            site.entry = std::format("__delay{}", delaySites_.size());
+            site.label = emit_.NewLabel();
+            site.location = location;
+            site.target = target;
+            site.method = std::string(name);
+            site.own = own;
+            auto queue = [&](const Type* type) {
+                std::string symbol = std::format("{}_{}", site.entry, site.queues.size());
+                HeapValue empty;
+                empty.kind = ValueKind::Array;
+                empty.text = type->udonName;
+                Variable list = DeclareListStorage(symbol, types_.ListOf(type), true, std::move(empty), 0);
+                site.queues.push_back(Value::OfSlot(list.slot, list.type));
+                return site.queues.back();
+            };
+            site.queuedTarget = !toSelf && !emit_.IsConstant(target.slot);
+            if (site.queuedTarget) CallList(queue(target.type), "Add", { Value::OfSlot(target.slot, target.type) }, location);
+            for (size_t i = 0; i < args.size(); ++i) CallList(queue(types[i]), "Add", { args[i] }, location);
+            if (!spec.amount.IsLiteral() || (spec.timing && !spec.timing->IsLiteral())) {
+                const Type* clock = spec.frames ? types_.Int32 : types_.Single;
+                HeapValue empty;
+                empty.kind = ValueKind::Array;
+                empty.text = clock->udonName;
+                Variable list = DeclareListStorage(site.entry + "_due", types_.ListOf(clock), true, std::move(empty), 0);
+                site.due = Value::OfSlot(list.slot, list.type);
+                Value now = CallStatic(types_.Get("UnityEngineTime"), spec.frames ? "get_frameCount" : "get_time", {}, nullptr, location).at(0);
+                CallList(*site.due, "Add", { CompileArithmetic(AstExprBinary::Add, now, spec.amount, location) }, location);
+            }
+            schedule[0] = Value::OfString(site.entry);
+            CallMember(self, scheduler, std::move(schedule), nullptr, location);
+            delaySites_.push_back(std::move(site));
+            return { Value::OfNil() };
+        }
+
+        void Compiler::CompileDelaySite(const DelaySite& site) {
+            current_ = nullptr;
+            emit_.ResetTemps();
+            emit_.Bind(site.label);
+            entries_.push_back({ site.entry, *emit_.AddressOf(site.label) });
+            const Location& location = site.location;
+
+            if (site.due || !site.queues.empty()) {
+                const Value& first = site.due ? *site.due : site.queues.front();
+                Label pending = emit_.NewLabel();
+                Value empty = CompareValues(AstExprBinary::CompareLe, Value::OfSlot(ListCount(first).slot, types_.Int32), Value::OfInteger(0), location);
+                emit_.JumpIfFalse(TruthySlot(empty, location), pending);
+                emit_.JumpTo(0xFFFFFFFFu);
+                emit_.Bind(pending);
+            }
+            Variable pick{ emit_.Hidden(types_.Int32), types_.Int32 };
+            Store(Value::OfInteger(0), pick, location);
+            Value picked = Value::OfSlot(pick.slot, types_.Int32);
+            if (site.due) {
+                Variable i{ emit_.Hidden(types_.Int32), types_.Int32 };
+                Store(Value::OfInteger(1), i, location);
+                Value index = Value::OfSlot(i.slot, types_.Int32);
+                Label test = emit_.NewLabel();
+                Label next = emit_.NewLabel();
+                Label done = emit_.NewLabel();
+                emit_.Bind(test);
+                emit_.JumpIfFalse(TruthySlot(CompareValues(AstExprBinary::CompareLt, index, Value::OfSlot(ListCount(*site.due).slot, types_.Int32), location), location), done);
+                Value candidate = CallList(*site.due, "Get", { index }, location).at(0);
+                Value best = CallList(*site.due, "Get", { picked }, location).at(0);
+                emit_.JumpIfFalse(TruthySlot(CompareValues(AstExprBinary::CompareLt, candidate, best, location), location), next);
+                Store(index, pick, location);
+                emit_.Bind(next);
+                Store(CompileArithmetic(AstExprBinary::Add, index, Value::OfInteger(1), location), i, location);
+                emit_.Jump(test);
+                emit_.Bind(done);
+                ListRemoveAt(*site.due, picked, location);
+            }
+
+            std::vector<Value> values;
+            for (const Value& q : site.queues) {
+                const Type* type = q.type->element;
+                Variable held{ emit_.Hidden(type), type };
+                Store(CallList(q, "Get", { picked }, location).at(0), held, location);
+                ListRemoveAt(q, picked, location);
+                values.push_back(Value::OfSlot(held.slot, type));
+            }
+            Value target = site.target;
+            if (site.queuedTarget) {
+                target.slot = values.front().slot;
+                values.erase(values.begin());
+            }
+
+            if (target.kind == Value::Kind::Network) {
+                SendNetwork(target, site.method, std::move(values), location);
+            } else if (site.own) {
+                CallFunction(site.own, std::move(values), 0, location, nullptr);
+            } else {
+                auto method = std::ranges::find(target.type->script->methods, site.method, &ScriptMethod::name);
+                CallScriptMethod(target, *method, values, 0, location);
+            }
+            emit_.JumpTo(0xFFFFFFFFu);
         }
 
         void Compiler::CompileAssert(AstExprCall* call) {
@@ -2644,18 +2882,23 @@ namespace UdonLuau {
             return {};
         }
 
-        std::optional<std::string_view> Compiler::LibraryName(AstExpr* expr) const {
+        std::optional<std::string_view> Compiler::LibraryName(AstExpr* expr) {
             auto* g = Unwrap(expr)->as<AstExprGlobal>();
-            if (!g || globalFunctions_.contains(g->name.value)) return std::nullopt;
-            for (std::string_view library : { "math", "string", "table" })
-                if (library == g->name.value) return library;
+            if (!g || globalFunctions_.contains(g->name.value) || defines_.contains(g->name.value)) return std::nullopt;
+            for (const Polyfill& p : kPolyfills) {
+                if (p.library != g->name.value) continue;
+                if (!IsStandardLibrary(p.library) && !types_.FindByShortName(p.library).empty()) return std::nullopt;
+                return p.library;
+            }
             return std::nullopt;
         }
 
         std::vector<Value> Compiler::CallLibrary(std::string_view library, std::string_view name, AstExprCall* call, std::vector<Value> args, const Type* typeArg, const Variable* into) {
             if (call->self) Fail(call->location, std::format("use '{}.{}(...)'", library, name));
+            if (!FindPolyfill(library, name)) Fail(call->location, std::format("{}.{} is not supported; available: {}", library, name, PolyfillNames(library)));
             if (library == "math") return CallMath(name, std::move(args), call->location);
             if (library == "string") return CallString(name, std::move(args), call->location);
+            if (library == "Delay") return CallDelay(name, std::move(args), call->location);
             return CallTable(name, call, std::move(args), typeArg, into);
         }
 
@@ -2836,7 +3079,10 @@ namespace UdonLuau {
         }
 
         Value Compiler::NewArray(const Type* arrayType, const Value& length, const Location& location) {
-            return CallStatic(arrayType, "ctor", { length }, nullptr, location).at(0);
+            bool wrapped = arrayType->base && arrayType->base->kind == TypeKind::Array;
+            Value array = CallStatic(wrapped ? arrayType->base : arrayType, "ctor", { length }, nullptr, location).at(0);
+            array.type = arrayType;
+            return array;
         }
 
         void Compiler::CopyRange(const Value& source, const Value& sourceIndex, const Value& destination, const Value& destinationIndex, const Value& length, const Location& location) {
@@ -2886,7 +3132,7 @@ namespace UdonLuau {
                 AstExpr* target = writable(0);
                 Value last = hold(sub(length(array), Value::OfInteger(1)), types_.Int32);
                 Value at = args.size() == 2 ? hold(args[1], types_.Int32) : last;
-                Value removed = hold(CallMember(array, "Get", { at }, nullptr, location).at(0), array.type->element);
+                Value removed = hold(Narrow(CallMember(array, "Get", { at }, nullptr, location).at(0), array.type->element), array.type->element);
                 Value shrunk = hold(NewArray(array.type, last, location), array.type);
                 if (args.size() == 2) {
                     CopyRange(array, Value::OfInteger(0), shrunk, Value::OfInteger(0), at, location);
@@ -3140,7 +3386,7 @@ namespace UdonLuau {
             if (name == "Get") {
                 arity(1);
                 CheckListIndex(list, args[0], location);
-                return CallMember(ListArray(list), "Get", { args[0] }, nullptr, location);
+                return { Narrow(CallMember(ListArray(list), "Get", { args[0] }, nullptr, location).at(0), element) };
             }
             if (name == "Set") {
                 arity(2);
@@ -3167,7 +3413,7 @@ namespace UdonLuau {
                     index = Value::OfSlot(h.slot, types_.Int32);
                 }
                 CheckListIndex(list, index, location);
-                Value removed = CallMember(ListArray(list), "Get", { index }, nullptr, location).at(0);
+                Value removed = Narrow(CallMember(ListArray(list), "Get", { index }, nullptr, location).at(0), list.type->element);
                 Variable kept{ emit_.Hidden(list.type->element), list.type->element };
                 Store(removed, kept, location);
                 ListRemoveAt(list, index, location);

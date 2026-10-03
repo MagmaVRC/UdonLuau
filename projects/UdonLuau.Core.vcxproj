@@ -32,6 +32,7 @@
     <ClInclude Include="..\include\UdonLuau\Definitions.hpp" />
     <ClInclude Include="..\include\UdonLuau\Program.hpp" />
     <ClInclude Include="..\src\Emitter.hpp" />
+    <ClInclude Include="..\src\Polyfills.hpp" />
     <ClInclude Include="..\src\TypeSystem.hpp" />
   </ItemGroup>
   <ItemGroup>
