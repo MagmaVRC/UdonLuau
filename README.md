@@ -191,7 +191,19 @@ end
   - `and`, `or` and `not` short-circuit on booleans.
   - `value :: int` rounds a float the way `System.Convert` does.
 - **Truthiness:** an object in a condition means "is not nil".
-- **Built-ins:** `print`, `warn` and `tostring`.
+- **Built-ins:** `print`, `warn` and `tostring`, plus the standard library below.
+
+### Standard library
+
+Luau's `math`, `string` and `table` libraries are compiled onto Udon externs. Where Udon has no direct equivalent, the compiler emits a short inline routine instead. Array positions are 0-based, as everywhere else.
+
+| Library | Functions | Notes |
+|---|---|---|
+| `math` | `abs`, `floor`, `ceil`, `sqrt`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan(y [, x])`, `exp`, `log(x [, base])`, `log10`, `pow`, `min`, `max` (any count), `clamp`, `sign`, `round`, `fmod`, `lerp`, `map`, `random`, `pi`, `huge` | `round` rounds halves away from zero, as in Luau. `random(m, n)` includes both bounds. `floor`, `ceil` and `round` of an integer return it unchanged. |
+| `string` | `format`, `len`, `upper`, `lower`, `rep`, `split` | `format` takes a literal format string. It is translated to `String.Format` when compiling and supports `%d %i %s %f %.Nf %g %e %x %X %%`, widths and `-`/`0` flags. For anything else, use the string's own methods (`s:Substring(0, 3)`). |
+| `table` | `insert`, `remove`, `find`, `create`, `clone`, `clear`, `concat`, `sort`, `move` | Udon arrays have a fixed size. `insert` and `remove` build a new array and store it back into the variable or field you passed, so other references keep the old array. `find` returns -1 when the value is missing. `create(n, value)` fills by doubling copies, so it costs about 5·log2(n) externs rather than n. `sort` takes no comparison function. |
+
+Each `insert` or `remove` costs a constant 5-8 externs whatever the array's length. Each one also allocates a new array, so prefer `table.create` with a known size in hot loops.
 
 ### Other behaviours
 
@@ -236,7 +248,10 @@ Every optimization targets what costs time in VRChat's own Udon VM. In order of 
 - Small local functions, and functions called once, are inlined. Parameters that are never assigned are bound directly to their arguments, so nothing is copied.
 - Results are written straight into their destination: assignments, `return` values of inlined calls, if-expressions and boolean expressions.
 - Locals that are never reassigned are not stored at all: they are replaced by their value.
-- Struct constructors with literal arguments become constants built when the program is created, so they cost no extern at run time.
+- Struct constructors with literal arguments become constants built when the program is created, so they cost no extern at run time. The same applies to constant statics such as `Vector3.up` or `Color.red`, and to pure functions with literal arguments such as `Quaternion.Euler(0, 90, 0)` or `Mathf.Sqrt(2)`.
+- Repeated reads of the same property, such as `transform.position` used three times in one expression, run the extern once. The value is reused until a write, a branch target, or a call that could change it.
+- `not x` in a condition flips the branch instead of calling a negation extern.
+- Operands are only copied before a call when that call could change them. Local functions that write no behaviour variables are recognised and skip the copy.
 - Loops test their condition at the bottom, which saves one jump per iteration. Loops with constant bounds skip the first test.
 - An `if`/`elseif` chain comparing one `int` against eight or more constants becomes a jump table: two bounds checks, an array read and an indirect jump.
 - Events that no other code calls return with a single jump instead of the call/return trampoline.
