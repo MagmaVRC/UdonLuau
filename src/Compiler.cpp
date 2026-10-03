@@ -44,6 +44,8 @@ namespace UdonLuau {
             const Type* type = nullptr;
         };
 
+        enum class Reentry : uint8_t { Ignore, Restart, Overlap };
+
         struct Function {
             std::string              name;
             AstExprFunction*         node = nullptr;
@@ -67,6 +69,18 @@ namespace UdonLuau {
             bool                     delayTarget = false;
             bool                     networkCallable = false;
             int                      maxEventsPerSecond = 0;
+            bool                     async = false;
+            bool                     entered = false;
+            bool                     cancelTarget = false;
+            Reentry                  reentry = Reentry::Ignore;
+            uint32_t                 freeSlot = 0;
+            uint32_t                 lineSlot = 0;
+            uint32_t                 cancelReturn = 0;
+            Label                    cancelRoutine;
+            std::vector<uint32_t>    waitFlags;
+
+            [[nodiscard]] bool IsRoot() const { return async && (exported || entered); }
+            [[nodiscard]] bool Cancellable() const { return reentry == Reentry::Restart || cancelTarget; }
         };
 
         constexpr size_t kInlineBudget = 40;
@@ -650,6 +664,16 @@ namespace UdonLuau {
             std::vector<Value> CallDelayed(const Value& receiver, std::string_view name, std::vector<Value> args, const Location& location);
             void CompileDelaySite(const DelaySite& site);
             void EmitReturn();
+            void EmitYield();
+            [[nodiscard]] bool DebugBuild() const;
+            void AnalyzeCoroutines(AstStatBlock* root);
+            std::vector<Value> CallTask(AstExprCall* call, std::string_view name, size_t want);
+            std::vector<Value> EmitWait(bool frames, const Value& amount, const Value& timing, size_t want, const Location& location);
+            void EnterRoot(Function* f, std::vector<Value> args, const Location& location);
+            void CallCancel(Function& f);
+            void EmitRootPrologue(Function& f, Label reject);
+            void EmitRootReject(Function& f, Label reject);
+            void EmitCancelRoutine(Function& f);
             void DeclareConstTable(AstLocal* var, AstExprTable* table);
             void SortWith(const Value& array, const Value& length, const Value& comparer, const Location& location);
             Value FindBehaviour(const Value& receiver, std::string_view getter, const Type* wanted, const Location& location);
@@ -766,6 +790,8 @@ namespace UdonLuau {
             std::vector<EntryPoint>                        entries_;
             std::vector<LoopLabels>                        loops_;
             Function*                                      current_ = nullptr;
+            Function*                                      root_ = nullptr;
+            int                                            waitSites_ = 0;
             uint32_t                                       haltSlot_ = 0;
             uint32_t                                       returnJumpSlot_ = 0;
         };
@@ -1232,6 +1258,7 @@ namespace UdonLuau {
                     if (f->name == h.function && !f->event) h.target = f.get();
                 if (h.target) ++h.target->calls;
             }
+            AnalyzeCoroutines(root);
 
             for (auto& f : functions_) {
                 NodeCounter counter;
@@ -1242,8 +1269,79 @@ namespace UdonLuau {
                     if (a.name == "noinline") f->noInline = true;
                 }
                 if (f->forceInline && f->noInline) Report(f->location, std::format("'{}' cannot be both @inline and @noinline", f->name));
-                f->inlined = !f->noInline && !f->delayTarget && f->calls > 0 && (f->forceInline || f->size <= kInlineBudget || (f->calls == 1 && !f->exported));
-                f->trampoline = options_.compatibleExitReturn || !f->exported || (f->calls > 0 && !f->inlined);
+                if (f->async && f->noInline) Report(f->location, std::format("'{}' waits, so it is inlined into every caller and cannot be @noinline", f->name));
+                f->inlined = f->async || (!f->noInline && !f->delayTarget && f->calls > 0 && (f->forceInline || f->size <= kInlineBudget || (f->calls == 1 && !f->exported)));
+                f->trampoline = options_.compatibleExitReturn || f->async || !f->exported || (f->calls > 0 && !f->inlined);
+            }
+        }
+
+        void Compiler::AnalyzeCoroutines(AstStatBlock*) {
+            class CallScan : public AstVisitor {
+            public:
+                std::function<void(AstExprCall*)> onCall;
+                bool visit(AstExprCall* c) override {
+                    onCall(c);
+                    return true;
+                }
+            };
+            std::unordered_map<Function*, std::vector<Function*>> callees;
+            for (auto& f : functions_) {
+                Function* self = f.get();
+                CallScan scan;
+                scan.onCall = [&](AstExprCall* c) {
+                    auto* index = c->self ? nullptr : CallTarget(c)->as<AstExprIndexName>();
+                    std::optional<std::string_view> library = index ? LibraryName(index->expr) : std::nullopt;
+                    if (library && *library == "task") {
+                        std::string_view name = index->index.value;
+                        if (name == "wait" || name == "waitFrames" || name == "waitUntil") {
+                            self->async = true;
+                            return;
+                        }
+                        size_t at = name == "delay" ? 1 : 0;
+                        if (c->args.size <= at) return;
+                        if (Function* target = Callee(c->args.data[at])) {
+                            if (name == "cancel") target->cancelTarget = true;
+                            else target->entered = true;
+                        }
+                        return;
+                    }
+                    if (Function* g = c->self ? nullptr : Callee(CallTarget(c))) callees[self].push_back(g);
+                };
+                f->node->body->visit(&scan);
+            }
+            for (bool changed = true; changed;) {
+                changed = false;
+                for (auto& [f, called] : callees) {
+                    if (f->async || std::ranges::none_of(called, &Function::async)) continue;
+                    f->async = true;
+                    changed = true;
+                }
+            }
+            for (ChangeHandler& h : changeHandlers_)
+                if (h.target) h.target->entered = true;
+            for (auto& f : functions_) {
+                if (f->delayTarget) f->entered = true;
+                for (const FieldAttribute& a : AnnotationsFor(f->location).attributes) {
+                    if (a.name != "reentry") continue;
+                    std::string_view mode = a.arguments.size() == 1 ? std::string_view(a.arguments[0]) : std::string_view{};
+                    if (mode == "ignore") f->reentry = Reentry::Ignore;
+                    else if (mode == "restart") f->reentry = Reentry::Restart;
+                    else if (mode == "overlap") f->reentry = Reentry::Overlap;
+                    else Report(f->location, "@reentry takes ignore, restart or overlap");
+                    if (!f->async) Report(f->location, std::format("@reentry has no effect: '{}' never waits", f->name), Severity::Warning);
+                }
+                if (f->async && f->exported && !f->returns.empty())
+                    Report(f->location, std::format("'{}' waits, so it cannot return values: callers get control back at its first wait", f->name));
+                if (!f->IsRoot()) continue;
+                HeapValue yes;
+                yes.kind = ValueKind::Boolean;
+                yes.boolean = true;
+                f->freeSlot = emit_.AddSlot(std::format("__co_{}_free", f->name), types_.Boolean, yes);
+                if (DebugBuild()) f->lineSlot = emit_.AddSlot(std::format("__co_{}_line", f->name), types_.Int32);
+                if (f->Cancellable()) {
+                    f->cancelRoutine = emit_.NewLabel();
+                    f->cancelReturn = emit_.Hidden(types_.UInt32);
+                }
             }
         }
 
@@ -1512,10 +1610,12 @@ namespace UdonLuau {
         }
 
         void Compiler::CompileFunction(Function& f) {
-            if (!f.exported && (f.inlined || f.calls == 0)) return;
+            bool root = f.IsRoot();
+            if (!f.exported && !root && (f.inlined || f.calls == 0)) return;
             for (const Variable& p : f.parameters)
                 if (p.type->IsList()) Fail(f.location, std::format("'{}' takes a List, so it must be inlined; mark it '-- @inline'", f.name));
             current_ = &f;
+            root_ = root ? &f : nullptr;
             emit_.ResetTemps();
             for (size_t i = 0; i < f.parameters.size(); ++i) {
                 AstLocal* arg = f.node->args.data[i];
@@ -1529,17 +1629,219 @@ namespace UdonLuau {
                 EmitEntryPrologue(f);
             }
             emit_.Bind(f.entry);
+            Label reject = emit_.NewLabel();
+            if (root) EmitRootPrologue(f, reject);
             AstStat* tail = nullptr;
             CompileBody(f.node->body, tail);
             emit_.Bind(f.epilogue);
-            if (f.trampoline) {
-                emit_.Push(returnJumpSlot_);
-                emit_.CopyFromStack();
-                emit_.JumpIndirect(returnJumpSlot_);
-            } else {
-                emit_.JumpTo(0xFFFFFFFFu);
+            if (root) emit_.Copy(TruthySlot(Value::OfBoolean(true), f.location), f.freeSlot);
+            if (f.trampoline) EmitYield();
+            else emit_.JumpTo(0xFFFFFFFFu);
+            if (root) {
+                EmitRootReject(f, reject);
+                if (f.Cancellable()) EmitCancelRoutine(f);
             }
             current_ = nullptr;
+            root_ = nullptr;
+        }
+
+        void Compiler::EmitRootPrologue(Function& f, Label reject) {
+            emit_.JumpIfFalse(f.freeSlot, reject);
+            if (f.reentry == Reentry::Restart) CallCancel(f);
+            emit_.Copy(TruthySlot(Value::OfBoolean(false), f.location), f.freeSlot);
+            for (size_t i = 0; i < f.parameters.size(); ++i) {
+                AstLocal* arg = f.node->args.data[i];
+                Variable own{ emit_.Local(arg->name.value, f.parameters[i].type), f.parameters[i].type };
+                emit_.Copy(f.parameters[i].slot, own.slot);
+                variables_[arg] = own;
+            }
+        }
+
+        void Compiler::EmitRootReject(Function& f, Label reject) {
+            emit_.Bind(reject);
+            if (DebugBuild()) {
+                std::string who = options_.scriptName.empty() ? f.name : options_.scriptName + "." + f.name;
+                Value message = f.reentry == Reentry::Ignore
+                    ? ConcatValues({ Value::OfString(std::format("[UdonLuau] {} ignored: still waiting at line ", who)), Value::OfSlot(f.lineSlot, types_.Int32),
+                                       Value::OfString(" (@reentry(ignore))") }, f.location)
+                    : Value::OfString(std::format("[UdonLuau] {} ignored: it was triggered again while running", who));
+                CallStatic(types_.Get("UnityEngineDebug"), "LogWarning", { message }, nullptr, f.location);
+            }
+            EmitYield();
+        }
+
+        void Compiler::CallCancel(Function& f) {
+            Label back = emit_.NewLabel();
+            emit_.Copy(emit_.AddressConstant(back), f.cancelReturn);
+            emit_.Jump(f.cancelRoutine);
+            emit_.Bind(back);
+        }
+
+        void Compiler::EmitCancelRoutine(Function& f) {
+            emit_.Bind(f.cancelRoutine);
+            uint32_t yes = TruthySlot(Value::OfBoolean(true), f.location);
+            uint32_t no = TruthySlot(Value::OfBoolean(false), f.location);
+            emit_.Copy(yes, f.freeSlot);
+            for (uint32_t flag : f.waitFlags) emit_.Copy(no, flag);
+            emit_.JumpIndirect(f.cancelReturn);
+        }
+
+        std::vector<Value> Compiler::CallTask(AstExprCall* call, std::string_view name, size_t want) {
+            const Location& location = call->location;
+            if (!FindPolyfill("task", name)) Fail(location, std::format("task.{} is not supported; available: {}", name, PolyfillNames("task")));
+            size_t count = call->args.size;
+            auto arg = [&](size_t i) { return CompileExpr(call->args.data[i]); };
+            Value update = Value::OfInteger(0, types_.Get("VRCUdonCommonEnumsEventTiming"));
+
+            if (name == "wait" || name == "waitFrames") {
+                if (count > 2) Fail(location, std::format("task.{} takes the amount and an optional EventTiming", name));
+                if (name == "waitFrames" && count == 0) Fail(location, "task.waitFrames takes the number of frames");
+                bool frames = name == "waitFrames" || count == 0;
+                Value amount = count ? arg(0) : Value::OfInteger(1);
+                Value timing = count > 1 ? arg(1) : update;
+                return EmitWait(frames, amount, timing, want, location);
+            }
+            if (name == "waitUntil") {
+                if (count != 1) Fail(location, "task.waitUntil takes one condition");
+                Label test = emit_.NewLabel();
+                Label pause = emit_.NewLabel();
+                Label done = emit_.NewLabel();
+                emit_.Bind(test);
+                CompileCondition(call->args.data[0], pause);
+                emit_.Jump(done);
+                emit_.Bind(pause);
+                EmitWait(true, Value::OfInteger(1), update, 0, location);
+                emit_.Jump(test);
+                emit_.Bind(done);
+                return {};
+            }
+
+            size_t at = name == "delay" ? 1 : 0;
+            Function* target = count > at ? Callee(call->args.data[at]) : nullptr;
+            if (!target) Fail(location, std::format("task.{} takes a function of this script", name));
+            if (name == "cancel") {
+                if (count != 1) Fail(location, "task.cancel takes one function");
+                if (!target->IsRoot()) Fail(location, std::format("task.cancel: '{}' never waits, so there is nothing to cancel", target->name));
+                CallCancel(*target);
+                if (root_ == target) EmitYield();
+                return {};
+            }
+            std::vector<Value> rest;
+            for (size_t i = at + 1; i < count; ++i) rest.push_back(Evaluate(arg(i)));
+            if (name == "spawn") {
+                EnterRoot(target, std::move(rest), location);
+                return {};
+            }
+            Value amount = name == "delay" ? arg(0) : Value::OfInteger(1);
+            Value delayed = CallDelay(name == "delay" ? "Seconds" : "Frames", { amount, SelfValue("this") }, location).at(0);
+            CallDelayed(delayed, target->name, std::move(rest), location);
+            return {};
+        }
+
+        std::vector<Value> Compiler::EmitWait(bool frames, const Value& requested, const Value& timing, size_t want, const Location& location) {
+            Function* root = root_;
+            if (!root) Fail(location, "waits can only be used in events, public methods and functions they call or start");
+            if (!timing.IsLiteral()) Fail(location, "the EventTiming of a wait must be a constant, such as EventTiming.LateUpdate");
+            const Type* amountType = frames ? types_.Int32 : types_.Single;
+            if (Cost(requested, amountType) < 0) Fail(location, std::format("the wait must be {}, got {}", amountType->displayName, Describe(requested)));
+            Value amount = requested.IsLiteral() ? CoerceLiteral(requested, amountType, location) : requested;
+            if (amount.kind == Value::Kind::Slot && amount.type != amountType) amount = Value::OfSlot(Convert(amount.slot, amount.type, amountType, location), amountType);
+
+            const Type* clock = frames ? types_.Int32 : types_.Double;
+            auto now = [&] { return CallStatic(types_.Get("UnityEngineTime"), frames ? "get_frameCount" : "get_timeAsDouble", {}, nullptr, location).at(0); };
+            auto flag = [&](bool value) { return TruthySlot(Value::OfBoolean(value), location); };
+
+            std::string entry = std::format("__co{}", waitSites_++);
+            std::optional<Variable> start;
+            if (want > 0) {
+                start = Variable{ emit_.Hidden(types_.Double), types_.Double };
+                Store(CallStatic(types_.Get("UnityEngineTime"), "get_timeAsDouble", {}, nullptr, location).at(0), *start, location);
+            }
+            bool cancellable = root->Cancellable();
+            Variable waiting{}, pending{}, due{};
+            if (cancellable) {
+                waiting = { emit_.Hidden(types_.Boolean), types_.Boolean };
+                pending = { emit_.Hidden(types_.Int32), types_.Int32 };
+                due = { emit_.Hidden(clock), clock };
+                root->waitFlags.push_back(waiting.slot);
+                emit_.Copy(flag(true), waiting.slot);
+                Store(CompileArithmetic(AstExprBinary::Add, Value::OfSlot(pending.slot, types_.Int32), Value::OfInteger(1), location), pending, location);
+                Value span = amount;
+                if (!frames) {
+                    constexpr double kEarly = 0.0005;
+                    span = amount.IsLiteral() ? Value::OfSlot(Materialize(Value::OfReal((amount.kind == Value::Kind::Real ? amount.real : static_cast<double>(amount.integer)) - kEarly), types_.Double, location), types_.Double)
+                                              : CompileArithmetic(AstExprBinary::Sub, Value::OfSlot(Convert(amount.slot, types_.Single, types_.Double, location), types_.Double),
+                                                    Value::OfSlot(Materialize(Value::OfReal(kEarly), types_.Double, location), types_.Double), location);
+                }
+                Store(CompileArithmetic(AstExprBinary::Add, now(), span, location), due, location);
+            }
+            CallMember(SelfValue("this"), frames ? "SendCustomEventDelayedFrames" : "SendCustomEventDelayedSeconds", { Value::OfString(entry), amount, timing }, nullptr, location);
+            if (root->lineSlot) emit_.Copy(Materialize(Value::OfInteger(location.begin.line + 1), types_.Int32, location), root->lineSlot);
+            if (root->reentry != Reentry::Ignore) emit_.Copy(flag(true), root->freeSlot);
+            EmitYield();
+
+            Label resume = emit_.NewLabel();
+            emit_.Bind(resume);
+            entries_.push_back({ entry, *emit_.AddressOf(resume) });
+            emit_.Push(haltSlot_);
+            if (cancellable) {
+                Label stale = emit_.NewLabel();
+                Label fresh = emit_.NewLabel();
+                Label go = emit_.NewLabel();
+                Store(CompileArithmetic(AstExprBinary::Sub, Value::OfSlot(pending.slot, types_.Int32), Value::OfInteger(1), location), pending, location);
+                emit_.JumpIfFalse(waiting.slot, stale);
+                Value more = CompareValues(AstExprBinary::CompareGt, Value::OfSlot(pending.slot, types_.Int32), Value::OfInteger(0), location);
+                emit_.JumpIfFalse(TruthySlot(more, location), fresh);
+                Value reached = CompareValues(AstExprBinary::CompareGe, now(), Value::OfSlot(due.slot, clock), location);
+                emit_.JumpIfFalse(TruthySlot(reached, location), stale);
+                emit_.Bind(fresh);
+                emit_.Copy(flag(false), waiting.slot);
+                emit_.Jump(go);
+                emit_.Bind(stale);
+                EmitYield();
+                emit_.Bind(go);
+            }
+            if (root->reentry != Reentry::Ignore) emit_.Copy(flag(false), root->freeSlot);
+            if (!start) return {};
+            Value elapsed = CompileArithmetic(AstExprBinary::Sub, CallStatic(types_.Get("UnityEngineTime"), "get_timeAsDouble", {}, nullptr, location).at(0), Value::OfSlot(start->slot, types_.Double), location);
+            return { Value::OfSlot(Convert(elapsed.slot, types_.Double, types_.Single, location), types_.Single) };
+        }
+
+        void Compiler::EnterRoot(Function* f, std::vector<Value> args, const Location& location) {
+            if (!f->IsRoot()) {
+                CallFunction(f, std::move(args), 0, location);
+                return;
+            }
+            if (args.size() != f->parameters.size()) Fail(location, std::format("'{}' takes {} argument(s), got {}", f->name, f->parameters.size(), args.size()));
+            std::vector<uint32_t> slots;
+            for (size_t i = 0; i < args.size(); ++i) {
+                if (Cost(args[i], f->parameters[i].type) < 0)
+                    Fail(location, std::format("argument {} of '{}' must be {}, got {}", i + 1, f->name, f->parameters[i].type->displayName, Describe(args[i])));
+                slots.push_back(Materialize(args[i], f->parameters[i].type, location));
+            }
+            for (size_t i = 0; i < slots.size(); ++i) emit_.Copy(slots[i], f->parameters[i].slot);
+            if (current_) current_->callees.push_back(f);
+            Label back = emit_.NewLabel();
+            emit_.Push(emit_.AddressConstant(back));
+            emit_.Jump(f->entry);
+            emit_.Bind(back);
+            if (root_ && root_->Cancellable()) {
+                Label alive = emit_.NewLabel();
+                emit_.JumpIfFalse(root_->freeSlot, alive);
+                EmitYield();
+                emit_.Bind(alive);
+            }
+        }
+
+        void Compiler::EmitYield() {
+            emit_.Push(returnJumpSlot_);
+            emit_.CopyFromStack();
+            emit_.JumpIndirect(returnJumpSlot_);
+        }
+
+        bool Compiler::DebugBuild() const {
+            auto debug = defines_.find("DEBUG");
+            return debug != defines_.end() && IsTruthy(debug->second);
         }
 
         void Compiler::CompileBody(AstStatBlock* body, AstStat*& tail) {
@@ -2811,6 +3113,10 @@ namespace UdonLuau {
 
         std::vector<Value> Compiler::CompileCall(AstExprCall* call, size_t want, const Variable* into) {
             AstExpr* func = Unwrap(call->func);
+            if (auto* index = call->self ? nullptr : func->as<AstExprIndexName>()) {
+                std::optional<std::string_view> library = LibraryName(index->expr);
+                if (library && *library == "task") return CallTask(call, index->index.value, want);
+            }
             if (auto* g = func->as<AstExprGlobal>(); g && g->name == "assert" && !globalFunctions_.contains("assert")) {
                 CompileAssert(call);
                 return {};
@@ -3110,7 +3416,7 @@ namespace UdonLuau {
             if (target.kind == Value::Kind::Network) {
                 SendNetwork(target, site.method, std::move(values), location);
             } else if (site.own) {
-                CallFunction(site.own, std::move(values), 0, location, nullptr);
+                EnterRoot(site.own, std::move(values), location);
             } else {
                 CallScriptMethod(target, *site.scriptMethod, values, 0, location);
             }
@@ -3153,7 +3459,7 @@ namespace UdonLuau {
                 args.push_back(Value::OfSlot(old, handler.variable.type));
             }
             BeginSyntheticEntry("_onVarChange_" + handler.field);
-            CallFunction(handler.target, std::move(args), 0, handler.location, nullptr);
+            EnterRoot(handler.target, std::move(args), handler.location);
             EmitReturn();
         }
 

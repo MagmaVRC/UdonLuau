@@ -71,6 +71,13 @@ namespace UdonLuau::Detail {
         { "table", "concat", "(t: { string }, separator: string?) -> string" },
         { "table", "sort", "<T>(t: { T }) -> ()" },
         { "table", "move", "<T>(a1: { T }, f: number, e: number, t: number, a2: { T }?) -> { T }" },
+        { "task", "wait", "(seconds: number?, timing: any?) -> number" },
+        { "task", "waitFrames", "(frames: number, timing: any?) -> number" },
+        { "task", "waitUntil", "(condition: boolean) -> ()" },
+        { "task", "spawn", "<A...>(fn: (A...) -> ...any, A...) -> ()" },
+        { "task", "defer", "<A...>(fn: (A...) -> ...any, A...) -> ()" },
+        { "task", "delay", "<A...>(seconds: number, fn: (A...) -> ...any, A...) -> ()" },
+        { "task", "cancel", "(fn: (...any) -> ...any) -> ()" },
         { "Delay", "Seconds", "<T>(seconds: number, target: T, timing: any?) -> T" },
         { "Delay", "Frames", "<T>(frames: number, target: T, timing: any?) -> T" },
     };

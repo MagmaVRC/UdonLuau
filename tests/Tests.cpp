@@ -32,6 +32,9 @@ namespace {
     using Cell = std::variant<std::monostate, bool, int32_t, uint32_t, int64_t, float, double, std::string, Vec3, IntArray, std::vector<uint32_t>, BehaviourRef, RefArray>;
     using Impl = std::function<void(std::vector<Cell>&, const std::vector<uint32_t>&)>;
 
+    int32_t g_frame = 100;
+    double  g_time = 10.0;
+
     void RunOn(const Cell& behaviour, const std::string& entry);
     void NetworkRunOn(const Cell& behaviour, const std::string& entry, const std::vector<Cell>& arguments);
     Cell& VarOn(const Cell& behaviour, const std::string& symbol);
@@ -138,7 +141,7 @@ namespace {
         f.Extern("UnityEngineObject.__op_Equality__UnityEngineObject_UnityEngineObject__SystemBoolean", false);
         f.Extern("UnityEngineObject.__op_Inequality__UnityEngineObject_UnityEngineObject__SystemBoolean", false);
         f.Extern("UnityEngineDebug.__Log__SystemObject__SystemVoid", false, [&log = f.log](auto& h, auto& p) { log.push_back(Text(h[p[0]])); });
-        f.Extern("UnityEngineDebug.__LogWarning__SystemObject__SystemVoid", false);
+        f.Extern("UnityEngineDebug.__LogWarning__SystemObject__SystemVoid", false, [&log = f.log](auto& h, auto& p) { log.push_back("warn: " + Text(h[p[0]])); });
         f.Extern("UnityEngineDebug.__LogError__SystemObject__SystemVoid", false, [&log = f.log](auto& h, auto& p) { log.push_back("error: " + Text(h[p[0]])); });
         f.Extern("SystemUInt32Array.__Get__SystemInt32__SystemUInt32", true, [](auto& h, auto& p) {
             h[p[2]] = As<std::vector<uint32_t>>(h, p[0]).at(static_cast<size_t>(As<int32_t>(h, p[1])));
@@ -206,7 +209,13 @@ namespace {
             As<RefArray>(h, p[0])->at(static_cast<size_t>(As<int32_t>(h, p[1]))) = value;
         });
         f.Extern("UnityEngineComponentArray.__get_Length__SystemInt32", true, [](auto& h, auto& p) { h[p[1]] = static_cast<int32_t>(As<RefArray>(h, p[0])->size()); });
-        f.Extern("UnityEngineTime.__get_frameCount__SystemInt32", false, [](auto& h, auto& p) { h[p[0]] = int32_t{ 100 }; });
+        f.Extern("UnityEngineTime.__get_frameCount__SystemInt32", false, [](auto& h, auto& p) { h[p[0]] = g_frame; });
+        f.Extern("UnityEngineTime.__get_timeAsDouble__SystemDouble", false, [](auto& h, auto& p) { h[p[0]] = g_time; });
+        Binary<double>(f, "SystemDouble", "op_Addition", "SystemDouble", "SystemDouble", [](double a, double b) { return a + b; });
+        Binary<double>(f, "SystemDouble", "op_Subtraction", "SystemDouble", "SystemDouble", [](double a, double b) { return a - b; });
+        Binary<double>(f, "SystemDouble", "op_GreaterThanOrEqual", "SystemDouble", "SystemBoolean", [](double a, double b) { return a >= b; });
+        f.Extern("SystemConvert.__ToDouble__SystemSingle__SystemDouble", false, [](auto& h, auto& p) { h[p[1]] = static_cast<double>(As<float>(h, p[0])); });
+        f.Extern("SystemConvert.__ToSingle__SystemDouble__SystemSingle", false, [](auto& h, auto& p) { h[p[1]] = static_cast<float>(As<double>(h, p[0])); });
         f.Extern("SystemArray.__IndexOf__SystemArray_SystemObject_SystemInt32_SystemInt32__SystemInt32", false, [](auto& h, auto& p) {
             auto& xs = *As<IntArray>(h, p[0]);
             int32_t start = As<int32_t>(h, p[2]), n = As<int32_t>(h, p[3]);
@@ -1537,6 +1546,176 @@ end
         Check(HasError(f, "-- @networkcallable\nexport function Get(): int\n return 1\nend", "cannot return values"), "network callable methods cannot return");
         Check(HasError(f, "-- @networkcallable\nlocal function Hidden()\nend", "only 'export function'"), "network callable must be public");
         g_machines.clear();
+    });
+
+    Case("coroutines", [] {
+        Fixture f = MakeFixture();
+        auto log = [&] {
+            std::string all;
+            for (const std::string& line : f.log) all += line + " ";
+            return all;
+        };
+        auto basic = Build(f, R"(
+export local step = 0
+export local total = 0
+local function settle(n: int)
+    task.waitFrames(n)
+    total += n
+end
+function Interact()
+    step = 1
+    task.wait(2)
+    step = 2
+    settle(3)
+    step = 3
+end
+export function Count()
+    for i = 1, 3 do
+        total += i
+        task.wait(1)
+    end
+end
+)",
+            { .defines = { { "DEBUG", "true" } } });
+        Check(basic.has_value(), "waits compile");
+        if (basic) {
+            Machine m(f, *basic);
+            m.Run("_interact");
+            Check(std::get<int32_t>(m.Var("step")) == 1 && f.log.back() == "delay:__co0:2", std::format("the event runs until its first wait ({})", log()));
+            f.log.clear();
+            m.Run("_interact");
+            Check(std::get<int32_t>(m.Var("step")) == 1 && f.log.size() == 1 && f.log[0].starts_with("warn:") && f.log[0].find("line 10") != std::string::npos,
+                std::format("a second trigger while waiting is ignored and logged in debug builds ({})", log()));
+            m.Run("__co0");
+            Check(std::get<int32_t>(m.Var("step")) == 2 && f.log.back() == "frames:__co1:3", "resumes after the wait, into an inlined helper that waits");
+            m.Run("__co1");
+            Check(std::get<int32_t>(m.Var("step")) == 3 && std::get<int32_t>(m.Var("total")) == 3, "finishes after the helper resumes");
+            f.log.clear();
+            m.Run("_interact");
+            Check(f.log.size() == 1 && f.log[0] == "delay:__co0:2", "a finished coroutine can start again");
+
+            m.Var("total") = int32_t{ 0 };
+            m.Run("_Count");
+            for (int i = 0; i < 3; ++i) m.Run("__co2");
+            Check(std::get<int32_t>(m.Var("total")) == 6, std::format("loop state survives waits ({})", std::get<int32_t>(m.Var("total"))));
+        }
+
+        auto restart = Build(f, R"(
+export local lit = false
+export local elapsed: number = 0
+-- @reentry(restart)
+export function Pulse()
+    lit = true
+    elapsed = task.wait(5)
+    lit = false
+end
+export function Stop()
+    task.cancel(Pulse)
+end
+)");
+        Check(restart.has_value(), "restart and cancel compile");
+        if (restart) {
+            Machine m(f, *restart);
+            g_time = 10.0;
+            m.Run("_Pulse");
+            g_time = 13.0;
+            m.Run("_Pulse");
+            g_time = 15.0;
+            m.Run("__co0");
+            Check(std::get<bool>(m.Var("lit")), "the replaced run's resume is ignored");
+            g_time = 18.0;
+            m.Run("__co0");
+            Check(!std::get<bool>(m.Var("lit")) && std::abs(std::get<float>(m.Var("elapsed")) - 5.0f) < 0.001f, "the restarted run resumes on time and task.wait returns the elapsed time");
+            m.Run("_Pulse");
+            m.Run("_Stop");
+            m.Run("__co0");
+            Check(std::get<bool>(m.Var("lit")), "task.cancel stops a waiting run");
+            g_time = 10.0;
+        }
+
+        auto spawned = Build(f, R"(
+export local count = 0
+export local ready = false
+local function blink(n: int)
+    count += n
+    task.wait(1)
+    count += 10
+end
+function Start()
+    task.spawn(blink, 2)
+    count += 100
+end
+export function Gate()
+    task.waitUntil(ready)
+    count = -1
+end
+)");
+        Check(spawned.has_value(), "spawn and waitUntil compile");
+        if (spawned) {
+            Machine m(f, *spawned);
+            m.Run("_start");
+            Check(std::get<int32_t>(m.Var("count")) == 102, std::format("spawn runs until the first wait, then returns ({})", std::get<int32_t>(m.Var("count"))));
+            m.Run("__co0");
+            Check(std::get<int32_t>(m.Var("count")) == 112, "the spawned function resumes");
+            m.Run("_Gate");
+            m.Run("__co1");
+            Check(std::get<int32_t>(m.Var("count")) == 112, "waitUntil keeps waiting while false");
+            m.Var("ready") = true;
+            m.Run("__co1");
+            Check(std::get<int32_t>(m.Var("count")) == -1, "waitUntil continues once true");
+        }
+
+        auto joined = Build(f, R"(
+export local last: VRCPlayerApi
+function OnPlayerJoined(player: VRCPlayerApi)
+    task.wait(1)
+    last = player
+end
+)");
+        Check(joined.has_value(), "an event with parameters can wait");
+        if (joined) {
+            Machine m(f, *joined);
+            m.Var("onPlayerJoinedPlayer") = BehaviourRef{ 7 };
+            m.Run("_onPlayerJoined");
+            m.Var("onPlayerJoinedPlayer") = BehaviourRef{ 8 };
+            m.Run("__co0");
+            Check(std::get<BehaviourRef>(m.Var("last")).id == 7, "event arguments are kept across a wait");
+        }
+
+        auto later = Build(f, R"(
+export local hits = 0
+local function hit(n: int)
+    hits += n
+    task.wait(1)
+    hits += n
+end
+function Start()
+    task.defer(hit, 1)
+    task.delay(2, hit, 5)
+    if hits == 0 then
+        return
+    end
+    hits = 99
+end
+)",
+            { .compatibleExitReturn = true });
+        Check(later.has_value(), "defer and delay compile in compatible exit mode");
+        if (later) {
+            Machine m(f, *later);
+            f.log.clear();
+            m.Run("_start");
+            Check(f.log.size() == 2 && f.log[0] == "frames:__delay0:1" && f.log[1] == "delay:__delay1:2", std::format("defer and delay schedule the function ({})", log()));
+            m.Run("__delay0");
+            Check(std::get<int32_t>(m.Var("hits")) == 1, "a deferred function runs until its wait");
+            m.Run("__delay1");
+            Check(std::get<int32_t>(m.Var("hits")) == 1, "a second start while it waits is ignored");
+            m.Run("__co0");
+            Check(std::get<int32_t>(m.Var("hits")) == 2, "the deferred function resumes");
+        }
+
+        Check(HasError(f, "export function Get(): int\n task.wait(1)\n return 1\nend", "cannot return values"), "public methods that wait cannot return values");
+        Check(HasError(f, "local function go()\n task.wait(1)\nend\nfunction Start()\n task.cancel(print)\nend", "function of this script"), "task.cancel takes a script function");
+        Check(HasError(f, "local t = EventTiming.Update\nfunction Start()\n task.wait(1, t)\nend", "must be a constant"), "the timing of a wait is constant");
     });
 
     Case("UdonSharp-compatible export layout", [] {
