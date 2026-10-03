@@ -1713,6 +1713,84 @@ end
             Check(std::get<int32_t>(m.Var("hits")) == 2, "the deferred function resumes");
         }
 
+        auto signals = Build(f, R"(
+export local got: number = 0
+export local connected: number = 0
+export local stopped = 0
+export local who: VRCPlayerApi
+export local order = ""
+local hit: Signal<number> = Signal()
+local function onHit(n: number)
+    connected += n
+end
+export function Waiter()
+    while true do
+        local n = hit:Wait()
+        got += n
+    end
+end
+export function Stoppable()
+    hit:Wait()
+    stopped += 1
+end
+export function Stop()
+    task.cancel(Stoppable)
+end
+export function Hook()
+    hit:Connect(onHit)
+end
+export function Unhook()
+    hit:Disconnect(onHit)
+end
+export function Shoot()
+    hit:Fire(5)
+end
+export function Greeter()
+    who = Events.OnPlayerJoined:Wait()
+end
+function OnPlayerLeft(player: VRCPlayerApi)
+    order ..= "h"
+end
+export function Watch()
+    Events.OnPlayerLeft:Wait()
+    order ..= "w"
+end
+)");
+        Check(signals.has_value(), "signals and event waits compile");
+        if (signals) {
+            Machine m(f, *signals);
+            m.Run("_Waiter");
+            m.Run("_Shoot");
+            Check(std::get<float>(m.Var("got")) == 5.0f, "Fire resumes a waiter with the value");
+            m.Run("_Shoot");
+            Check(std::get<float>(m.Var("got")) == 10.0f, "a waiter that waits again is resumed once per Fire");
+            m.Run("_Hook");
+            m.Run("_Shoot");
+            Check(std::get<float>(m.Var("connected")) == 5.0f && std::get<float>(m.Var("got")) == 15.0f, "Connect calls the function on Fire");
+            m.Run("_Unhook");
+            m.Run("_Shoot");
+            Check(std::get<float>(m.Var("connected")) == 5.0f, "Disconnect stops the calls");
+            m.Run("_Stoppable");
+            m.Run("_Stop");
+            m.Run("_Shoot");
+            Check(std::get<int32_t>(m.Var("stopped")) == 0, "a cancelled waiter is not resumed");
+            m.Run("_Stoppable");
+            m.Run("_Shoot");
+            Check(std::get<int32_t>(m.Var("stopped")) == 1, "a restarted waiter is resumed");
+
+            m.Run("_Greeter");
+            m.Var("onPlayerJoinedPlayer") = BehaviourRef{ 3 };
+            m.Run("_onPlayerJoined");
+            Check(std::get<BehaviourRef>(m.Var("who")).id == 3, "Events.OnPlayerJoined:Wait() returns the joining player");
+            m.Var("onPlayerJoinedPlayer") = BehaviourRef{ 4 };
+            m.Run("_onPlayerJoined");
+            Check(std::get<BehaviourRef>(m.Var("who")).id == 3, "an event wait resumes once");
+            m.Run("_Watch");
+            m.Run("_onPlayerLeft");
+            Check(std::get<std::string>(m.Var("order")) == "hw", std::format("waiters resume after the script's own handler ({})", std::get<std::string>(m.Var("order"))));
+        }
+        Check(HasError(f, "export function Touch()\n Events.Interact:Wait()\nend", "needs a handler for Interact"), "waiting for Interact needs a handler");
+
         Check(HasError(f, "export function Get(): int\n task.wait(1)\n return 1\nend", "cannot return values"), "public methods that wait cannot return values");
         Check(HasError(f, "local function go()\n task.wait(1)\nend\nfunction Start()\n task.cancel(print)\nend", "function of this script"), "task.cancel takes a script function");
         Check(HasError(f, "local t = EventTiming.Update\nfunction Start()\n task.wait(1, t)\nend", "must be a constant"), "the timing of a wait is constant");

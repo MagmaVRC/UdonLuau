@@ -313,6 +313,39 @@ namespace UdonLuau {
             const ScriptMethod*  scriptMethod = nullptr;
         };
 
+        struct ListenSite {
+            Function*             root = nullptr;
+            uint32_t              waiting = 0;
+            uint32_t              taken = 0;
+            Label                 direct;
+            std::vector<Variable> results;
+        };
+
+        struct SignalInfo {
+            std::string                       name;
+            std::vector<const Type*>          types;
+            bool                              exported = false;
+            std::vector<ListenSite*>          sites;
+            std::map<Function*, uint32_t>     connections;
+        };
+
+        struct FireSite {
+            SignalInfo*        signal = nullptr;
+            Label              block;
+            Label              back;
+            std::vector<Value> values;
+            Location           location;
+        };
+
+        struct EventListeners {
+            const EventInfo*         event = nullptr;
+            Location                 location;
+            Function*                handler = nullptr;
+            Label                    dispatch;
+            std::vector<ListenSite*> sites;
+            std::vector<Variable>    values;
+        };
+
         struct Annotations {
             bool                        synced = false;
             SyncInterpolation           interpolation = SyncInterpolation::None;
@@ -674,6 +707,15 @@ namespace UdonLuau {
             void EmitRootPrologue(Function& f, Label reject);
             void EmitRootReject(Function& f, Label reject);
             void EmitCancelRoutine(Function& f);
+            void EmitAliveCheck();
+            bool DeclareSignal(AstLocal* var, AstExpr* init, bool exported);
+            SignalInfo* SignalOf(AstExpr* expr);
+            const EventInfo* EventOf(AstExpr* expr) const;
+            std::optional<std::vector<Value>> CallListenable(AstExprCall* call, size_t want);
+            std::vector<Value> EmitListen(const std::vector<const Type*>& types, std::vector<ListenSite*>& registry, size_t want, const Location& location);
+            void EmitDispatch(const std::vector<ListenSite*>& sites, const std::vector<Value>& values, const std::map<Function*, uint32_t>& connections, const Location& location);
+            void EmitFireBlock(const FireSite& fire);
+            void EmitEventDispatch(EventListeners& listeners);
             void DeclareConstTable(AstLocal* var, AstExprTable* table);
             void SortWith(const Value& array, const Value& length, const Value& comparer, const Location& location);
             Value FindBehaviour(const Value& receiver, std::string_view getter, const Type* wanted, const Location& location);
@@ -792,6 +834,10 @@ namespace UdonLuau {
             Function*                                      current_ = nullptr;
             Function*                                      root_ = nullptr;
             int                                            waitSites_ = 0;
+            std::deque<ListenSite>                         listenSites_;
+            std::unordered_map<AstLocal*, SignalInfo>      signals_;
+            std::deque<FireSite>                           fireSites_;
+            std::map<std::string, EventListeners, std::less<>> eventListeners_;
             uint32_t                                       haltSlot_ = 0;
             uint32_t                                       returnJumpSlot_ = 0;
         };
@@ -854,18 +900,22 @@ namespace UdonLuau {
                     Report(e.location, e.message);
                 }
             }
-            for (size_t i = 0; i < delaySites_.size(); ++i) {
+            auto guarded = [&](auto&& compile) {
                 try {
-                    CompileDelaySite(DelaySite(delaySites_[i]));
+                    compile();
                 } catch (const CompileError& e) {
                     Report(e.location, e.message);
                 }
-            }
-            for (const ChangeHandler& handler : changeHandlers_) {
-                try {
-                    CompileChangeHandler(handler);
-                } catch (const CompileError& e) {
-                    Report(e.location, e.message);
+            };
+            for (const ChangeHandler& handler : changeHandlers_) guarded([&] { CompileChangeHandler(handler); });
+            for (auto& [name, listeners] : eventListeners_) guarded([&] { EmitEventDispatch(listeners); });
+            for (size_t delays = 0, fires = 0; delays < delaySites_.size() || fires < fireSites_.size();) {
+                if (delays < delaySites_.size()) {
+                    guarded([&] { CompileDelaySite(DelaySite(delaySites_[delays])); });
+                    ++delays;
+                } else {
+                    guarded([&] { EmitFireBlock(fireSites_[fires]); });
+                    ++fires;
                 }
             }
             if (singleton_ && !singletonStarted_) {
@@ -1271,7 +1321,7 @@ namespace UdonLuau {
                 if (f->forceInline && f->noInline) Report(f->location, std::format("'{}' cannot be both @inline and @noinline", f->name));
                 if (f->async && f->noInline) Report(f->location, std::format("'{}' waits, so it is inlined into every caller and cannot be @noinline", f->name));
                 f->inlined = f->async || (!f->noInline && !f->delayTarget && f->calls > 0 && (f->forceInline || f->size <= kInlineBudget || (f->calls == 1 && !f->exported)));
-                f->trampoline = options_.compatibleExitReturn || f->async || !f->exported || (f->calls > 0 && !f->inlined);
+                f->trampoline = options_.compatibleExitReturn || f->async || !f->exported || (f->calls > 0 && !f->inlined) || (f->event && eventListeners_.contains(f->event->name));
             }
         }
 
@@ -1289,7 +1339,27 @@ namespace UdonLuau {
                 Function* self = f.get();
                 CallScan scan;
                 scan.onCall = [&](AstExprCall* c) {
-                    auto* index = c->self ? nullptr : CallTarget(c)->as<AstExprIndexName>();
+                    if (c->self) {
+                        auto* member = Unwrap(c->func)->as<AstExprIndexName>();
+                        std::string_view method = member ? member->index.value : "";
+                        if (SignalInfo* signal = member ? SignalOf(member->expr) : nullptr) {
+                            if (method == "Wait") self->async = true;
+                            Function* fn = method == "Connect" && c->args.size == 1 ? Callee(c->args.data[0]) : nullptr;
+                            if (fn) {
+                                fn->entered = true;
+                                if (!signal->connections.contains(fn)) signal->connections.emplace(fn, emit_.Hidden(types_.Boolean));
+                            }
+                        } else if (const EventInfo* event = member ? EventOf(member->expr) : nullptr; event && method == "Wait") {
+                            self->async = true;
+                            if (event->name != "Update" && event->name != "LateUpdate" && event->name != "FixedUpdate" && event->name != "PostLateUpdate") {
+                                auto [listeners, added] = eventListeners_.try_emplace(event->name);
+                                listeners->second.event = event;
+                                if (added) listeners->second.location = c->location;
+                            }
+                        }
+                        return;
+                    }
+                    auto* index = CallTarget(c)->as<AstExprIndexName>();
                     std::optional<std::string_view> library = index ? LibraryName(index->expr) : std::nullopt;
                     if (library && *library == "task") {
                         std::string_view name = index->index.value;
@@ -1319,6 +1389,21 @@ namespace UdonLuau {
             }
             for (ChangeHandler& h : changeHandlers_)
                 if (h.target) h.target->entered = true;
+            for (auto& [name, listeners] : eventListeners_) {
+                listeners.dispatch = emit_.NewLabel();
+                for (const auto& f : functions_)
+                    if (f->event == listeners.event) listeners.handler = f.get();
+                if (listeners.handler) {
+                    listeners.values = listeners.handler->parameters;
+                    continue;
+                }
+                if (name == "Interact" || name == "OnAnimatorMove" || name == "OnRenderObject" || name.starts_with("OnCollision"))
+                    Report(listeners.location, std::format("Events.{}:Wait() needs a handler for {} in this script: declaring the event changes how VRChat treats the object", name, name));
+                for (const EventParameter& p : listeners.event->parameters) {
+                    const Type* type = types_.Get(p.type);
+                    listeners.values.push_back({ emit_.AddSlot(LowerFirst(name) + UpperFirst(p.name), type), type });
+                }
+            }
             for (auto& f : functions_) {
                 if (f->delayTarget) f->entered = true;
                 for (const FieldAttribute& a : AnnotationsFor(f->location).attributes) {
@@ -1423,6 +1508,7 @@ namespace UdonLuau {
                         DeclareConstTable(var, table);
                         continue;
                     }
+                if (DeclareSignal(var, i < stat->values.size ? stat->values.data[i] : nullptr, exported)) continue;
                 const Type* type = var->annotation ? ResolveType(var->annotation) : nullptr;
                 if (type && type->IsList()) {
                     if (options_.staticPart) Fail(var->location, "a List cannot be static; use an array");
@@ -1625,7 +1711,10 @@ namespace UdonLuau {
             if (f.exported) {
                 emit_.Bind(f.exportedEntry);
                 entries_.push_back({ f.entryName, *emit_.AddressOf(f.exportedEntry) });
-                if (f.trampoline) emit_.Push(haltSlot_);
+                if (f.trampoline) {
+                    auto listening = f.event ? eventListeners_.find(f.event->name) : eventListeners_.end();
+                    emit_.Push(listening != eventListeners_.end() ? emit_.AddressConstant(listening->second.dispatch) : haltSlot_);
+                }
                 EmitEntryPrologue(f);
             }
             emit_.Bind(f.entry);
@@ -1825,12 +1914,226 @@ namespace UdonLuau {
             emit_.Push(emit_.AddressConstant(back));
             emit_.Jump(f->entry);
             emit_.Bind(back);
-            if (root_ && root_->Cancellable()) {
-                Label alive = emit_.NewLabel();
-                emit_.JumpIfFalse(root_->freeSlot, alive);
-                EmitYield();
-                emit_.Bind(alive);
+            EmitAliveCheck();
+        }
+
+        bool Compiler::DeclareSignal(AstLocal* var, AstExpr* init, bool exported) {
+            auto* ref = var->annotation ? var->annotation->as<AstTypeReference>() : nullptr;
+            bool annotated = ref && !ref->prefix && std::string_view(ref->name.value) == "Signal" && !typeAliases_.contains("Signal");
+            auto* call = init ? Unwrap(init)->as<AstExprCall>() : nullptr;
+            auto* ctor = call ? Unwrap(call->func)->as<AstExprGlobal>() : nullptr;
+            bool constructed = ctor && std::string_view(ctor->name.value) == "Signal" && !globalFunctions_.contains("Signal");
+            if (!annotated && !constructed) return false;
+            if (!constructed || call->args.size) Fail(var->location, "create a signal with Signal(), e.g. 'local hit: Signal<VRCPlayerApi> = Signal()'");
+            if (var->annotation && !annotated) Fail(var->annotation->location, "a signal's type is Signal<...>");
+            if (options_.staticPart) Fail(var->location, "signals cannot be static");
+            SignalInfo info;
+            info.name = var->name.value;
+            info.exported = exported;
+            if (annotated) {
+                for (const AstTypeOrPack& p : ref->parameters) {
+                    if (!p.type) Fail(ref->location, "a signal's values are listed as types, e.g. Signal<VRCPlayerApi, number>");
+                    const Type* type = ResolveType(p.type);
+                    if (type->IsList()) Fail(p.type->location, "a signal cannot carry a List; pass an array");
+                    info.types.push_back(type);
+                }
             }
+            signals_[var] = std::move(info);
+            return true;
+        }
+
+        SignalInfo* Compiler::SignalOf(AstExpr* expr) {
+            auto* l = Unwrap(expr)->as<AstExprLocal>();
+            if (!l) return nullptr;
+            auto it = signals_.find(l->local);
+            return it == signals_.end() ? nullptr : &it->second;
+        }
+
+        const EventInfo* Compiler::EventOf(AstExpr* expr) const {
+            auto* index = Unwrap(expr)->as<AstExprIndexName>();
+            auto* owner = index ? Unwrap(index->expr)->as<AstExprGlobal>() : nullptr;
+            if (!owner || std::string_view(owner->name.value) != "Events" || globalFunctions_.contains("Events") || defines_.contains("Events")) return nullptr;
+            return catalog_.FindEvent(index->index.value);
+        }
+
+        std::optional<std::vector<Value>> Compiler::CallListenable(AstExprCall* call, size_t want) {
+            auto* index = call->self ? Unwrap(call->func)->as<AstExprIndexName>() : nullptr;
+            if (!index) return std::nullopt;
+            std::string_view method = index->index.value;
+            const Location& location = call->location;
+            if (SignalInfo* signal = SignalOf(index->expr)) {
+                if (method == "Wait") {
+                    if (call->args.size) Fail(location, "Wait takes no arguments");
+                    return EmitListen(signal->types, signal->sites, want, location);
+                }
+                if (method == "Fire") {
+                    if (call->args.size != signal->types.size()) Fail(location, std::format("'{}' carries {} value(s), got {}", signal->name, signal->types.size(), call->args.size));
+                    FireSite fire;
+                    fire.signal = signal;
+                    fire.block = emit_.NewLabel();
+                    fire.back = emit_.NewLabel();
+                    fire.location = location;
+                    for (size_t i = 0; i < call->args.size; ++i) {
+                        const Type* type = signal->types[i];
+                        Value v = CompileExpr(call->args.data[i], type);
+                        if (Cost(v, type) < 0) Fail(call->args.data[i]->location, std::format("value {} of '{}' must be {}, got {}", i + 1, signal->name, type->displayName, Describe(v)));
+                        Variable held{ emit_.Temp(type), type };
+                        Store(v, held, location);
+                        fire.values.push_back(Value::OfSlot(held.slot, type));
+                    }
+                    emit_.Jump(fire.block);
+                    emit_.Bind(fire.back);
+                    fireSites_.push_back(std::move(fire));
+                    EmitAliveCheck();
+                    return std::vector<Value>{};
+                }
+                if (method == "Connect" || method == "Disconnect") {
+                    Function* fn = call->args.size == 1 ? Callee(call->args.data[0]) : nullptr;
+                    if (!fn) Fail(location, std::format("{} takes a function of this script", method));
+                    if (fn->parameters.size() != signal->types.size() ||
+                        !std::ranges::equal(fn->parameters, signal->types, [](const Variable& p, const Type* t) { return p.type == t; }))
+                        Fail(location, std::format("'{}' must take the values '{}' carries", fn->name, signal->name));
+                    auto connection = signal->connections.find(fn);
+                    if (connection == signal->connections.end()) {
+                        if (method == "Disconnect") return std::vector<Value>{};
+                        connection = signal->connections.emplace(fn, emit_.Hidden(types_.Boolean)).first;
+                    }
+                    emit_.Copy(TruthySlot(Value::OfBoolean(method == "Connect"), location), connection->second);
+                    return std::vector<Value>{};
+                }
+                Fail(location, std::format("signals have Wait, Fire, Connect and Disconnect, not '{}'", method));
+            }
+            if (const EventInfo* event = EventOf(index->expr)) {
+                if (method != "Wait") Fail(location, std::format("Events.{} only has Wait", event->name));
+                if (call->args.size) Fail(location, "Wait takes no arguments");
+                for (std::string_view frameEvent : { "Update", "LateUpdate", "FixedUpdate", "PostLateUpdate" }) {
+                    if (event->name != frameEvent) continue;
+                    const Type* timing = types_.Get("VRCUdonCommonEnumsEventTiming");
+                    const EnumMember* member = nullptr;
+                    if (timing && timing->info)
+                        for (const EnumMember& m : timing->info->enumMembers)
+                            if (m.name == frameEvent) member = &m;
+                    if (!member) Fail(location, std::format("this SDK has no EventTiming.{}", frameEvent));
+                    return EmitWait(true, Value::OfInteger(1), Value::OfInteger(member->value, timing), 0, location);
+                }
+                EventListeners& listeners = eventListeners_.at(event->name);
+                std::vector<const Type*> types;
+                for (const Variable& v : listeners.values) types.push_back(v.type);
+                return EmitListen(types, listeners.sites, want, location);
+            }
+            return std::nullopt;
+        }
+
+        std::vector<Value> Compiler::EmitListen(const std::vector<const Type*>& types, std::vector<ListenSite*>& registry, size_t want, const Location& location) {
+            Function* root = root_;
+            if (!root) Fail(location, "waits can only be used in events, public methods and functions they call or start");
+            ListenSite& site = listenSites_.emplace_back();
+            site.root = root;
+            site.waiting = emit_.Hidden(types_.Boolean);
+            site.taken = emit_.Hidden(types_.Boolean);
+            site.direct = emit_.NewLabel();
+            for (const Type* t : types) site.results.push_back({ emit_.Hidden(t), t });
+            root->waitFlags.push_back(site.waiting);
+            root->waitFlags.push_back(site.taken);
+            registry.push_back(&site);
+
+            emit_.Copy(TruthySlot(Value::OfBoolean(true), location), site.waiting);
+            if (root->lineSlot) emit_.Copy(Materialize(Value::OfInteger(location.begin.line + 1), types_.Int32, location), root->lineSlot);
+            if (root->reentry != Reentry::Ignore) emit_.Copy(TruthySlot(Value::OfBoolean(true), location), root->freeSlot);
+            EmitYield();
+            emit_.Bind(site.direct);
+            if (root->reentry != Reentry::Ignore) emit_.Copy(TruthySlot(Value::OfBoolean(false), location), root->freeSlot);
+            std::vector<Value> out;
+            for (size_t i = 0; i < std::min(want, site.results.size()); ++i) out.push_back(Value::OfSlot(site.results[i].slot, site.results[i].type));
+            return out;
+        }
+
+        void Compiler::EmitDispatch(const std::vector<ListenSite*>& sites, const std::vector<Value>& values, const std::map<Function*, uint32_t>& connections, const Location& location) {
+            uint32_t yes = TruthySlot(Value::OfBoolean(true), location);
+            uint32_t no = TruthySlot(Value::OfBoolean(false), location);
+            uint32_t busy = emit_.Hidden(types_.Boolean);
+            Label start = emit_.NewLabel();
+            Label done = emit_.NewLabel();
+            emit_.JumpIfFalse(busy, start);
+            if (DebugBuild()) CallStatic(types_.Get("UnityEngineDebug"), "LogWarning", { Value::OfString(std::format("[UdonLuau] line {}: fired again while it was still being handled; ignored", location.begin.line + 1)) }, nullptr, location);
+            emit_.Jump(done);
+            emit_.Bind(start);
+            emit_.Copy(yes, busy);
+            std::vector<uint32_t> snapshots;
+            for (const ListenSite* site : sites) {
+                uint32_t snapshot = emit_.Hidden(types_.Boolean);
+                snapshots.push_back(snapshot);
+                Label idle = emit_.NewLabel();
+                Label next = emit_.NewLabel();
+                emit_.JumpIfFalse(site->waiting, idle);
+                emit_.Copy(no, site->waiting);
+                emit_.Copy(yes, site->taken);
+                emit_.Copy(yes, snapshot);
+                emit_.Jump(next);
+                emit_.Bind(idle);
+                emit_.Copy(no, snapshot);
+                emit_.Bind(next);
+            }
+            for (size_t i = 0; i < sites.size(); ++i) {
+                const ListenSite* site = sites[i];
+                Label next = emit_.NewLabel();
+                Label back = emit_.NewLabel();
+                emit_.JumpIfFalse(snapshots[i], next);
+                emit_.JumpIfFalse(site->taken, next);
+                emit_.Copy(no, site->taken);
+                for (size_t j = 0; j < site->results.size(); ++j) emit_.Copy(values[j].slot, site->results[j].slot);
+                emit_.Push(emit_.AddressConstant(back));
+                emit_.Jump(site->direct);
+                emit_.Bind(back);
+                emit_.Bind(next);
+            }
+            for (const auto& [fn, flag] : connections) {
+                Label next = emit_.NewLabel();
+                emit_.JumpIfFalse(flag, next);
+                EnterRoot(fn, values, location);
+                emit_.Bind(next);
+            }
+            emit_.Copy(no, busy);
+            emit_.Bind(done);
+        }
+
+        void Compiler::EmitFireBlock(const FireSite& fire) {
+            current_ = nullptr;
+            root_ = nullptr;
+            emit_.ResetTemps();
+            emit_.Bind(fire.block);
+            EmitDispatch(fire.signal->sites, fire.values, fire.signal->connections, fire.location);
+            emit_.Jump(fire.back);
+        }
+
+        void Compiler::EmitEventDispatch(EventListeners& listeners) {
+            current_ = nullptr;
+            root_ = nullptr;
+            emit_.ResetTemps();
+            Location location;
+            if (listeners.handler) {
+                location = listeners.handler->location;
+                for (size_t i = 0; i < listeners.handler->parameters.size(); ++i)
+                    if (!listeners.handler->async && assigned_.contains(listeners.handler->node->args.data[i]))
+                        Fail(location, std::format("Events.{}:Wait() passes on {}'s parameters, so the handler cannot assign them; copy into a local instead", listeners.event->name, listeners.event->name));
+            } else {
+                Label entry = emit_.NewLabel();
+                emit_.Bind(entry);
+                entries_.push_back({ "_" + LowerFirst(listeners.event->name), *emit_.AddressOf(entry) });
+            }
+            emit_.Bind(listeners.dispatch);
+            std::vector<Value> values;
+            for (const Variable& v : listeners.values) values.push_back(Value::OfSlot(v.slot, v.type));
+            EmitDispatch(listeners.sites, values, {}, location);
+            emit_.JumpTo(0xFFFFFFFFu);
+        }
+
+        void Compiler::EmitAliveCheck() {
+            if (!root_ || !root_->Cancellable()) return;
+            Label alive = emit_.NewLabel();
+            emit_.JumpIfFalse(root_->freeSlot, alive);
+            EmitYield();
+            emit_.Bind(alive);
         }
 
         void Compiler::EmitYield() {
@@ -3117,6 +3420,7 @@ namespace UdonLuau {
                 std::optional<std::string_view> library = LibraryName(index->expr);
                 if (library && *library == "task") return CallTask(call, index->index.value, want);
             }
+            if (auto listened = CallListenable(call, want)) return std::move(*listened);
             if (auto* g = func->as<AstExprGlobal>(); g && g->name == "assert" && !globalFunctions_.contains("assert")) {
                 CompileAssert(call);
                 return {};
