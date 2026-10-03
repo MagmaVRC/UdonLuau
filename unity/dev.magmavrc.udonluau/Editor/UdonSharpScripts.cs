@@ -113,13 +113,11 @@ namespace Magma.VRC.UdonLuau
             }
 
             var publicMethods = type.GetMethods(BindingFlags.Instance | BindingFlags.Public)
-                .Where(m => IsUserType(m.DeclaringType) && !m.IsSpecialName && !m.IsGenericMethod && !IsEvent(m))
+                .Where(m => IsUserType(m.DeclaringType) && (!m.IsSpecialName || IsPropertyAccessor(m)) && !m.IsGenericMethod && !IsEvent(m))
                 .ToList();
-            var overloaded = new HashSet<string>(publicMethods.GroupBy(m => m.Name).Where(g => g.Count() > 1).Select(g => g.Key));
 
             foreach (MethodInfo method in publicMethods)
             {
-                if (overloaded.Contains(method.Name)) continue;
                 MethodInfo root = method;
                 for (MethodInfo up = Overridden(root); up != null && IsUserType(up.DeclaringType); up = Overridden(up)) root = up;
                 if (!layouts.TryGetValue(root, out Layout layout)) continue;
@@ -185,6 +183,9 @@ namespace Magma.VRC.UdonLuau
                 Symbol = symbol,
             };
         }
+
+        private static bool IsPropertyAccessor(MethodInfo method) =>
+            method.DeclaringType.GetProperties(Declared).Any(p => p.GetIndexParameters().Length == 0 && (p.GetMethod == method || p.SetMethod == method));
 
         private static bool IsUserType(Type type) => type != null && type != typeof(UdonSharpBehaviour) && typeof(UdonSharpBehaviour).IsAssignableFrom(type);
 

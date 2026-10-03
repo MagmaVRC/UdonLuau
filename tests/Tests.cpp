@@ -1059,6 +1059,37 @@ end
             "static code cannot use instance fields");
     });
 
+    Case("UdonSharp overloads and properties", [] {
+        Fixture f = MakeFixture();
+        ScriptInfo manager;
+        manager.name = "Manager";
+        manager.methods.push_back({ "Has", "__0_Has", { { "id", "SystemInt32", "", "__0_id__param" } }, { { "result", "SystemBoolean", "", "__0___0_Has__ret" } }, false });
+        manager.methods.push_back({ "Has", "__1_Has", { { "key", "SystemString", "", "__0_key__param" } }, { { "result", "SystemBoolean", "", "__0___1_Has__ret" } }, false });
+        manager.methods.push_back({ "get_Ready", "get_Ready", {}, { { "result", "SystemBoolean", "", "__0_get_Ready__ret" } }, false });
+        manager.methods.push_back({ "set_Level", "__0_set_Level", { { "value", "SystemInt32", "", "__0_value__param" } }, {}, false });
+        f.catalog.AddScript(manager);
+        auto p = Build(f, R"(
+export local manager: Manager
+local a = false
+local b = false
+local ready = false
+function Start()
+    a = manager:Has(3)
+    b = manager:Has("admin")
+    ready = manager.Ready
+    manager.Level = 2
+end
+)");
+        Check(p.has_value(), "compiles");
+        if (!p) return;
+        auto hasText = [&](std::string_view text) { return std::ranges::any_of(p->heap, [&](const HeapSlot& s) { return s.value.text == text; }); };
+        Check(hasText("__0_Has") && hasText("__1_Has"), "each overload is called through its own entry point");
+        Check(hasText("get_Ready") && hasText("__0_get_Ready__ret"), "a property read calls the getter");
+        Check(hasText("__0_set_Level") && hasText("__0_value__param"), "a property write calls the setter");
+        std::string defs = GenerateDefinitions(f.catalog);
+        Check(defs.find("    Ready: boolean\n") != std::string::npos && defs.find("get_Ready") == std::string::npos, "luau-lsp sees properties, not accessors");
+    });
+
     Case("event returns, entry names and own network calls", [] {
         Fixture f = MakeFixture();
         f.Extern("SystemString.__Split__SystemCharArray__SystemStringArray", true, [](auto&, auto&) {});

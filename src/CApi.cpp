@@ -72,8 +72,8 @@ namespace {
     }
 
     UdonLuau::ScriptMethod* FindMethod(UdonLuau::ScriptInfo& script, const char* method) {
-        auto it = std::find_if(script.methods.begin(), script.methods.end(), [&](const UdonLuau::ScriptMethod& m) { return m.name == method; });
-        return it == script.methods.end() ? nullptr : &*it;
+        auto it = std::find_if(script.methods.rbegin(), script.methods.rend(), [&](const UdonLuau::ScriptMethod& m) { return m.name == method; });
+        return it == script.methods.rend() ? nullptr : &*it;
     }
 
     UdonLuau::CompileOptions Options(const char* defines, const char* scriptName, int32_t staticPart) {

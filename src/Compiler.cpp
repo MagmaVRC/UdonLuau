@@ -288,6 +288,7 @@ namespace UdonLuau {
             std::vector<Value>   queues;
             std::optional<Value> due;
             Function*            own = nullptr;
+            const ScriptMethod*  scriptMethod = nullptr;
         };
 
         struct Annotations {
@@ -613,6 +614,7 @@ namespace UdonLuau {
             void Store(const Value& value, const Variable& destination, const Location& location);
             Value Evaluate(const Value& value);
             Function* Callee(AstExpr* func) const;
+            const ScriptMethod* PickScriptMethod(const ScriptInfo* script, std::string_view name, const std::vector<Value>& args, const Location& location);
             struct ListInit {
                 bool                   ok = false;
                 std::vector<AstExpr*>  items;
@@ -993,6 +995,35 @@ namespace UdonLuau {
                 info.methods.push_back(std::move(m));
             }
             return info;
+        }
+
+        const ScriptMethod* Compiler::PickScriptMethod(const ScriptInfo* script, std::string_view name, const std::vector<Value>& args, const Location& location) {
+            const ScriptMethod* best = nullptr;
+            int bestCost = std::numeric_limits<int>::max();
+            int candidates = 0;
+            bool ambiguous = false;
+            for (const ScriptMethod& m : script->methods) {
+                if (m.name != name) continue;
+                ++candidates;
+                if (m.parameters.size() != args.size()) continue;
+                int total = 0;
+                for (size_t i = 0; i < args.size() && total >= 0; ++i) {
+                    int c = Cost(args[i], VariableType(m.parameters[i]));
+                    total = c < 0 ? -1 : total + c;
+                }
+                if (total < 0) continue;
+                if (total < bestCost) {
+                    best = &m;
+                    bestCost = total;
+                    ambiguous = false;
+                } else if (total == bestCost) {
+                    ambiguous = true;
+                }
+            }
+            if (candidates <= 1) return candidates ? &*std::ranges::find(script->methods, name, &ScriptMethod::name) : nullptr;
+            if (!best) Fail(location, std::format("no overload of {}.{} takes these {} argument(s)", script->name, name, args.size()));
+            if (ambiguous) Fail(location, std::format("call to {}.{} is ambiguous between overloads", script->name, name));
+            return best;
         }
 
         std::vector<Value> Compiler::CallScriptMethod(const Value& receiver, const ScriptMethod& method, const std::vector<Value>& args, size_t want, const Location& location) {
@@ -1714,6 +1745,11 @@ namespace UdonLuau {
                     CallMember(Value::OfSlot(owner.slot, types_.Behaviour()), "SetProgramVariable", { Value::OfString(field->symbol), v }, nullptr, location);
                     return;
                 }
+                auto propertySetter = std::ranges::find(script->methods, "set_" + std::string(name), &ScriptMethod::name);
+                if (propertySetter != script->methods.end() && propertySetter->parameters.size() == 1) {
+                    CallScriptMethod(owner, *propertySetter, { value }, 0, location);
+                    return;
+                }
             }
             if (owner.type->IsValueType() && emit_.IsConstant(owner.slot))
                 Fail(location, std::format("cannot modify '{}' of a constant {}", name, owner.type->displayName));
@@ -2317,6 +2353,9 @@ namespace UdonLuau {
                 const ScriptInfo* script = owner.type->script;
                 auto field = std::ranges::find(script->fields, name, &ScriptVariable::name);
                 if (field != script->fields.end()) return ReadScriptField(owner, *field, location);
+                auto getter = std::ranges::find(script->methods, "get_" + std::string(name), &ScriptMethod::name);
+                if (getter != script->methods.end() && getter->parameters.empty() && getter->returns.size() == 1)
+                    return CallScriptMethod(owner, *getter, {}, 1, location).at(0);
                 if (std::ranges::find(script->methods, name, &ScriptMethod::name) != script->methods.end())
                     Fail(location, std::format("'{}' is a method; call it with 'value:{}()'", name, name));
             }
@@ -2737,11 +2776,9 @@ namespace UdonLuau {
                 if (receiver.kind == Value::Kind::Slot && receiver.type->IsList()) return CallList(receiver, name, std::move(args), call->location);
                 if (receiver.kind == Value::Kind::Network) return SendNetwork(receiver, name, std::move(args), call->location);
                 if (receiver.kind == Value::Kind::Delayed) return CallDelayed(receiver, name, std::move(args), call->location);
-                if (receiver.kind == Value::Kind::Slot && receiver.type->script) {
-                    const ScriptInfo* script = receiver.type->script;
-                    auto method = std::ranges::find(script->methods, name, &ScriptMethod::name);
-                    if (method != script->methods.end()) return CallScriptMethod(receiver, *method, args, want, call->location);
-                }
+                if (receiver.kind == Value::Kind::Slot && receiver.type->script)
+                    if (const ScriptMethod* method = PickScriptMethod(receiver.type->script, name, args, call->location))
+                        return CallScriptMethod(receiver, *method, args, want, call->location);
                 if (receiver.kind == Value::Kind::TypeRef || receiver.kind == Value::Kind::Namespace)
                     Fail(call->location, "use '.' to call static methods");
                 if (receiver.kind == Value::Kind::Nil || receiver.kind == Value::Kind::Function || receiver.kind == Value::Kind::None)
@@ -2863,6 +2900,7 @@ namespace UdonLuau {
 
             std::vector<const Type*> types;
             Function* own = nullptr;
+            const ScriptMethod* scriptMethod = nullptr;
             std::string entry(name);
             if (network) {
                 if (const ScriptMethod* method = NetworkMethod(target, name, args.size(), location)) {
@@ -2877,11 +2915,11 @@ namespace UdonLuau {
                 if (args.size() != own->parameters.size()) Fail(location, std::format("'{}' takes {} argument(s), got {}", name, own->parameters.size(), args.size()));
                 for (const Variable& p : own->parameters) types.push_back(p.type);
             } else if (const ScriptInfo* script = target.type->script) {
-                auto method = std::ranges::find(script->methods, name, &ScriptMethod::name);
-                if (method == script->methods.end()) Fail(location, std::format("{} has no public method '{}'", script->name, name));
-                if (args.size() != method->parameters.size()) Fail(location, std::format("'{}' takes {} argument(s), got {}", name, method->parameters.size(), args.size()));
-                for (const ScriptVariable& p : method->parameters) types.push_back(VariableType(p));
-                entry = method->entryPoint;
+                scriptMethod = PickScriptMethod(script, name, args, location);
+                if (!scriptMethod) Fail(location, std::format("{} has no public method '{}'", script->name, name));
+                if (args.size() != scriptMethod->parameters.size()) Fail(location, std::format("'{}' takes {} argument(s), got {}", name, scriptMethod->parameters.size(), args.size()));
+                for (const ScriptVariable& p : scriptMethod->parameters) types.push_back(VariableType(p));
+                entry = scriptMethod->entryPoint;
             } else if (!args.empty()) {
                 Fail(location, "a delayed call with arguments needs a typed script reference; a plain UdonBehaviour only takes delayed calls without arguments");
             }
@@ -2909,6 +2947,7 @@ namespace UdonLuau {
             site.target = target;
             site.method = std::string(name);
             site.own = own;
+            site.scriptMethod = scriptMethod;
             auto queue = [&](const Type* type) {
                 std::string symbol = std::format("{}_{}", site.entry, site.queues.size());
                 HeapValue empty;
@@ -3001,8 +3040,7 @@ namespace UdonLuau {
             } else if (site.own) {
                 CallFunction(site.own, std::move(values), 0, location, nullptr);
             } else {
-                auto method = std::ranges::find(target.type->script->methods, site.method, &ScriptMethod::name);
-                CallScriptMethod(target, *method, values, 0, location);
+                CallScriptMethod(target, *site.scriptMethod, values, 0, location);
             }
             emit_.JumpTo(0xFFFFFFFFu);
         }

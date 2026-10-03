@@ -329,10 +329,19 @@ namespace UdonLuau {
                     std::string target = scriptNames.contains(v.script) ? v.script : ClassName(behaviour);
                     return v.type.ends_with("Array") ? "{" + target + "}" : target;
                 };
+                std::set<std::string> members;
                 for (const ScriptVariable& f : script->fields)
-                    if (IsIdentifier(f.name)) out_ += std::format("    {}: {}\n", f.name, variableType(f));
+                    if (IsIdentifier(f.name) && members.insert(f.name).second) out_ += std::format("    {}: {}\n", f.name, variableType(f));
                 for (const ScriptMethod& m : script->methods) {
-                    if (!IsIdentifier(m.name)) continue;
+                    bool getter = m.name.starts_with("get_") && m.parameters.empty() && m.returns.size() == 1;
+                    bool setter = m.name.starts_with("set_") && m.parameters.size() == 1;
+                    if (!getter && !setter) continue;
+                    std::string property = m.name.substr(4);
+                    if (IsIdentifier(property) && members.insert(property).second)
+                        out_ += std::format("    {}: {}\n", property, variableType(getter ? m.returns[0] : m.parameters[0]));
+                }
+                for (const ScriptMethod& m : script->methods) {
+                    if (!IsIdentifier(m.name) || m.name.starts_with("get_") || m.name.starts_with("set_") || !members.insert(m.name).second) continue;
                     std::string params = "self";
                     for (const ScriptVariable& p : m.parameters) params += std::format(", {}: {}", IsIdentifier(p.name) ? p.name : "value", variableType(p));
                     std::string returns = "()";
