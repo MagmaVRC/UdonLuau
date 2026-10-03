@@ -180,6 +180,15 @@ UDONLUAU_API ul_result* ul_compile(const ul_catalog* catalog, const char* source
 /// <summary>Compiles with compile-time defines given as ';'-separated NAME=value pairs, for example "DEBUG=true;LEVEL=3".</summary>
 UDONLUAU_API ul_result* ul_compile_with_defines(const ul_catalog* catalog, const char* source, size_t length, const char* defines);
 
+/// <summary>Compiles one part of a module: its per-instance program (static_part 0) or the companion singleton holding its static fields and functions (static_part 1). script_name is the script's name; statics live in a companion singleton named script_name + ".Static".</summary>
+UDONLUAU_API ul_result* ul_compile_part(const ul_catalog* catalog, const char* source, size_t length, const char* defines, const char* script_name, int32_t static_part);
+
+/// <summary>Reads the public interface of one part of a module, as ul_compile_part would compile it.</summary>
+UDONLUAU_API ul_result* ul_extract_interface_part(const ul_catalog* catalog, const char* source, size_t length, const char* defines, const char* script_name, int32_t static_part);
+
+/// <summary>Whether the module declares static fields or functions, so its companion singleton must also be compiled and placed.</summary>
+UDONLUAU_API int32_t ul_result_has_statics(const ul_result* result);
+
 /// <summary>Destroys a result and every string it returned.</summary>
 UDONLUAU_API void ul_result_destroy(ul_result* result);
 

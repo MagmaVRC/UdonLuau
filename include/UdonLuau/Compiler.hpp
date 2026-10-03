@@ -31,12 +31,21 @@ namespace UdonLuau {
     /// name is used, so code behind a false define is never compiled.</summary>
     struct CompileOptions {
         std::map<std::string, std::string, std::less<>> defines;
+        /// <summary>The script's name. Needed when the module declares statics, which live in a companion singleton named after it.</summary>
+        std::string scriptName;
+        /// <summary>Compile the module's static declarations as its companion singleton instead of the per-instance program.</summary>
+        bool staticPart = false;
     };
+
+    /// <summary>The name of the companion singleton that holds a script's static fields and functions.</summary>
+    inline std::string StaticCompanionName(std::string_view scriptName) { return std::string(scriptName) + ".Static"; }
 
     struct CompileResult {
         std::optional<Program>    program;
         std::optional<ScriptInfo> scriptInterface;
         std::vector<Diagnostic>   diagnostics;
+        /// <summary>Whether the module declares static fields or functions, so the host must also compile and place its companion.</summary>
+        bool                      hasStatics = false;
 
         [[nodiscard]] bool Succeeded() const { return program.has_value(); }
     };

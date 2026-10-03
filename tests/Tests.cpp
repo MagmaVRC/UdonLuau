@@ -946,6 +946,70 @@ end
         Check(std::get<int32_t>(userMachine.Var("seen")) == 5, "fields read through the singleton");
     });
 
+    Case("statics", [] {
+        Fixture f = MakeFixture();
+        f.Extern("UnityEngineGameObject.__Find__SystemString__UnityEngineGameObject", false, [](auto& h, auto& p) { h[p[1]] = BehaviourRef{ 0 }; });
+        f.Extern("UnityEngineGameObject.__GetComponent__SystemType__UnityEngineComponent", true, [](auto& h, auto& p) { h[p[2]] = h[p[0]]; });
+        const char* source = R"(
+-- @static
+local alive: int = 0
+
+-- @static
+local function Register(n: int)
+    alive += n
+end
+
+const BONUS = 3
+export local health: int = 100
+
+function Start()
+    Register(2)
+    health = alive + BONUS
+end
+)";
+        CompileOptions instanceOptions;
+        instanceOptions.scriptName = "Enemy";
+        CompileOptions staticOptions = instanceOptions;
+        staticOptions.staticPart = true;
+
+        CompileResult face = ExtractInterface(f.catalog, source, staticOptions);
+        Check(face.hasStatics && face.scriptInterface && face.scriptInterface->singleton, "the static part is a singleton");
+        if (!face.scriptInterface) return;
+        ScriptInfo companion = *face.scriptInterface;
+        companion.name = StaticCompanionName("Enemy");
+        Check(companion.fields.size() == 1 && companion.methods.size() == 1, "only statics are in the companion");
+        f.catalog.AddScript(companion);
+
+        CompileResult instanceFace = ExtractInterface(f.catalog, source, instanceOptions);
+        Check(instanceFace.scriptInterface && instanceFace.scriptInterface->fields.size() == 1 && instanceFace.scriptInterface->fields[0].name == "health",
+            "only instance members are in the script's interface");
+
+        auto shared = Build(f, source, staticOptions);
+        auto enemy = Build(f, source, instanceOptions);
+        Check(shared && enemy, "both parts compile");
+        if (!shared || !enemy) return;
+        Check(std::ranges::none_of(shared->heap, [](const HeapSlot& s) { return s.symbol == "health"; }) &&
+                  std::ranges::none_of(enemy->heap, [](const HeapSlot& s) { return s.symbol == "alive"; }),
+            "each part holds only its own fields");
+
+        Machine sharedMachine(f, *shared);
+        Machine first(f, *enemy);
+        Machine second(f, *enemy);
+        g_machines = { &sharedMachine, &first, &second };
+        for (Machine* m : { &first, &second }) {
+            m->Var("__singleton_Enemy.Static") = BehaviourRef{ 0 };
+            m->Var("__singletons_ready") = true;
+        }
+        sharedMachine.Run("_start");
+        first.Run("_start");
+        second.Run("_start");
+        Check(std::get<int32_t>(sharedMachine.Var("alive")) == 4, "two instances share one static counter");
+        Check(std::get<int32_t>(first.Var("health")) == 5 && std::get<int32_t>(second.Var("health")) == 7, "instances read the shared value");
+
+        Check(HasError(f, "local hp: int = 1\n-- @static\nlocal function Hurt()\n    hp -= 1\nend\n", "is not static", staticOptions),
+            "static code cannot use instance fields");
+    });
+
     Case("negated conditions branch without an extern", [] {
         Fixture f = MakeFixture();
         auto p = Build(f, R"(

@@ -76,6 +76,35 @@ namespace {
         return it == script.methods.end() ? nullptr : &*it;
     }
 
+    UdonLuau::CompileOptions Options(const char* defines, const char* scriptName, int32_t staticPart) {
+        UdonLuau::CompileOptions options;
+        for (const std::string& pair : SplitList(defines)) {
+            size_t eq = pair.find('=');
+            options.defines[pair.substr(0, eq)] = eq == std::string::npos ? "true" : pair.substr(eq + 1);
+        }
+        options.scriptName = scriptName ? scriptName : "";
+        options.staticPart = staticPart != 0;
+        return options;
+    }
+
+    ul_result* Run(const ul_catalog* catalog, const char* source, size_t length, const UdonLuau::CompileOptions& options, bool interfaceOnly) {
+        auto* r = new (std::nothrow) ul_result();
+        if (!r) return nullptr;
+        if (!catalog) {
+            r->result.diagnostics.push_back({ UdonLuau::Severity::Error, "no catalog" });
+            return r;
+        }
+        std::string_view text(source ? source : "", source ? length : 0);
+        try {
+            r->result = interfaceOnly ? UdonLuau::ExtractInterface(catalog->catalog, text, options) : UdonLuau::Compile(catalog->catalog, text, options);
+        } catch (const std::exception& e) {
+            r->result = {};
+            r->result.diagnostics.push_back({ UdonLuau::Severity::Error, std::string("internal compiler error: ") + e.what() });
+        }
+        if (r->result.program) r->bytes = r->result.program->ByteCode();
+        return r;
+    }
+
 } // namespace
 
 extern "C" {
@@ -199,24 +228,19 @@ int32_t ul_catalog_set_script_method_network_callable(ul_catalog* catalog, const
 }
 
 ul_result* ul_extract_interface(const ul_catalog* catalog, const char* source, size_t length, const char* defines) {
-    auto* r = new (std::nothrow) ul_result();
-    if (!r) return nullptr;
-    if (!catalog) {
-        r->result.diagnostics.push_back({ UdonLuau::Severity::Error, "no catalog" });
-        return r;
-    }
-    UdonLuau::CompileOptions options;
-    for (const std::string& pair : SplitList(defines)) {
-        size_t eq = pair.find('=');
-        options.defines[pair.substr(0, eq)] = eq == std::string::npos ? "true" : pair.substr(eq + 1);
-    }
-    try {
-        r->result = UdonLuau::ExtractInterface(catalog->catalog, std::string_view(source ? source : "", source ? length : 0), options);
-    } catch (const std::exception& e) {
-        r->result = {};
-        r->result.diagnostics.push_back({ UdonLuau::Severity::Error, std::string("internal compiler error: ") + e.what() });
-    }
-    return r;
+    return Run(catalog, source, length, Options(defines, nullptr, 0), true);
+}
+
+ul_result* ul_extract_interface_part(const ul_catalog* catalog, const char* source, size_t length, const char* defines, const char* script_name, int32_t static_part) {
+    return Run(catalog, source, length, Options(defines, script_name, static_part), true);
+}
+
+ul_result* ul_compile_part(const ul_catalog* catalog, const char* source, size_t length, const char* defines, const char* script_name, int32_t static_part) {
+    return Run(catalog, source, length, Options(defines, script_name, static_part), false);
+}
+
+int32_t ul_result_has_statics(const ul_result* result) {
+    return result && result->result.hasStatics ? 1 : 0;
 }
 
 void ul_catalog_set_preferred_namespaces(ul_catalog* catalog, const char* namespaces) {
@@ -228,25 +252,7 @@ ul_result* ul_compile(const ul_catalog* catalog, const char* source, size_t leng
 }
 
 ul_result* ul_compile_with_defines(const ul_catalog* catalog, const char* source, size_t length, const char* defines) {
-    UdonLuau::CompileOptions options;
-    for (const std::string& pair : SplitList(defines)) {
-        size_t eq = pair.find('=');
-        options.defines[pair.substr(0, eq)] = eq == std::string::npos ? "true" : pair.substr(eq + 1);
-    }
-    auto* r = new (std::nothrow) ul_result();
-    if (!r) return nullptr;
-    if (!catalog) {
-        r->result.diagnostics.push_back({ UdonLuau::Severity::Error, "no catalog" });
-        return r;
-    }
-    try {
-        r->result = UdonLuau::Compile(catalog->catalog, std::string_view(source ? source : "", source ? length : 0), options);
-    } catch (const std::exception& e) {
-        r->result = {};
-        r->result.diagnostics.push_back({ UdonLuau::Severity::Error, std::string("internal compiler error: ") + e.what() });
-    }
-    if (r->result.program) r->bytes = r->result.program->ByteCode();
-    return r;
+    return Run(catalog, source, length, Options(defines, nullptr, 0), false);
 }
 
 void ul_result_destroy(ul_result* result) {

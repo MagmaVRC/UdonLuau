@@ -518,7 +518,7 @@ namespace UdonLuau {
             void Report(const Location& location, std::string message, Severity severity = Severity::Error);
 
             void DeclareModule(AstStatBlock* root);
-            void DeclareFields(AstStatLocal* stat);
+            void DeclareFields(AstStatLocal* stat, bool aliasesOnly = false);
             void DeclareFunction(std::string name, AstExprFunction* node, const Location& location, AstLocal* local);
             void CheckUserName(std::string_view name, const Location& location);
             void CompileFunction(Function& f);
@@ -624,6 +624,8 @@ namespace UdonLuau {
             std::vector<Value> CallDelayed(const Value& receiver, std::string_view name, std::vector<Value> args, const Location& location);
             void CompileDelaySite(const DelaySite& site);
             void FindSingletonUses(AstStatBlock* root);
+            Value StaticCompanion(const Location& location);
+            void CheckInstanceUse(AstLocal* local, const Location& location) const;
             void EmitEntryPrologue(const Function& f);
             void EmitSingletonResolver();
             std::optional<std::string_view> LibraryName(AstExpr* expr);
@@ -696,6 +698,10 @@ namespace UdonLuau {
                 bool              methods = false;
             };
             bool                                           singleton_ = false;
+            bool                                           hasStatics_ = false;
+            std::unordered_map<AstLocal*, std::string>     staticFields_;
+            std::unordered_map<AstLocal*, std::string>     staticFunctions_;
+            std::unordered_set<AstLocal*>                  instanceLocals_;
             bool                                           singletonStarted_ = false;
             uint32_t                                       startedSlot_ = 0;
             std::map<std::string, SingletonUse, std::less<>> singletons_;
@@ -754,7 +760,7 @@ namespace UdonLuau {
             halt.unsignedInteger = 0xFFFFFFFFu;
             haltSlot_ = emit_.Constant(types_.UInt32, halt);
             returnJumpSlot_ = emit_.AddSlot("__intnl_returnJump_SystemUInt32_0", types_.UInt32);
-            singleton_ = std::ranges::any_of(ModuleAttributes(parsed.root), [](const FieldAttribute& a) { return a.name == "singleton"; });
+            singleton_ = options_.staticPart || std::ranges::any_of(ModuleAttributes(parsed.root), [](const FieldAttribute& a) { return a.name == "singleton"; });
             if (singleton_) {
                 HeapValue no;
                 no.kind = ValueKind::Boolean;
@@ -765,6 +771,7 @@ namespace UdonLuau {
             DeclareModule(parsed.root);
             bool declared = std::ranges::none_of(diagnostics_, [](const Diagnostic& d) { return d.severity == Severity::Error; });
             if (declared) result.scriptInterface = BuildInterface();
+            result.hasStatics = hasStatics_;
             if (interfaceOnly_) {
                 result.diagnostics = std::move(diagnostics_);
                 return result;
@@ -1173,6 +1180,21 @@ namespace UdonLuau {
             }
             for (AstStat* stat : root->body) {
                 try {
+                    auto* asLocal = stat->as<AstStatLocal>();
+                    bool splittable = (asLocal && !asLocal->isConst) || stat->is<AstStatLocalFunction>() || stat->is<AstStatFunction>();
+                    bool isStatic = splittable && std::ranges::any_of(AnnotationsFor(stat->location).attributes, [](const FieldAttribute& a) { return a.name == "static"; });
+                    if (isStatic) hasStatics_ = true;
+                    if (splittable && isStatic != options_.staticPart) {
+                        if (asLocal && options_.staticPart) {
+                            DeclareFields(asLocal, true);
+                        } else if (asLocal) {
+                            for (AstLocal* var : asLocal->vars) staticFields_[var] = var->name.value;
+                        } else if (auto* lf = stat->as<AstStatLocalFunction>()) {
+                            if (options_.staticPart) instanceLocals_.insert(lf->name);
+                            else staticFunctions_[lf->name] = lf->name->name.value;
+                        }
+                        continue;
+                    }
                     if (auto* local = stat->as<AstStatLocal>()) {
                         DeclareFields(local);
                     } else if (auto* lf = stat->as<AstStatLocalFunction>()) {
@@ -1194,17 +1216,32 @@ namespace UdonLuau {
             }
         }
 
-        void Compiler::DeclareFields(AstStatLocal* stat) {
+        void Compiler::DeclareFields(AstStatLocal* stat, bool aliasesOnly) {
             Annotations annotations = AnnotationsFor(stat->location);
+            const bool exported = stat->isExported || options_.staticPart;
             for (size_t i = 0; i < stat->vars.size; ++i) {
                 AstLocal* var = stat->vars.data[i];
                 std::string name = var->name.value;
                 CheckUserName(name, var->location);
                 if (!userSymbols_.insert(name).second) Fail(var->location, std::format("'{}' is already declared", name));
 
+                if (aliasesOnly) {
+                    AstExpr* init = i < stat->values.size ? Unwrap(stat->values.data[i]) : nullptr;
+                    if (!var->annotation && init && (init->is<AstExprGlobal>() || init->is<AstExprIndexName>())) {
+                        Value v = CompileExpr(init);
+                        if (v.kind == Value::Kind::TypeRef || v.kind == Value::Kind::Namespace) {
+                            aliases_[var] = v;
+                            continue;
+                        }
+                    }
+                    instanceLocals_.insert(var);
+                    continue;
+                }
+
                 const Type* type = var->annotation ? ResolveType(var->annotation) : nullptr;
                 if (type && type->IsList()) {
-                    if (stat->isExported) Fail(var->location, "a List cannot be exported; export an array instead");
+                    if (options_.staticPart) Fail(var->location, "a List cannot be static; use an array");
+                    if (exported) Fail(var->location, "a List cannot be exported; export an array instead");
                     if (stat->isConst) Fail(var->location, "a List cannot be a constant");
                     if (annotations.synced) Fail(var->location, "a List cannot be synced; sync an array instead");
                     ListInit parsed = ParseListInit(i < stat->values.size ? stat->values.data[i] : nullptr);
@@ -1240,9 +1277,9 @@ namespace UdonLuau {
                     if (v.kind == Value::Kind::Slot && emit_.IsConstant(v.slot) && (!type || type == v.type)) {
                         type = v.type;
                         initial = emit_.Slot(v.slot).value;
-                        uint32_t slot = emit_.AddSlot(name, type, initial, stat->isExported);
+                        uint32_t slot = emit_.AddSlot(name, type, initial, exported);
                         fieldSlots_.insert(slot);
-                        if (stat->isExported) exportedFields_.emplace_back(name, type);
+                        if (exported) exportedFields_.emplace_back(name, type);
                         emit_.Slot(slot).attributes = annotations.attributes;
                         variables_[var] = { slot, type };
                         if (annotations.synced) {
@@ -1261,9 +1298,9 @@ namespace UdonLuau {
                 }
 
                 if (stat->isConst) Fail(var->location, "constants need a value");
-                uint32_t slot = emit_.AddSlot(name, type, initial, stat->isExported);
+                uint32_t slot = emit_.AddSlot(name, type, initial, exported);
                 fieldSlots_.insert(slot);
-                if (stat->isExported) exportedFields_.emplace_back(name, type);
+                if (exported) exportedFields_.emplace_back(name, type);
                 emit_.Slot(slot).attributes = annotations.attributes;
                 variables_[var] = { slot, type };
                 if (annotations.synced) {
@@ -1286,7 +1323,7 @@ namespace UdonLuau {
             f->entry = emit_.NewLabel();
             f->epilogue = emit_.NewLabel();
 
-            if (!local || local->isExported) {
+            if (!local || local->isExported || options_.staticPart) {
                 if (globalFunctions_.contains(name) || std::ranges::any_of(functions_, [&](const auto& g) { return g->exported && g->name == name; }))
                     Fail(location, std::format("function '{}' is already defined", name));
                 f->exported = true;
@@ -1598,6 +1635,11 @@ namespace UdonLuau {
         void Compiler::AssignTo(AstExpr* target, const Value& value) {
             target = Unwrap(target);
             if (auto* local = target->as<AstExprLocal>()) {
+                if (auto it = staticFields_.find(local->local); it != staticFields_.end()) {
+                    WriteMember(StaticCompanion(target->location), it->second, value, target->location);
+                    return;
+                }
+                CheckInstanceUse(local->local, target->location);
                 if (aliases_.contains(local->local)) Fail(target->location, std::format("'{}' is a constant", local->local->name.value));
                 Store(value, LookupLocal(local->local, local->location), target->location);
                 return;
@@ -1666,7 +1708,9 @@ namespace UdonLuau {
             AstExpr* target = Unwrap(stat->var);
             if (auto* local = target->as<AstExprLocal>()) {
                 AstExprBinary synthetic(stat->location, stat->op, stat->var, stat->value);
-                AssignTo(stat->var, CompileBinary(&synthetic, LookupLocal(local->local, local->location).type));
+                CheckInstanceUse(local->local, local->location);
+                const Type* type = staticFields_.contains(local->local) ? nullptr : LookupLocal(local->local, local->location).type;
+                AssignTo(stat->var, CompileBinary(&synthetic, type));
                 return;
             }
             bool valueCall = HasCall(stat->value);
@@ -2108,6 +2152,9 @@ namespace UdonLuau {
             if (auto* e = expr->as<AstExprConstantInteger>()) return Value::OfInteger(e->value);
             if (auto* e = expr->as<AstExprConstantString>()) return Value::OfString(std::string(e->value.data, e->value.size));
             if (auto* e = expr->as<AstExprLocal>()) {
+                if (auto it = staticFields_.find(e->local); it != staticFields_.end()) return ReadMember(StaticCompanion(e->location), it->second, e->location);
+                if (staticFunctions_.contains(e->local)) Fail(e->location, std::format("static function '{}' can only be called", e->local->name.value));
+                CheckInstanceUse(e->local, e->location);
                 if (auto it = aliases_.find(e->local); it != aliases_.end()) return it->second;
                 if (auto it = localFunctions_.find(e->local); it != localFunctions_.end()) return Value::OfFunction(it->second);
                 Variable v = LookupLocal(e->local, e->location);
@@ -2679,6 +2726,15 @@ namespace UdonLuau {
                 Fail(call->location, "this expression cannot be called");
             }
 
+            if (auto* l = func->as<AstExprLocal>()) {
+                if (auto it = staticFunctions_.find(l->local); it != staticFunctions_.end()) {
+                    Value companion = StaticCompanion(call->location);
+                    const ScriptInfo* script = companion.type->script;
+                    auto method = std::ranges::find(script->methods, it->second, &ScriptMethod::name);
+                    if (method == script->methods.end()) Fail(call->location, std::format("static function '{}' is not registered yet; recompile the script", it->second));
+                    return CallScriptMethod(companion, *method, args, want, call->location);
+                }
+            }
             if (auto* global = func->as<AstExprGlobal>(); global && !globalFunctions_.contains(global->name.value)) {
                 bool handled = false;
                 std::vector<Value> results = CallBuiltin(global->name.value, args, call->location, handled);
@@ -2924,6 +2980,17 @@ namespace UdonLuau {
                 emit_.Slot(slot).attributes.push_back({ "hideininspector", {} });
                 singletons_[name] = { script, slot, finder.called.contains(name) };
             }
+            if (!options_.staticPart && (!staticFields_.empty() || !staticFunctions_.empty())) {
+                if (options_.scriptName.empty()) Fail(root->location, "statics need the script's name; the host must pass it when compiling");
+                std::string name = StaticCompanionName(options_.scriptName);
+                const ScriptInfo* script = catalog_.FindScript(name);
+                if (!script) Fail(root->location, std::format("the static part of {} is not registered yet; recompile the script", options_.scriptName));
+                HeapValue none;
+                none.kind = ValueKind::Null;
+                uint32_t slot = emit_.AddSlot("__singleton_" + name, types_.Script(script), none, true);
+                emit_.Slot(slot).attributes.push_back({ "hideininspector", {} });
+                singletons_[name] = { script, slot, !staticFunctions_.empty() };
+            }
             if (singletons_.empty()) return;
             HeapValue no;
             no.kind = ValueKind::Boolean;
@@ -2931,6 +2998,17 @@ namespace UdonLuau {
             emit_.Slot(singletonsReadySlot_).attributes.push_back({ "hideininspector", {} });
             resolveReturnSlot_ = emit_.Hidden(types_.UInt32);
             resolveRoutine_ = emit_.NewLabel();
+        }
+
+        Value Compiler::StaticCompanion(const Location& location) {
+            auto it = singletons_.find(StaticCompanionName(options_.scriptName));
+            if (it == singletons_.end()) Fail(location, "this script's statics are not available here");
+            return Value::OfSlot(it->second.slot, types_.Script(it->second.script));
+        }
+
+        void Compiler::CheckInstanceUse(AstLocal* local, const Location& location) const {
+            if (instanceLocals_.contains(local))
+                Fail(location, std::format("'{}' is not static; static code can only use static fields and functions", local->name.value));
         }
 
         void Compiler::EmitEntryPrologue(const Function& f) {
