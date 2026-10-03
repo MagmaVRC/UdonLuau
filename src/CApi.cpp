@@ -225,6 +225,24 @@ int32_t ul_catalog_add_script_method_value(ul_catalog* catalog, const char* scri
     });
 }
 
+int32_t ul_catalog_add_script_signal(ul_catalog* catalog, const char* script, const char* name) {
+    if (!name) return 0;
+    return EditScript(catalog, script, [&](UdonLuau::ScriptInfo& s) {
+        s.signals.push_back({ name, {} });
+        return true;
+    });
+}
+
+int32_t ul_catalog_add_script_signal_value(ul_catalog* catalog, const char* script, const char* signal, const char* udon_type, const char* script_type, const char* symbol) {
+    if (!signal) return 0;
+    return EditScript(catalog, script, [&](UdonLuau::ScriptInfo& s) {
+        auto it = std::find_if(s.signals.rbegin(), s.signals.rend(), [&](const UdonLuau::ScriptSignal& g) { return g.name == signal; });
+        if (it == s.signals.rend()) return false;
+        it->values.push_back(MakeVariable("", udon_type, script_type, symbol));
+        return true;
+    });
+}
+
 int32_t ul_catalog_set_script_method_network_callable(ul_catalog* catalog, const char* script, const char* method, int32_t network_callable) {
     if (!method) return 0;
     return EditScript(catalog, script, [&](UdonLuau::ScriptInfo& s) {
@@ -451,6 +469,25 @@ int32_t ul_result_interface_method_value(const ul_result* result, int32_t method
     if (!ul_result_has_interface(result) || !out || !InRange(method, result->result.scriptInterface->methods.size())) return 0;
     const UdonLuau::ScriptMethod& m = result->result.scriptInterface->methods[static_cast<size_t>(method)];
     const auto& values = is_return ? m.returns : m.parameters;
+    if (!InRange(index, values.size())) return 0;
+    Fill(values[static_cast<size_t>(index)], out);
+    return 1;
+}
+
+int32_t ul_result_interface_signal_count(const ul_result* result) {
+    return ul_result_has_interface(result) ? static_cast<int32_t>(result->result.scriptInterface->signals.size()) : 0;
+}
+
+int32_t ul_result_interface_signal(const ul_result* result, int32_t index, ul_script_method* out) {
+    if (!ul_result_has_interface(result) || !out || !InRange(index, result->result.scriptInterface->signals.size())) return 0;
+    const UdonLuau::ScriptSignal& s = result->result.scriptInterface->signals[static_cast<size_t>(index)];
+    *out = { s.name.c_str(), "", static_cast<int32_t>(s.values.size()), 0 };
+    return 1;
+}
+
+int32_t ul_result_interface_signal_value(const ul_result* result, int32_t signal, int32_t index, ul_script_variable* out) {
+    if (!ul_result_has_interface(result) || !out || !InRange(signal, result->result.scriptInterface->signals.size())) return 0;
+    const auto& values = result->result.scriptInterface->signals[static_cast<size_t>(signal)].values;
     if (!InRange(index, values.size())) return 0;
     Fill(values[static_cast<size_t>(index)], out);
     return 1;

@@ -167,6 +167,14 @@ UDONLUAU_API int32_t ul_catalog_add_script_method(ul_catalog* catalog, const cha
 /// <returns>0 when the script or method is unknown.</returns>
 UDONLUAU_API int32_t ul_catalog_add_script_method_value(ul_catalog* catalog, const char* script, const char* method, int32_t is_return, const char* name, const char* udon_type, const char* script_type, const char* symbol);
 
+/// <summary>Adds an exported signal to a script added earlier.</summary>
+/// <returns>0 when the script is unknown.</returns>
+UDONLUAU_API int32_t ul_catalog_add_script_signal(ul_catalog* catalog, const char* script, const char* name);
+
+/// <summary>Appends a value the signal carries, delivered through the heap symbol symbol.</summary>
+/// <returns>0 when the script or signal is unknown.</returns>
+UDONLUAU_API int32_t ul_catalog_add_script_signal_value(ul_catalog* catalog, const char* script, const char* signal, const char* udon_type, const char* script_type, const char* symbol);
+
 /// <summary>Marks a method added earlier as callable by other clients over the network.</summary>
 /// <returns>0 when the script or method is unknown.</returns>
 UDONLUAU_API int32_t ul_catalog_set_script_method_network_callable(ul_catalog* catalog, const char* script, const char* method, int32_t network_callable);
@@ -265,6 +273,11 @@ UDONLUAU_API int32_t ul_result_network_parameter(const ul_result* result, int32_
 
 /// <summary>A parameter (is_return 0) or return value (is_return 1) of a public method.</summary>
 UDONLUAU_API int32_t ul_result_interface_method_value(const ul_result* result, int32_t method, int32_t is_return, int32_t index, ul_script_variable* out);
+
+/// <summary>Exported signals: out->name is the signal and out->parameter_count the number of values it carries.</summary>
+UDONLUAU_API int32_t ul_result_interface_signal_count(const ul_result* result);
+UDONLUAU_API int32_t ul_result_interface_signal(const ul_result* result, int32_t index, ul_script_method* out);
+UDONLUAU_API int32_t ul_result_interface_signal_value(const ul_result* result, int32_t signal, int32_t index, ul_script_variable* out);
 
 /// <summary>A readable listing of the compiled program, or an empty string when compilation failed.</summary>
 UDONLUAU_API const char* ul_result_disassembly(ul_result* result);

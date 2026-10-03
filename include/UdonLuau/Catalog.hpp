@@ -81,11 +81,19 @@ namespace UdonLuau {
         bool                        networkCallable = false;
     };
 
+    /// <summary>A signal a script exports. Other behaviours can wait on it, connect to it and fire
+    /// it; values are the types it carries, each delivered through the heap symbol it names.</summary>
+    struct ScriptSignal {
+        std::string                 name;
+        std::vector<ScriptVariable> values;
+    };
+
     /// <summary>The public surface of a behaviour script, Luau or UdonSharp.</summary>
     struct ScriptInfo {
         std::string                 name;
         std::vector<ScriptMethod>   methods;
         std::vector<ScriptVariable> fields;
+        std::vector<ScriptSignal>   signals;
         bool                        singleton = false;
         /// <summary>The type name the script's program stores in __refl_typename, used to find it among a GameObject's behaviours.</summary>
         std::string                 typeName;

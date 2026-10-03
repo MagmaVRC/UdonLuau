@@ -29,7 +29,8 @@ namespace {
 
     using IntArray = std::shared_ptr<std::vector<int32_t>>;
     using RefArray = std::shared_ptr<std::vector<BehaviourRef>>;
-    using Cell = std::variant<std::monostate, bool, int32_t, uint32_t, int64_t, float, double, std::string, Vec3, IntArray, std::vector<uint32_t>, BehaviourRef, RefArray>;
+    using StrArray = std::shared_ptr<std::vector<std::string>>;
+    using Cell = std::variant<std::monostate, bool, int32_t, uint32_t, int64_t, float, double, std::string, Vec3, IntArray, std::vector<uint32_t>, BehaviourRef, RefArray, StrArray>;
     using Impl = std::function<void(std::vector<Cell>&, const std::vector<uint32_t>&)>;
 
     int32_t g_frame = 100;
@@ -138,7 +139,10 @@ namespace {
         f.Extern("SystemString.__get_Length__SystemInt32", true, [](auto& h, auto& p) { h[p[1]] = static_cast<int32_t>(As<std::string>(h, p[0]).size()); });
         f.Extern("SystemObject.__Equals__SystemObject_SystemObject__SystemBoolean", false, [](auto& h, auto& p) { h[p[2]] = h[p[0]].index() == h[p[1]].index(); });
         f.Extern("SystemObject.__ToString__SystemString", true, [](auto& h, auto& p) { h[p[1]] = Text(h[p[0]]); });
-        f.Extern("UnityEngineObject.__op_Equality__UnityEngineObject_UnityEngineObject__SystemBoolean", false);
+        f.Extern("UnityEngineObject.__op_Equality__UnityEngineObject_UnityEngineObject__SystemBoolean", false, [](auto& h, auto& p) {
+            auto id = [&](uint32_t a) { return std::holds_alternative<BehaviourRef>(h[a]) ? std::get<BehaviourRef>(h[a]).id : -1; };
+            h[p[2]] = id(p[0]) == id(p[1]);
+        });
         f.Extern("UnityEngineObject.__op_Inequality__UnityEngineObject_UnityEngineObject__SystemBoolean", false);
         f.Extern("UnityEngineDebug.__Log__SystemObject__SystemVoid", false, [&log = f.log](auto& h, auto& p) { log.push_back(Text(h[p[0]])); });
         f.Extern("UnityEngineDebug.__LogWarning__SystemObject__SystemVoid", false, [&log = f.log](auto& h, auto& p) { log.push_back("warn: " + Text(h[p[0]])); });
@@ -186,6 +190,7 @@ namespace {
                 std::ranges::copy(chunk, to.begin() + d);
             };
             if (std::holds_alternative<RefArray>(h[p[0]])) move(*As<RefArray>(h, p[0]), *As<RefArray>(h, p[2]));
+            else if (std::holds_alternative<StrArray>(h[p[0]])) move(*As<StrArray>(h, p[0]), *As<StrArray>(h, p[2]));
             else move(*As<IntArray>(h, p[0]), *As<IntArray>(h, p[2]));
         });
         f.Extern("SystemArray.__IndexOf__SystemArray_SystemObject__SystemInt32", false, [](auto& h, auto& p) {
@@ -196,6 +201,10 @@ namespace {
         f.Extern("SystemArray.__Copy__SystemArray_SystemArray_SystemInt32__SystemVoid", false, [](auto& h, auto& p) {
             if (std::holds_alternative<RefArray>(h[p[0]])) {
                 std::copy_n(As<RefArray>(h, p[0])->begin(), As<int32_t>(h, p[2]), As<RefArray>(h, p[1])->begin());
+                return;
+            }
+            if (std::holds_alternative<StrArray>(h[p[0]])) {
+                std::copy_n(As<StrArray>(h, p[0])->begin(), As<int32_t>(h, p[2]), As<StrArray>(h, p[1])->begin());
                 return;
             }
             std::copy_n(As<IntArray>(h, p[0])->begin(), As<int32_t>(h, p[2]), As<IntArray>(h, p[1])->begin());
@@ -209,6 +218,17 @@ namespace {
             As<RefArray>(h, p[0])->at(static_cast<size_t>(As<int32_t>(h, p[1]))) = value;
         });
         f.Extern("UnityEngineComponentArray.__get_Length__SystemInt32", true, [](auto& h, auto& p) { h[p[1]] = static_cast<int32_t>(As<RefArray>(h, p[0])->size()); });
+        f.Extern("SystemStringArray.__ctor__SystemInt32__SystemStringArray", false, [](auto& h, auto& p) { h[p[1]] = std::make_shared<std::vector<std::string>>(static_cast<size_t>(As<int32_t>(h, p[0]))); });
+        f.Extern("SystemStringArray.__Get__SystemInt32__SystemString", true, [](auto& h, auto& p) { h[p[2]] = As<StrArray>(h, p[0])->at(static_cast<size_t>(As<int32_t>(h, p[1]))); });
+        f.Extern("SystemStringArray.__Set__SystemInt32_SystemString__SystemVoid", true, [](auto& h, auto& p) {
+            As<StrArray>(h, p[0])->at(static_cast<size_t>(As<int32_t>(h, p[1]))) = std::holds_alternative<std::string>(h[p[2]]) ? As<std::string>(h, p[2]) : std::string();
+        });
+        f.Extern("SystemStringArray.__get_Length__SystemInt32", true, [](auto& h, auto& p) { h[p[1]] = static_cast<int32_t>(As<StrArray>(h, p[0])->size()); });
+        f.Extern("SystemString.__op_Equality__SystemString_SystemString__SystemBoolean", false, [](auto& h, auto& p) { h[p[2]] = As<std::string>(h, p[0]) == As<std::string>(h, p[1]); });
+        f.Type("VRC.SDKBase.Utilities", TypeKind::Class);
+        f.Extern("VRCSDKBaseUtilities.__IsValid__SystemObject__SystemBoolean", false, [](auto& h, auto& p) {
+            h[p[1]] = std::holds_alternative<BehaviourRef>(h[p[0]]) && std::get<BehaviourRef>(h[p[0]]).id >= 0;
+        });
         f.Extern("UnityEngineTime.__get_frameCount__SystemInt32", false, [](auto& h, auto& p) { h[p[0]] = g_frame; });
         f.Extern("UnityEngineTime.__get_timeAsDouble__SystemDouble", false, [](auto& h, auto& p) { h[p[0]] = g_time; });
         Binary<double>(f, "SystemDouble", "op_Addition", "SystemDouble", "SystemDouble", [](double a, double b) { return a + b; });
@@ -276,6 +296,7 @@ namespace {
             }
             case ValueKind::Array: {
                 if (t == "UnityEngineComponentArray") return std::make_shared<std::vector<BehaviourRef>>(v.arguments.size(), BehaviourRef{ -1 });
+                if (t == "SystemStringArray") return std::make_shared<std::vector<std::string>>(v.arguments.size());
                 if (t == "SystemInt32Array") {
                     auto ints = std::make_shared<std::vector<int32_t>>();
                     for (const HeapValue& e : v.arguments) ints->push_back(static_cast<int32_t>(e.integer));
@@ -1790,6 +1811,65 @@ end
             Check(std::get<std::string>(m.Var("order")) == "hw", std::format("waiters resume after the script's own handler ({})", std::get<std::string>(m.Var("order"))));
         }
         Check(HasError(f, "export function Touch()\n Events.Interact:Wait()\nend", "needs a handler for Interact"), "waiting for Interact needs a handler");
+
+        const char* doorSource = R"(
+export local opened: Signal<number> = Signal()
+export function Open()
+    opened:Fire(4)
+end
+)";
+        CompileResult doorFace = ExtractInterface(f.catalog, doorSource);
+        Check(doorFace.scriptInterface && doorFace.scriptInterface->signals.size() == 1 && doorFace.scriptInterface->signals[0].values.size() == 1,
+            "exported signals are part of the interface");
+        if (doorFace.scriptInterface) {
+            ScriptInfo door = *doorFace.scriptInterface;
+            door.name = "Door";
+            f.catalog.AddScript(door);
+        }
+        auto doorProgram = Build(f, doorSource);
+        auto listener = Build(f, R"(
+export local door: Door
+export local got: number = 0
+export local calls: number = 0
+local function onOpened(n: number)
+    calls += n
+end
+export function Listen()
+    got = door.opened:Wait()
+end
+export function Hook()
+    door.opened:Connect(onOpened)
+end
+export function Unhook()
+    door.opened:Disconnect(onOpened)
+end
+export function Poke()
+    door.opened:Fire(2)
+end
+)");
+        Check(doorProgram.has_value() && listener.has_value(), "cross-script signals compile");
+        if (doorProgram && listener) {
+            Machine owner(f, *doorProgram);
+            Machine other(f, *listener);
+            g_machines = { &owner, &other };
+            for (size_t i = 0; i < listener->heap.size(); ++i)
+                if (listener->heap[i].value.kind == ValueKind::This && listener->heap[i].type == "VRCUdonUdonBehaviour") other.heap[i] = BehaviourRef{ 1 };
+            other.Var("door") = BehaviourRef{ 0 };
+            other.Run("_Listen");
+            owner.Run("_Open");
+            Check(std::get<float>(other.Var("got")) == 4.0f, "a remote Fire resumes another script's waiter with the value");
+            other.Run("_Hook");
+            other.Run("_Hook");
+            owner.Run("_Open");
+            Check(std::get<float>(other.Var("calls")) == 4.0f && std::get<float>(other.Var("got")) == 4.0f, "a remote connection is called once, and a finished waiter is not resumed");
+            other.Run("_Unhook");
+            owner.Run("_Open");
+            Check(std::get<float>(other.Var("calls")) == 4.0f, "a remote Disconnect stops the calls");
+            other.Run("_Listen");
+            other.Run("_Poke");
+            Check(std::get<float>(other.Var("got")) == 2.0f, "another script can fire the signal");
+            g_machines.clear();
+        }
 
         Check(HasError(f, "export function Get(): int\n task.wait(1)\n return 1\nend", "cannot return values"), "public methods that wait cannot return values");
         Check(HasError(f, "local function go()\n task.wait(1)\nend\nfunction Start()\n task.cancel(print)\nend", "function of this script"), "task.cancel takes a script function");

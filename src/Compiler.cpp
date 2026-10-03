@@ -324,9 +324,24 @@ namespace UdonLuau {
         struct SignalInfo {
             std::string                       name;
             std::vector<const Type*>          types;
+            std::vector<std::string>          symbols;
             bool                              exported = false;
             std::vector<ListenSite*>          sites;
             std::map<Function*, uint32_t>     connections;
+            std::vector<Value>                staging;
+            Value                             waitTargets;
+            Value                             waitEntries;
+            Value                             connectTargets;
+            Value                             connectEntries;
+            uint32_t                          target = 0;
+            uint32_t                          entry = 0;
+        };
+
+        struct RemoteCallback {
+            std::string        entry;
+            Function*          function = nullptr;
+            std::vector<Value> values;
+            Location           location;
         };
 
         struct FireSite {
@@ -716,6 +731,16 @@ namespace UdonLuau {
             void EmitDispatch(const std::vector<ListenSite*>& sites, const std::vector<Value>& values, const std::map<Function*, uint32_t>& connections, const Location& location);
             void EmitFireBlock(const FireSite& fire);
             void EmitEventDispatch(EventListeners& listeners);
+            uint32_t SignalSlot(const std::string& symbol, const Type* type);
+            [[nodiscard]] bool RemoteSignalNamed(std::string_view name) const {
+                return std::ranges::any_of(catalog_.Scripts(), [&](const ScriptInfo* s) { return std::ranges::any_of(s->signals, [&](const ScriptSignal& g) { return g.name == name; }); });
+            }
+            std::vector<Value> CallRemoteSignal(const Value& owner, const ScriptSignal& signal, std::string_view method, AstExprCall* call, size_t want);
+            void RegisterWith(const Value& owner, std::string_view signal, std::string_view action, const std::string& entry, const Location& location);
+            void EmitSignalHost(SignalInfo& signal);
+            void EmitRemoteFire(const SignalInfo& signal, const std::vector<Value>& values, const Location& location);
+            void EmitRemoteCallback(const RemoteCallback& callback);
+            void EmitCount(const Value& count, const std::function<void(const Value&)>& body, const Location& location);
             void DeclareConstTable(AstLocal* var, AstExprTable* table);
             void SortWith(const Value& array, const Value& length, const Value& comparer, const Location& location);
             Value FindBehaviour(const Value& receiver, std::string_view getter, const Type* wanted, const Location& location);
@@ -836,6 +861,10 @@ namespace UdonLuau {
             int                                            waitSites_ = 0;
             std::deque<ListenSite>                         listenSites_;
             std::unordered_map<AstLocal*, SignalInfo>      signals_;
+            std::vector<AstLocal*>                         signalOrder_;
+            std::unordered_map<std::string, uint32_t>      signalSlots_;
+            std::deque<RemoteCallback>                     remoteCallbacks_;
+            std::map<std::string, std::string, std::less<>> callbackEntries_;
             std::deque<FireSite>                           fireSites_;
             std::map<std::string, EventListeners, std::less<>> eventListeners_;
             uint32_t                                       haltSlot_ = 0;
@@ -909,14 +938,12 @@ namespace UdonLuau {
             };
             for (const ChangeHandler& handler : changeHandlers_) guarded([&] { CompileChangeHandler(handler); });
             for (auto& [name, listeners] : eventListeners_) guarded([&] { EmitEventDispatch(listeners); });
-            for (size_t delays = 0, fires = 0; delays < delaySites_.size() || fires < fireSites_.size();) {
-                if (delays < delaySites_.size()) {
-                    guarded([&] { CompileDelaySite(DelaySite(delaySites_[delays])); });
-                    ++delays;
-                } else {
-                    guarded([&] { EmitFireBlock(fireSites_[fires]); });
-                    ++fires;
-                }
+            for (AstLocal* local : signalOrder_)
+                if (signals_.at(local).exported) guarded([&] { EmitSignalHost(signals_.at(local)); });
+            for (size_t delays = 0, fires = 0, callbacks = 0; delays < delaySites_.size() || fires < fireSites_.size() || callbacks < remoteCallbacks_.size();) {
+                if (delays < delaySites_.size()) guarded([&] { CompileDelaySite(DelaySite(delaySites_[delays++])); });
+                else if (fires < fireSites_.size()) guarded([&] { EmitFireBlock(fireSites_[fires++]); });
+                else guarded([&] { EmitRemoteCallback(RemoteCallback(remoteCallbacks_[callbacks++])); });
             }
             if (singleton_ && !singletonStarted_) {
                 Label start = emit_.NewLabel();
@@ -1096,6 +1123,13 @@ namespace UdonLuau {
                 for (size_t i = 0; i < f->returns.size(); ++i)
                     m.returns.push_back(MakeVariable(i ? std::format("result{}", i) : "result", f->returns[i], emit_.Slot(f->returnSlots[i]).symbol));
                 info.methods.push_back(std::move(m));
+            }
+            for (AstLocal* local : signalOrder_) {
+                const SignalInfo& s = signals_.at(local);
+                if (!s.exported) continue;
+                ScriptSignal signal{ s.name, {} };
+                for (size_t i = 0; i < s.types.size(); ++i) signal.values.push_back(MakeVariable("", s.types[i], s.symbols[i]));
+                info.signals.push_back(std::move(signal));
             }
             return info;
         }
@@ -1356,6 +1390,9 @@ namespace UdonLuau {
                                 listeners->second.event = event;
                                 if (added) listeners->second.location = c->location;
                             }
+                        } else if (auto* remote = member ? Unwrap(member->expr)->as<AstExprIndexName>() : nullptr; remote && RemoteSignalNamed(remote->index.value)) {
+                            if (method == "Wait") self->async = true;
+                            if (Function* fn = method == "Connect" && c->args.size == 1 ? Callee(c->args.data[0]) : nullptr) fn->entered = true;
                         }
                         return;
                     }
@@ -1938,8 +1975,32 @@ namespace UdonLuau {
                     info.types.push_back(type);
                 }
             }
+            for (size_t i = 0; i < info.types.size(); ++i) info.symbols.push_back(std::format("__sig_{}_{}_{}", info.name, i, info.types[i]->udonName));
+            if (exported) {
+                auto list = [&](std::string_view suffix, const Type* element) {
+                    HeapValue empty;
+                    empty.kind = ValueKind::Array;
+                    empty.text = element->udonName;
+                    Variable storage = DeclareListStorage(std::format("__sig_{}_{}", info.name, suffix), types_.ListOf(element), true, std::move(empty), 0);
+                    return Value::OfSlot(storage.slot, storage.type);
+                };
+                info.waitTargets = list("waitTargets", types_.Behaviour());
+                info.waitEntries = list("waitEntries", types_.String);
+                info.connectTargets = list("connectTargets", types_.Behaviour());
+                info.connectEntries = list("connectEntries", types_.String);
+                info.target = emit_.AddSlot(std::format("__sig_{}_target", info.name), types_.Behaviour());
+                info.entry = emit_.AddSlot(std::format("__sig_{}_entry", info.name), types_.String);
+                for (size_t i = 0; i < info.types.size(); ++i) info.staging.push_back(Value::OfSlot(SignalSlot(info.symbols[i], info.types[i]), info.types[i]));
+            }
             signals_[var] = std::move(info);
+            signalOrder_.push_back(var);
             return true;
+        }
+
+        uint32_t Compiler::SignalSlot(const std::string& symbol, const Type* type) {
+            auto [it, added] = signalSlots_.try_emplace(symbol, 0);
+            if (added) it->second = emit_.AddSlot(symbol, type);
+            return it->second;
         }
 
         SignalInfo* Compiler::SignalOf(AstExpr* expr) {
@@ -2002,6 +2063,14 @@ namespace UdonLuau {
                     return std::vector<Value>{};
                 }
                 Fail(location, std::format("signals have Wait, Fire, Connect and Disconnect, not '{}'", method));
+            }
+            if (auto* member = Unwrap(index->expr)->as<AstExprIndexName>()) {
+                auto* local = Unwrap(member->expr)->as<AstExprLocal>();
+                auto owner = local ? variables_.find(local->local) : variables_.end();
+                const ScriptInfo* script = owner != variables_.end() ? owner->second.type->script : nullptr;
+                if (script)
+                    for (const ScriptSignal& signal : script->signals)
+                        if (signal.name == member->index.value) return CallRemoteSignal(Value::OfSlot(owner->second.slot, owner->second.type), signal, method, call, want);
             }
             if (const EventInfo* event = EventOf(index->expr)) {
                 if (method != "Wait") Fail(location, std::format("Events.{} only has Wait", event->name));
@@ -2103,6 +2172,7 @@ namespace UdonLuau {
             emit_.ResetTemps();
             emit_.Bind(fire.block);
             EmitDispatch(fire.signal->sites, fire.values, fire.signal->connections, fire.location);
+            if (fire.signal->exported) EmitRemoteFire(*fire.signal, fire.values, fire.location);
             emit_.Jump(fire.back);
         }
 
@@ -2126,6 +2196,214 @@ namespace UdonLuau {
             for (const Variable& v : listeners.values) values.push_back(Value::OfSlot(v.slot, v.type));
             EmitDispatch(listeners.sites, values, {}, location);
             emit_.JumpTo(0xFFFFFFFFu);
+        }
+
+        std::vector<Value> Compiler::CallRemoteSignal(const Value& owner, const ScriptSignal& signal, std::string_view method, AstExprCall* call, size_t want) {
+            const Location& location = call->location;
+            Value receiver = Value::OfSlot(owner.slot, types_.Behaviour());
+            std::vector<const Type*> types;
+            for (const ScriptVariable& v : signal.values) types.push_back(VariableType(v));
+            uint32_t yes = TruthySlot(Value::OfBoolean(true), location);
+            uint32_t no = TruthySlot(Value::OfBoolean(false), location);
+
+            if (method == "Wait") {
+                if (call->args.size) Fail(location, "Wait takes no arguments");
+                Function* root = root_;
+                if (!root) Fail(location, "waits can only be used in events, public methods and functions they call or start");
+                std::string entry = std::format("__co{}", waitSites_++);
+                uint32_t waiting = emit_.Hidden(types_.Boolean);
+                uint32_t registered = emit_.Hidden(types_.Boolean);
+                root->waitFlags.push_back(waiting);
+                std::vector<Variable> results;
+                for (const Type* t : types) results.push_back({ emit_.Hidden(t), t });
+
+                Label enlist = emit_.NewLabel();
+                Label enlisted = emit_.NewLabel();
+                emit_.JumpIfFalse(registered, enlist);
+                emit_.Jump(enlisted);
+                emit_.Bind(enlist);
+                RegisterWith(owner, signal.name, "wait", entry, location);
+                emit_.Copy(yes, registered);
+                emit_.Bind(enlisted);
+                emit_.Copy(yes, waiting);
+                if (root->lineSlot) emit_.Copy(Materialize(Value::OfInteger(location.begin.line + 1), types_.Int32, location), root->lineSlot);
+                if (root->reentry != Reentry::Ignore) emit_.Copy(yes, root->freeSlot);
+                EmitYield();
+
+                Label resume = emit_.NewLabel();
+                Label stale = emit_.NewLabel();
+                Label go = emit_.NewLabel();
+                emit_.Bind(resume);
+                entries_.push_back({ entry, *emit_.AddressOf(resume) });
+                emit_.Push(haltSlot_);
+                emit_.Copy(no, registered);
+                emit_.JumpIfFalse(waiting, stale);
+                emit_.Copy(no, waiting);
+                for (size_t i = 0; i < results.size(); ++i) emit_.Copy(SignalSlot(signal.values[i].symbol, types[i]), results[i].slot);
+                emit_.Jump(go);
+                emit_.Bind(stale);
+                EmitYield();
+                emit_.Bind(go);
+                if (root->reentry != Reentry::Ignore) emit_.Copy(no, root->freeSlot);
+                std::vector<Value> out;
+                for (size_t i = 0; i < std::min(want, results.size()); ++i) out.push_back(Value::OfSlot(results[i].slot, results[i].type));
+                return out;
+            }
+            if (method == "Connect" || method == "Disconnect") {
+                Function* fn = call->args.size == 1 ? Callee(call->args.data[0]) : nullptr;
+                if (!fn) Fail(location, std::format("{} takes a function of this script", method));
+                if (fn->parameters.size() != types.size() || !std::ranges::equal(fn->parameters, types, [](const Variable& p, const Type* t) { return p.type == t; }))
+                    Fail(location, std::format("'{}' must take the values '{}' carries", fn->name, signal.name));
+                std::string key = std::format("{}.{}.{}", owner.type->script->name, signal.name, fn->name);
+                auto [known, added] = callbackEntries_.try_emplace(key, std::format("__sigcb{}", callbackEntries_.size()));
+                if (added) {
+                    RemoteCallback callback{ known->second, fn, {}, location };
+                    for (size_t i = 0; i < types.size(); ++i) callback.values.push_back(Value::OfSlot(SignalSlot(signal.values[i].symbol, types[i]), types[i]));
+                    remoteCallbacks_.push_back(std::move(callback));
+                }
+                RegisterWith(owner, signal.name, method == "Connect" ? "connect" : "disconnect", known->second, location);
+                return {};
+            }
+            if (method == "Fire") {
+                if (call->args.size != types.size()) Fail(location, std::format("'{}' carries {} value(s), got {}", signal.name, types.size(), call->args.size));
+                for (size_t i = 0; i < types.size(); ++i) {
+                    Value v = CompileExpr(call->args.data[i], types[i]);
+                    if (Cost(v, types[i]) < 0) Fail(call->args.data[i]->location, std::format("value {} of '{}' must be {}, got {}", i + 1, signal.name, types[i]->displayName, Describe(v)));
+                    CallMember(receiver, "SetProgramVariable", { Value::OfString(signal.values[i].symbol), Value::OfSlot(Materialize(v, types[i], location), types[i]) }, nullptr, location);
+                }
+                CallMember(receiver, "SendCustomEvent", { Value::OfString(std::format("__sig_{}_fire", signal.name)) }, nullptr, location);
+                return {};
+            }
+            Fail(location, std::format("signals have Wait, Fire, Connect and Disconnect, not '{}'", method));
+        }
+
+        void Compiler::RegisterWith(const Value& owner, std::string_view signal, std::string_view action, const std::string& entry, const Location& location) {
+            Value receiver = Value::OfSlot(owner.slot, types_.Behaviour());
+            CallMember(receiver, "SetProgramVariable", { Value::OfString(std::format("__sig_{}_target", signal)), SelfValue("this") }, nullptr, location);
+            CallMember(receiver, "SetProgramVariable", { Value::OfString(std::format("__sig_{}_entry", signal)), Value::OfString(entry) }, nullptr, location);
+            CallMember(receiver, "SendCustomEvent", { Value::OfString(std::format("__sig_{}_{}", signal, action)) }, nullptr, location);
+        }
+
+        void Compiler::EmitCount(const Value& count, const std::function<void(const Value&)>& body, const Location& location) {
+            Variable i{ emit_.Hidden(types_.Int32), types_.Int32 };
+            Store(Value::OfInteger(0), i, location);
+            Label test = emit_.NewLabel();
+            Label done = emit_.NewLabel();
+            emit_.Bind(test);
+            Value more = CompareValues(AstExprBinary::CompareLt, Value::OfSlot(i.slot, types_.Int32), count, location);
+            emit_.JumpIfFalse(TruthySlot(more, location), done);
+            body(Value::OfSlot(i.slot, types_.Int32));
+            Store(CompileArithmetic(AstExprBinary::Add, Value::OfSlot(i.slot, types_.Int32), Value::OfInteger(1), location), i, location);
+            emit_.Jump(test);
+            emit_.Bind(done);
+        }
+
+        void Compiler::EmitSignalHost(SignalInfo& signal) {
+            Location location;
+            Value target = Value::OfSlot(signal.target, types_.Behaviour());
+            Value entry = Value::OfSlot(signal.entry, types_.String);
+            auto count = [&](const Value& list) { return Value::OfSlot(ListCount(list).slot, types_.Int32); };
+            auto find = [&] {
+                Variable found{ emit_.Hidden(types_.Int32), types_.Int32 };
+                Store(Value::OfInteger(-1), found, location);
+                EmitCount(count(signal.connectTargets), [&](const Value& i) {
+                    Label next = emit_.NewLabel();
+                    Value t = Narrow(CallList(signal.connectTargets, "Get", { i }, location).at(0), types_.Behaviour());
+                    emit_.JumpIfFalse(TruthySlot(CompareValues(AstExprBinary::CompareEq, t, target, location), location), next);
+                    Value e = CallList(signal.connectEntries, "Get", { i }, location).at(0);
+                    emit_.JumpIfFalse(TruthySlot(CompareValues(AstExprBinary::CompareEq, e, entry, location), location), next);
+                    Store(i, found, location);
+                    emit_.Bind(next);
+                }, location);
+                return Value::OfSlot(found.slot, types_.Int32);
+            };
+
+            BeginSyntheticEntry(std::format("__sig_{}_wait", signal.name));
+            CallList(signal.waitTargets, "Add", { target }, location);
+            CallList(signal.waitEntries, "Add", { entry }, location);
+            EmitReturn();
+
+            BeginSyntheticEntry(std::format("__sig_{}_connect", signal.name));
+            Label known = emit_.NewLabel();
+            Value missing = CompareValues(AstExprBinary::CompareLt, find(), Value::OfInteger(0), location);
+            emit_.JumpIfFalse(TruthySlot(missing, location), known);
+            CallList(signal.connectTargets, "Add", { target }, location);
+            CallList(signal.connectEntries, "Add", { entry }, location);
+            emit_.Bind(known);
+            EmitReturn();
+
+            BeginSyntheticEntry(std::format("__sig_{}_disconnect", signal.name));
+            Label absent = emit_.NewLabel();
+            Value at = find();
+            emit_.JumpIfFalse(TruthySlot(CompareValues(AstExprBinary::CompareGe, at, Value::OfInteger(0), location), location), absent);
+            for (const Value* list : { &signal.connectTargets, &signal.connectEntries }) {
+                Value fresh = NewArray(list->type->listArray, Value::OfSlot(ListCapacity(*list).slot, types_.Int32), location);
+                CopyRange(ListArray(*list), Value::OfInteger(0), fresh, Value::OfInteger(0), count(*list), location);
+                Store(fresh, { list->slot, list->type->listArray }, location);
+                ListRemoveAt(*list, at, location);
+            }
+            emit_.Bind(absent);
+            EmitReturn();
+
+            BeginSyntheticEntry(std::format("__sig_{}_fire", signal.name));
+            FireSite fire;
+            fire.signal = &signal;
+            fire.block = emit_.NewLabel();
+            fire.back = emit_.NewLabel();
+            fire.values = signal.staging;
+            emit_.Jump(fire.block);
+            emit_.Bind(fire.back);
+            fireSites_.push_back(std::move(fire));
+            EmitReturn();
+        }
+
+        void Compiler::EmitRemoteFire(const SignalInfo& signal, const std::vector<Value>& values, const Location& location) {
+            auto deliver = [&](const Value& targets, const Value& entries, const Value& i) {
+                Label next = emit_.NewLabel();
+                Value t = Narrow(CallMember(targets, "Get", { i }, nullptr, location).at(0), types_.Behaviour());
+                Value held = Evaluate(t);
+                Value valid = CallStatic(types_.Get("VRCSDKBaseUtilities"), "IsValid", { held }, nullptr, location).at(0);
+                emit_.JumpIfFalse(TruthySlot(valid, location), next);
+                Value receiver = Value::OfSlot(held.slot, types_.Behaviour());
+                for (size_t j = 0; j < values.size(); ++j)
+                    CallMember(receiver, "SetProgramVariable", { Value::OfString(signal.symbols[j]), values[j] }, nullptr, location);
+                Value e = CallMember(entries, "Get", { i }, nullptr, location).at(0);
+                CallMember(receiver, "SendCustomEvent", { e }, nullptr, location);
+                emit_.Bind(next);
+            };
+            auto snapshot = [&](const Value& list) {
+                Variable held{ emit_.Hidden(list.type->listArray), list.type->listArray };
+                Store(ListArray(list), held, location);
+                return Value::OfSlot(held.slot, held.type);
+            };
+            auto counted = [&](const Value& list) {
+                Variable n{ emit_.Hidden(types_.Int32), types_.Int32 };
+                Store(Value::OfSlot(ListCount(list).slot, types_.Int32), n, location);
+                return Value::OfSlot(n.slot, types_.Int32);
+            };
+
+            Label noWaiters = emit_.NewLabel();
+            Value waiting = counted(signal.waitTargets);
+            emit_.JumpIfFalse(TruthySlot(CompareValues(AstExprBinary::CompareGt, waiting, Value::OfInteger(0), location), location), noWaiters);
+            Value targets = snapshot(signal.waitTargets);
+            Value entries = snapshot(signal.waitEntries);
+            for (const Value* list : { &signal.waitTargets, &signal.waitEntries }) {
+                Store(NewArray(list->type->listArray, Value::OfSlot(ListCapacity(*list).slot, types_.Int32), location), { list->slot, list->type->listArray }, location);
+                Store(Value::OfInteger(0), ListCount(*list), location);
+            }
+            EmitCount(waiting, [&](const Value& i) { deliver(targets, entries, i); }, location);
+            emit_.Bind(noWaiters);
+
+            Value connected = counted(signal.connectTargets);
+            Value connectTargets = snapshot(signal.connectTargets);
+            Value connectEntries = snapshot(signal.connectEntries);
+            EmitCount(connected, [&](const Value& i) { deliver(connectTargets, connectEntries, i); }, location);
+        }
+
+        void Compiler::EmitRemoteCallback(const RemoteCallback& callback) {
+            BeginSyntheticEntry(callback.entry);
+            EnterRoot(callback.function, callback.values, callback.location);
+            EmitReturn();
         }
 
         void Compiler::EmitAliveCheck() {

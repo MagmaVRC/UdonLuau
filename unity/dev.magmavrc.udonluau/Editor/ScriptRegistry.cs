@@ -25,6 +25,12 @@ namespace Magma.VRC.UdonLuau
         public readonly List<ScriptVariable> Returns = new List<ScriptVariable>();
     }
 
+    internal sealed class ScriptSignal
+    {
+        public string Name;
+        public readonly List<ScriptVariable> Values = new List<ScriptVariable>();
+    }
+
     internal sealed class ScriptInterface
     {
         public string Name;
@@ -32,6 +38,7 @@ namespace Magma.VRC.UdonLuau
         public string TypeName;
         public readonly List<ScriptVariable> Fields = new List<ScriptVariable>();
         public readonly List<ScriptMethod> Methods = new List<ScriptMethod>();
+        public readonly List<ScriptSignal> Signals = new List<ScriptSignal>();
 
         /// <summary>A stable text form used to detect interface changes.</summary>
         public override string ToString()
@@ -44,6 +51,12 @@ namespace Magma.VRC.UdonLuau
                 foreach (ScriptVariable p in m.Parameters) Append(text, p);
                 text.Append(")->(");
                 foreach (ScriptVariable r in m.Returns) Append(text, r);
+                text.Append(')');
+            }
+            foreach (ScriptSignal s in Signals)
+            {
+                text.Append("s:").Append(s.Name).Append('(');
+                foreach (ScriptVariable v in s.Values) Append(text, v);
                 text.Append(')');
             }
             return text.Append('}').ToString();
@@ -248,6 +261,16 @@ namespace Magma.VRC.UdonLuau
                     if (Native.ul_result_interface_method_value(result, i, 1, j, out NativeScriptVariable v) != 0) method.Returns.Add(Read(v));
                 script.Methods.Add(method);
             }
+
+            int signalCount = Native.ul_result_interface_signal_count?.Invoke(result) ?? 0;
+            for (int i = 0; i < signalCount; i++)
+            {
+                if (Native.ul_result_interface_signal(result, i, out NativeScriptMethod s) == 0) continue;
+                var signal = new ScriptSignal { Name = Native.Read(s.Name) };
+                for (int j = 0; j < s.ParameterCount; j++)
+                    if (Native.ul_result_interface_signal_value(result, i, j, out NativeScriptVariable v) != 0) signal.Values.Add(Read(v));
+                script.Signals.Add(signal);
+            }
             return script;
         }
 
@@ -276,6 +299,14 @@ namespace Magma.VRC.UdonLuau
                 foreach (ScriptVariable r in m.Returns)
                     Native.ul_catalog_add_script_method_value(catalog.Handle, name, method, 1, Native.Utf8(r.Name), Native.Utf8(r.UdonType), Native.Utf8(r.Script), Native.Utf8(r.Symbol));
                 if (m.NetworkCallable) Native.ul_catalog_set_script_method_network_callable?.Invoke(catalog.Handle, name, method, 1);
+            }
+            if (Native.ul_catalog_add_script_signal == null || Native.ul_catalog_add_script_signal_value == null) return;
+            foreach (ScriptSignal s in script.Signals)
+            {
+                byte[] signal = Native.Utf8(s.Name);
+                Native.ul_catalog_add_script_signal(catalog.Handle, name, signal);
+                foreach (ScriptVariable v in s.Values)
+                    Native.ul_catalog_add_script_signal_value(catalog.Handle, name, signal, Native.Utf8(v.UdonType), Native.Utf8(v.Script), Native.Utf8(v.Symbol));
             }
         }
 

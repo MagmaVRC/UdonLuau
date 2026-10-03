@@ -271,7 +271,14 @@ namespace UdonLuau {
                     "    Set: (self: List<T>, index: number, item: T) -> (),\n"
                     "    [number]: T,\n"
                     "}\n"
-                    "declare List: { new: <T>(capacity: number?) -> List<T> }\n\n";
+                    "declare List: { new: <T>(capacity: number?) -> List<T> }\n\n"
+                    "export type Signal<T...> = {\n"
+                    "    Wait: (self: Signal<T...>) -> T...,\n"
+                    "    Fire: (self: Signal<T...>, T...) -> (),\n"
+                    "    Connect: (self: Signal<T...>, fn: (T...) -> ()) -> (),\n"
+                    "    Disconnect: (self: Signal<T...>, fn: (T...) -> ()) -> (),\n"
+                    "}\n"
+                    "declare function Signal<T...>(): Signal<T...>\n\n";
             std::string library;
             for (const Polyfill& p : kPolyfills) {
                 if (IsStandardLibrary(p.library) || p.library == library) continue;
@@ -340,6 +347,12 @@ namespace UdonLuau {
                     if (IsIdentifier(property) && members.insert(property).second)
                         out_ += std::format("    {}: {}\n", property, variableType(getter ? m.returns[0] : m.parameters[0]));
                 }
+                for (const ScriptSignal& s : script->signals) {
+                    if (!IsIdentifier(s.name) || !members.insert(s.name).second) continue;
+                    std::string values;
+                    for (const ScriptVariable& v : s.values) values += (values.empty() ? "" : ", ") + variableType(v);
+                    out_ += std::format("    {}: Signal<{}>\n", s.name, values);
+                }
                 for (const ScriptMethod& m : script->methods) {
                     if (!IsIdentifier(m.name) || m.name.starts_with("get_") || m.name.starts_with("set_") || !members.insert(m.name).second) continue;
                     std::string params = "self";
@@ -385,6 +398,18 @@ namespace UdonLuau {
                 };
                 if (IsIdentifier(root) && !names.contains(root)) out_ += std::format("declare {}: {}\n\n", root, table(root, 0));
             }
+
+            std::string events;
+            for (const EventInfo* e : catalog_.Events()) {
+                if (!IsIdentifier(e->name)) continue;
+                std::string values;
+                for (const EventParameter& p : e->parameters) {
+                    const Type* type = types_.Get(p.type);
+                    values += (values.empty() ? "" : ", ") + (type ? Name(type) : std::string("any"));
+                }
+                events += std::format("    {}: {{ Wait: (self: any) -> ({}) }},\n", e->name, values);
+            }
+            out_ += std::format("declare Events: {{\n{}}}\n\n", events);
 
             out_ += std::format("declare this: {}\n", ClassName(behaviour));
             out_ += std::format("declare gameObject: {}\n", ClassName(types_.Get("UnityEngineGameObject")));
