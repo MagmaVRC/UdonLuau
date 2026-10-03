@@ -76,7 +76,7 @@ namespace {
         return it == script.methods.rend() ? nullptr : &*it;
     }
 
-    UdonLuau::CompileOptions Options(const char* defines, const char* scriptName, int32_t staticPart) {
+    UdonLuau::CompileOptions Options(const char* defines, const char* scriptName, int32_t staticPart, uint32_t flags = 0) {
         UdonLuau::CompileOptions options;
         for (const std::string& pair : SplitList(defines)) {
             size_t eq = pair.find('=');
@@ -84,6 +84,7 @@ namespace {
         }
         options.scriptName = scriptName ? scriptName : "";
         options.staticPart = staticPart != 0;
+        options.compatibleExitReturn = (flags & UL_COMPILE_COMPATIBLE_EXIT_RETURN) != 0;
         return options;
     }
 
@@ -185,6 +186,13 @@ void ul_catalog_add_script(ul_catalog* catalog, const char* name) {
     });
 }
 
+int32_t ul_catalog_set_script_type_name(ul_catalog* catalog, const char* script, const char* type_name) {
+    return EditScript(catalog, script, [&](UdonLuau::ScriptInfo& s) {
+        s.typeName = type_name ? type_name : "";
+        return true;
+    });
+}
+
 int32_t ul_catalog_set_script_singleton(ul_catalog* catalog, const char* script, int32_t singleton) {
     return EditScript(catalog, script, [&](UdonLuau::ScriptInfo& s) {
         s.singleton = singleton != 0;
@@ -237,6 +245,22 @@ ul_result* ul_extract_interface_part(const ul_catalog* catalog, const char* sour
 
 ul_result* ul_compile_part(const ul_catalog* catalog, const char* source, size_t length, const char* defines, const char* script_name, int32_t static_part) {
     return Run(catalog, source, length, Options(defines, script_name, static_part), false);
+}
+
+ul_result* ul_compile_with_options(const ul_catalog* catalog, const char* source, size_t length, const char* defines, const char* script_name, int32_t static_part, uint32_t flags) {
+    return Run(catalog, source, length, Options(defines, script_name, static_part, flags), false);
+}
+
+int32_t ul_result_line_count(const ul_result* result) {
+    return result && result->result.program ? static_cast<int32_t>(result->result.program->lines.size()) : 0;
+}
+
+int32_t ul_result_line(const ul_result* result, int32_t index, uint32_t* address, int32_t* line) {
+    if (!result || !result->result.program || !address || !line || !InRange(index, result->result.program->lines.size())) return 0;
+    const UdonLuau::LineEntry& entry = result->result.program->lines[static_cast<size_t>(index)];
+    *address = entry.address;
+    *line = entry.line;
+    return 1;
 }
 
 int32_t ul_result_has_statics(const ul_result* result) {

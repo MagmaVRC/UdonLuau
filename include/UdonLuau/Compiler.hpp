@@ -35,6 +35,8 @@ namespace UdonLuau {
         std::string scriptName;
         /// <summary>Compile the module's static declarations as its companion singleton instead of the per-instance program.</summary>
         bool staticPart = false;
+        /// <summary>Begin every entry point with UdonSharp's 0xFFFFFFFF exit marker and leave through the return trampoline, so tools that expect UdonSharp's layout can read the program. Costs a few instructions per event.</summary>
+        bool compatibleExitReturn = false;
     };
 
     /// <summary>The name of the companion singleton that holds a script's static fields and functions.</summary>

@@ -67,6 +67,12 @@ namespace UdonLuau {
         uint32_t    address = 0;
     };
 
+    /// <summary>Where a source line's code starts, for mapping a program counter back to the script.</summary>
+    struct LineEntry {
+        uint32_t address = 0;
+        int      line = 0;
+    };
+
     enum class SyncInterpolation : uint8_t {
         None,
         Linear,
@@ -112,6 +118,8 @@ namespace UdonLuau {
         std::vector<NetworkCallable> networkCallables;
         std::vector<FieldAttribute> attributes;
         int                       updateOrder = 0;
+        /// <summary>Code addresses where each compiled statement starts, sorted by address, with zero-based source lines.</summary>
+        std::vector<LineEntry>    lines;
 
         /// <summary>The code in Udon's serialized big-endian byte order.</summary>
         [[nodiscard]] std::vector<uint8_t> ByteCode() const;

@@ -1059,6 +1059,38 @@ end
             "static code cannot use instance fields");
     });
 
+    Case("change callbacks and GetComponent by script type", [] {
+        Fixture f = MakeFixture();
+        f.Extern("UnityEngineComponent.__GetComponents__SystemType__UnityEngineComponentArray", true);
+        ScriptInfo door;
+        door.name = "Door";
+        door.typeName = "UdonLuau.Scripts.Door";
+        f.catalog.AddScript(door);
+        auto p = Build(f, R"(
+-- @onchange(OnScore)
+export local score: int = 0
+local seen = -1
+local function OnScore(old: int)
+    seen = old * 10 + score
+end
+local door: Door
+function Start()
+    door = this:GetComponent(Door)
+end
+)");
+        Check(p.has_value(), "compiles");
+        if (!p) return;
+        Check(std::ranges::any_of(p->entryPoints, [](const EntryPoint& e) { return e.name == "_onVarChange_score"; }), "the change entry point is exported");
+        Check(std::ranges::any_of(p->heap, [](const HeapSlot& s) { return s.value.text == "UdonLuau.Scripts.Door"; }) &&
+                  std::ranges::any_of(p->heap, [](const HeapSlot& s) { return s.value.text.find("GetComponents__SystemType") != std::string::npos; }),
+            "GetComponent(Door) checks each behaviour's type name");
+        Machine m(f, *p);
+        m.Var("score") = int32_t{ 7 };
+        m.Var("_old_score") = int32_t{ 3 };
+        m.Run("_onVarChange_score");
+        Check(std::get<int32_t>(m.Var("seen")) == 37, std::format("the callback sees the old and new value ({})", std::get<int32_t>(m.Var("seen"))));
+    });
+
     Case("UdonSharp overloads and properties", [] {
         Fixture f = MakeFixture();
         ScriptInfo manager;

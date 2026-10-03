@@ -147,6 +147,10 @@ UDONLUAU_API void ul_catalog_add_syncable_type(ul_catalog* catalog, const char* 
 /// <summary>Adds a behaviour script that Luau code can hold typed references to, replacing any earlier one with the same name.</summary>
 UDONLUAU_API void ul_catalog_add_script(ul_catalog* catalog, const char* name);
 
+/// <summary>Sets the type name a script's program stores in __refl_typename, so GetComponent can tell scripts apart on one GameObject.</summary>
+/// <returns>0 when the script is unknown.</returns>
+UDONLUAU_API int32_t ul_catalog_set_script_type_name(ul_catalog* catalog, const char* script, const char* type_name);
+
 /// <summary>Marks a script added earlier as a singleton (singleton 1) or a regular script (singleton 0).</summary>
 /// <returns>0 when the script is unknown.</returns>
 UDONLUAU_API int32_t ul_catalog_set_script_singleton(ul_catalog* catalog, const char* script, int32_t singleton);
@@ -185,6 +189,19 @@ UDONLUAU_API ul_result* ul_compile_part(const ul_catalog* catalog, const char* s
 
 /// <summary>Reads the public interface of one part of a module, as ul_compile_part would compile it.</summary>
 UDONLUAU_API ul_result* ul_extract_interface_part(const ul_catalog* catalog, const char* source, size_t length, const char* defines, const char* script_name, int32_t static_part);
+
+/// <summary>Flag for ul_compile_with_options: begin every entry point with UdonSharp's 0xFFFFFFFF exit marker and leave through the return trampoline, so tools that expect UdonSharp's layout can read the program.</summary>
+#define UL_COMPILE_COMPATIBLE_EXIT_RETURN 1u
+
+/// <summary>Compiles like ul_compile_part, with UL_COMPILE_* flags.</summary>
+UDONLUAU_API ul_result* ul_compile_with_options(const ul_catalog* catalog, const char* source, size_t length, const char* defines, const char* script_name, int32_t static_part, uint32_t flags);
+
+/// <summary>The number of entries in the program's line table.</summary>
+UDONLUAU_API int32_t ul_result_line_count(const ul_result* result);
+
+/// <summary>Entry index of the line table: the code address where a statement's instructions start, and its zero-based source line. Entries are sorted by address.</summary>
+/// <returns>0 when the index is out of range.</returns>
+UDONLUAU_API int32_t ul_result_line(const ul_result* result, int32_t index, uint32_t* address, int32_t* line);
 
 /// <summary>Whether the module declares static fields or functions, so its companion singleton must also be compiled and placed.</summary>
 UDONLUAU_API int32_t ul_result_has_statics(const ul_result* result);

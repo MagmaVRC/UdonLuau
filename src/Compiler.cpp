@@ -278,6 +278,14 @@ namespace UdonLuau {
             Value                target;
         };
 
+        struct ChangeHandler {
+            std::string field;
+            Variable    variable;
+            std::string function;
+            Location    location;
+            Function*   target = nullptr;
+        };
+
         struct DelaySite {
             std::string          entry;
             Label                label;
@@ -641,6 +649,11 @@ namespace UdonLuau {
             std::vector<Value> CallDelay(std::string_view name, std::vector<Value> args, const Location& location);
             std::vector<Value> CallDelayed(const Value& receiver, std::string_view name, std::vector<Value> args, const Location& location);
             void CompileDelaySite(const DelaySite& site);
+            void EmitReturn();
+            Value FindBehaviour(const Value& receiver, std::string_view getter, const Type* wanted, const Location& location);
+            void RecordChangeHandler(const Annotations& annotations, const std::string& field, const Variable& variable, const Location& location);
+            void CompileChangeHandler(const ChangeHandler& handler);
+            void BeginSyntheticEntry(const std::string& name);
             void FindSingletonUses(AstStatBlock* root);
             Value StaticCompanion(const Location& location);
             void CheckInstanceUse(AstLocal* local, const Location& location) const;
@@ -718,6 +731,7 @@ namespace UdonLuau {
             bool                                           singleton_ = false;
             bool                                           hasStatics_ = false;
             uint32_t                                       eventReturnSlot_ = 0;
+            std::vector<ChangeHandler>                     changeHandlers_;
             std::set<std::string, std::less<>>             entryNames_;
             std::unordered_map<AstLocal*, std::string>     staticFields_;
             std::unordered_map<AstLocal*, std::string>     staticFunctions_;
@@ -816,15 +830,23 @@ namespace UdonLuau {
                     Report(e.location, e.message);
                 }
             }
+            for (const ChangeHandler& handler : changeHandlers_) {
+                try {
+                    CompileChangeHandler(handler);
+                } catch (const CompileError& e) {
+                    Report(e.location, e.message);
+                }
+            }
             if (singleton_ && !singletonStarted_) {
                 Label start = emit_.NewLabel();
                 emit_.Bind(start);
                 entries_.push_back({ "_start", *emit_.AddressOf(start) });
+                if (options_.compatibleExitReturn) emit_.Push(haltSlot_);
                 HeapValue yes;
                 yes.kind = ValueKind::Boolean;
                 yes.boolean = true;
                 emit_.Copy(emit_.Constant(types_.Boolean, yes), startedSlot_);
-                emit_.JumpTo(0xFFFFFFFFu);
+                EmitReturn();
             }
             try {
                 EmitSingletonResolver();
@@ -1200,6 +1222,12 @@ namespace UdonLuau {
                 }
             }
 
+            for (ChangeHandler& h : changeHandlers_) {
+                for (const auto& f : functions_)
+                    if (f->name == h.function && !f->event) h.target = f.get();
+                if (h.target) ++h.target->calls;
+            }
+
             for (auto& f : functions_) {
                 NodeCounter counter;
                 f->node->body->visit(&counter);
@@ -1210,7 +1238,7 @@ namespace UdonLuau {
                 }
                 if (f->forceInline && f->noInline) Report(f->location, std::format("'{}' cannot be both @inline and @noinline", f->name));
                 f->inlined = !f->noInline && !f->delayTarget && f->calls > 0 && (f->forceInline || f->size <= kInlineBudget || (f->calls == 1 && !f->exported));
-                f->trampoline = !f->exported || (f->calls > 0 && !f->inlined);
+                f->trampoline = options_.compatibleExitReturn || !f->exported || (f->calls > 0 && !f->inlined);
             }
         }
 
@@ -1331,6 +1359,7 @@ namespace UdonLuau {
                         if (exported) exportedFields_.emplace_back(name, type);
                         emit_.Slot(slot).attributes = annotations.attributes;
                         variables_[var] = { slot, type };
+                        RecordChangeHandler(annotations, name, { slot, type }, var->location);
                         if (annotations.synced) {
                             CheckSynced(name, type, annotations.interpolation, var->location);
                             sync_.push_back({ name, annotations.interpolation });
@@ -1352,6 +1381,7 @@ namespace UdonLuau {
                 if (exported) exportedFields_.emplace_back(name, type);
                 emit_.Slot(slot).attributes = annotations.attributes;
                 variables_[var] = { slot, type };
+                RecordChangeHandler(annotations, name, { slot, type }, var->location);
                 if (annotations.synced) {
                     CheckSynced(name, type, annotations.interpolation, var->location);
                     sync_.push_back({ name, annotations.interpolation });
@@ -1541,6 +1571,7 @@ namespace UdonLuau {
 
         void Compiler::CompileStatementGuarded(AstStat* stat) {
             size_t mark = emit_.TempMark();
+            if (!stat->is<AstStatBlock>()) emit_.MarkLine(static_cast<int>(stat->location.begin.line));
             try {
                 CompileStatement(stat);
             } catch (const CompileError& e) {
@@ -2982,6 +3013,7 @@ namespace UdonLuau {
             emit_.Bind(site.label);
             entries_.push_back({ site.entry, *emit_.AddressOf(site.label) });
             const Location& location = site.location;
+            if (options_.compatibleExitReturn) emit_.Push(haltSlot_);
             if (!singletons_.empty()) {
                 Label resolve = emit_.NewLabel();
                 Label resolved = emit_.NewLabel();
@@ -2990,12 +3022,13 @@ namespace UdonLuau {
                 resolveStubs_.emplace_back(resolve, resolved);
             }
 
+            Label finished = emit_.NewLabel();
             if (site.due || !site.queues.empty()) {
                 const Value& first = site.due ? *site.due : site.queues.front();
                 Label pending = emit_.NewLabel();
                 Value empty = CompareValues(AstExprBinary::CompareLe, Value::OfSlot(ListCount(first).slot, types_.Int32), Value::OfInteger(0), location);
                 emit_.JumpIfFalse(TruthySlot(empty, location), pending);
-                emit_.JumpTo(0xFFFFFFFFu);
+                emit_.Jump(finished);
                 emit_.Bind(pending);
             }
             Variable pick{ emit_.Hidden(types_.Int32), types_.Int32 };
@@ -3042,7 +3075,57 @@ namespace UdonLuau {
             } else {
                 CallScriptMethod(target, *site.scriptMethod, values, 0, location);
             }
-            emit_.JumpTo(0xFFFFFFFFu);
+            emit_.Bind(finished);
+            EmitReturn();
+        }
+
+        void Compiler::BeginSyntheticEntry(const std::string& name) {
+            current_ = nullptr;
+            emit_.ResetTemps();
+            Label entry = emit_.NewLabel();
+            emit_.Bind(entry);
+            entries_.push_back({ name, *emit_.AddressOf(entry) });
+            if (options_.compatibleExitReturn) emit_.Push(haltSlot_);
+            if (!singletons_.empty()) {
+                Label resolve = emit_.NewLabel();
+                Label resolved = emit_.NewLabel();
+                emit_.JumpIfFalse(singletonsReadySlot_, resolve);
+                emit_.Bind(resolved);
+                resolveStubs_.emplace_back(resolve, resolved);
+            }
+        }
+
+        void Compiler::RecordChangeHandler(const Annotations& annotations, const std::string& field, const Variable& variable, const Location& location) {
+            for (const FieldAttribute& a : annotations.attributes) {
+                if (a.name != "onchange") continue;
+                if (a.arguments.size() != 1 || a.arguments[0].empty()) Fail(location, "@onchange takes the name of a function, e.g. @onchange(OnScoreChanged)");
+                changeHandlers_.push_back({ field, variable, a.arguments[0], location, nullptr });
+            }
+        }
+
+        void Compiler::CompileChangeHandler(const ChangeHandler& handler) {
+            if (!handler.target) Fail(handler.location, std::format("@onchange: '{}' is not a function of this script", handler.function));
+            const Function& f = *handler.target;
+            if (f.parameters.size() > 1 || (f.parameters.size() == 1 && f.parameters[0].type != handler.variable.type))
+                Fail(handler.location, std::format("@onchange: '{}' must take no parameters or the old value as {}", handler.function, handler.variable.type->displayName));
+            std::vector<Value> args;
+            if (f.parameters.size() == 1) {
+                uint32_t old = emit_.AddSlot("_old_" + handler.field, handler.variable.type);
+                args.push_back(Value::OfSlot(old, handler.variable.type));
+            }
+            BeginSyntheticEntry("_onVarChange_" + handler.field);
+            CallFunction(handler.target, std::move(args), 0, handler.location, nullptr);
+            EmitReturn();
+        }
+
+        void Compiler::EmitReturn() {
+            if (!options_.compatibleExitReturn) {
+                emit_.JumpTo(0xFFFFFFFFu);
+                return;
+            }
+            emit_.Push(returnJumpSlot_);
+            emit_.CopyFromStack();
+            emit_.JumpIndirect(returnJumpSlot_);
         }
 
         void Compiler::FindSingletonUses(AstStatBlock* root) {
@@ -3903,6 +3986,10 @@ namespace UdonLuau {
 
         std::vector<Value> Compiler::CallMember(const Value& receiver, std::string_view name, std::vector<Value> args, const Type* typeArg, const Location& location) {
             if (receiver.kind != Value::Kind::Slot || !receiver.type) Fail(location, std::format("cannot call '{}' on {}", name, Describe(receiver)));
+            if (name == "GetComponent" || name == "GetComponentInChildren" || name == "GetComponentInParent") {
+                const Type* wanted = typeArg ? typeArg : args.size() == 1 && args[0].kind == Value::Kind::TypeRef ? args[0].type : nullptr;
+                if (wanted && (wanted->script || wanted == types_.Behaviour())) return { FindBehaviour(receiver, name, wanted, location) };
+            }
             bool delayed = name == "SendCustomEventDelayedSeconds" || name == "SendCustomEventDelayedFrames";
             if (delayed && args.size() == 2) args.push_back(Value::OfInteger(0, types_.Get("VRCUdonCommonEnumsEventTiming")));
             size_t eventArg = name == "SendCustomNetworkEvent" ? 1 : 0;
@@ -3931,6 +4018,53 @@ namespace UdonLuau {
             }
             Resolution r = Resolve(methods, args, typeArg, location, std::format("{}.{}", receiver.type->displayName, name));
             return Invoke(r, receiver, args, location);
+        }
+
+        Value Compiler::FindBehaviour(const Value& receiver, std::string_view getter, const Type* wanted, const Location& location) {
+            std::string plural = "GetComponents" + std::string(getter.substr(std::string_view("GetComponent").size()));
+            auto nonGeneric = [&](std::string_view method, const Value& owner) {
+                std::vector<const Method*> methods = MembersWithRenames(owner.type, method, false);
+                std::erase_if(methods, [](const Method* m) { return m->ext->isGeneric; });
+                std::vector<Value> args{ Value::OfType(types_.Behaviour()) };
+                return Invoke(Resolve(methods, args, nullptr, location, std::format("{}.{}", owner.type->displayName, method)), owner, args, location).at(0);
+            };
+            if (!wanted->script) {
+                Value found = nonGeneric(getter, receiver);
+                found.type = types_.Behaviour();
+                return found;
+            }
+            const std::string& typeName = wanted->script->typeName;
+            if (typeName.empty()) Fail(location, std::format("{} has no registered type name, so it cannot be found with {}", wanted->displayName, getter));
+
+            Variable result{ emit_.Hidden(wanted), wanted };
+            Store(Value::OfNil(), Variable{ result.slot, types_.Behaviour() }, location);
+            Variable components{ emit_.Hidden(types_.ArrayOf(types_.Behaviour())), types_.ArrayOf(types_.Behaviour()) };
+            Value all = nonGeneric(plural, receiver);
+            emit_.Copy(all.slot, components.slot);
+            Value list = Value::OfSlot(components.slot, components.type);
+            Variable index{ emit_.Hidden(types_.Int32), types_.Int32 };
+            Store(Value::OfInteger(0), index, location);
+            Variable count{ emit_.Hidden(types_.Int32), types_.Int32 };
+            Store(CallMember(list, "get_Length", {}, nullptr, location).at(0), count, location);
+
+            Label top = emit_.NewLabel();
+            Label next = emit_.NewLabel();
+            Label done = emit_.NewLabel();
+            Value i = Value::OfSlot(index.slot, types_.Int32);
+            emit_.Bind(top);
+            emit_.JumpIfFalse(TruthySlot(CompareValues(AstExprBinary::CompareLt, i, Value::OfSlot(count.slot, types_.Int32), location), location), done);
+            Value candidate = CallMember(list, "Get", { i }, nullptr, location).at(0);
+            candidate.type = types_.Behaviour();
+            Value name = CallMember(candidate, "GetProgramVariable", { Value::OfString("__refl_typename") }, nullptr, location).at(0);
+            name.type = types_.String;
+            emit_.JumpIfFalse(TruthySlot(CompareValues(AstExprBinary::CompareEq, name, Value::OfString(typeName), location), location), next);
+            emit_.Copy(candidate.slot, result.slot);
+            emit_.Jump(done);
+            emit_.Bind(next);
+            Store(CompileArithmetic(AstExprBinary::Add, i, Value::OfInteger(1), location), index, location);
+            emit_.Jump(top);
+            emit_.Bind(done);
+            return Value::OfSlot(result.slot, wanted);
         }
 
         std::vector<Value> Compiler::CallStatic(const Type* owner, std::string_view name, std::vector<Value> args, const Type* typeArg, const Location& location) {

@@ -149,6 +149,16 @@ namespace UdonLuau::Detail {
         return slot < isTemp_.size() && isTemp_[slot];
     }
 
+    void Emitter::MarkLine(int line) {
+        uint32_t here = Here();
+        if (!lines_.empty() && lines_.back().address == here) {
+            lines_.back().line = line;
+            return;
+        }
+        if (!lines_.empty() && lines_.back().line == line) return;
+        lines_.push_back({ here, line });
+    }
+
     Label Emitter::NewLabel() {
         labels_.emplace_back();
         return { static_cast<int>(labels_.size() - 1) };
@@ -244,6 +254,8 @@ namespace UdonLuau::Detail {
         program.heap = std::move(heap_);
         program.entryPoints = std::move(entries);
         program.sync = std::move(sync);
+        std::ranges::stable_sort(lines_, {}, &LineEntry::address);
+        program.lines = std::move(lines_);
         return program;
     }
 

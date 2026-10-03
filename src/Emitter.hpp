@@ -36,6 +36,8 @@ namespace UdonLuau::Detail {
         void MarkConstant(uint32_t slot);
         [[nodiscard]] bool IsConstant(uint32_t slot) const;
 
+        void MarkLine(int line);
+
         [[nodiscard]] Label NewLabel();
         void Bind(Label label);
 
@@ -83,6 +85,7 @@ namespace UdonLuau::Detail {
         std::vector<std::pair<uint32_t, int>>       slotFixups_;
         std::optional<size_t>                       lastResultOperand_;
         std::map<std::pair<uint32_t, uint32_t>, uint32_t> reads_;
+        std::vector<LineEntry>                      lines_;
     };
 
 } // namespace UdonLuau::Detail

@@ -87,6 +87,8 @@ namespace UdonLuau {
         std::vector<ScriptMethod>   methods;
         std::vector<ScriptVariable> fields;
         bool                        singleton = false;
+        /// <summary>The type name the script's program stores in __refl_typename, used to find it among a GameObject's behaviours.</summary>
+        std::string                 typeName;
     };
 
     /// <summary>Everything the host exposes to Udon: types, extern signatures and events.
