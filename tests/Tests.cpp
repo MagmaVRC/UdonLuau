@@ -897,7 +897,7 @@ end
             log.push_back("find:" + As<std::string>(h, p[0]));
             h[p[1]] = BehaviourRef{ 0 };
         });
-        f.Extern("UnityEngineGameObject.__GetComponent__T", true, [](auto& h, auto& p) { h[p[2]] = h[p[0]]; });
+        f.Extern("UnityEngineGameObject.__GetComponent__SystemType__UnityEngineComponent", true, [](auto& h, auto& p) { h[p[2]] = h[p[0]]; });
         f.impls["UnityEngineObject.__op_Inequality__UnityEngineObject_UnityEngineObject__SystemBoolean"] = [](auto& h, auto& p) {
             h[p[2]] = std::holds_alternative<BehaviourRef>(h[p[0]]) && std::get<BehaviourRef>(h[p[0]]).id >= 0;
         };

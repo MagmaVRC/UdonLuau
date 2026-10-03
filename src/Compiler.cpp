@@ -2978,7 +2978,10 @@ namespace UdonLuau {
                 Label missing = emit_.NewLabel();
                 Label next = emit_.NewLabel();
                 emit_.JumpIfFalse(TruthySlot(found, location), missing);
-                Value behaviour = CallMember(found, "GetComponent", {}, types_.Behaviour(), location).at(0);
+                std::vector<const Method*> getters = types_.Methods(found.type, "GetComponent", false, true);
+                std::erase_if(getters, [](const Method* m) { return m->ext->isGeneric; });
+                std::vector<Value> args{ Value::OfType(types_.Behaviour()) };
+                Value behaviour = Invoke(Resolve(getters, args, nullptr, location, "GameObject.GetComponent"), found, args, location).at(0);
                 emit_.Copy(behaviour.slot, use.slot);
                 emit_.Jump(next);
                 emit_.Bind(missing);
