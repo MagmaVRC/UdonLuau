@@ -159,6 +159,17 @@ namespace UdonLuau::Detail {
         return &type;
     }
 
+    const Type* TypeTable::ListOf(const Type* element) {
+        if (auto it = lists_.find(element); it != lists_.end()) return it->second;
+        Type& type = storage_.emplace_back();
+        type.udonName = "List<" + element->udonName + ">";
+        type.displayName = "List<" + element->displayName + ">";
+        type.element = element;
+        type.listArray = ArrayOf(element);
+        lists_.emplace(element, &type);
+        return &type;
+    }
+
     const Type* TypeTable::FindByFullName(std::string_view fullName) {
         if (const TypeInfo* info = catalog_.FindTypeByFullName(fullName)) return Get(info->udonName);
         for (const Builtin& b : kBuiltins)

@@ -187,6 +187,18 @@ namespace {
             auto it = std::ranges::find(xs, As<int32_t>(h, p[1]));
             h[p[2]] = it == xs.end() ? -1 : static_cast<int32_t>(it - xs.begin());
         });
+        f.Extern("SystemArray.__Copy__SystemArray_SystemArray_SystemInt32__SystemVoid", false, [](auto& h, auto& p) {
+            auto& from = *As<IntArray>(h, p[0]);
+            std::copy_n(from.begin(), As<int32_t>(h, p[2]), As<IntArray>(h, p[1])->begin());
+        });
+        f.Extern("SystemArray.__IndexOf__SystemArray_SystemObject_SystemInt32_SystemInt32__SystemInt32", false, [](auto& h, auto& p) {
+            auto& xs = *As<IntArray>(h, p[0]);
+            int32_t start = As<int32_t>(h, p[2]), n = As<int32_t>(h, p[3]);
+            auto end = xs.begin() + start + n;
+            auto it = std::find(xs.begin() + start, end, As<int32_t>(h, p[1]));
+            h[p[4]] = it == end ? -1 : static_cast<int32_t>(it - xs.begin());
+        });
+        f.Extern("UnityEngineMathf.__Max__SystemInt32_SystemInt32__SystemInt32", false, [](auto& h, auto& p) { h[p[2]] = std::max(As<int32_t>(h, p[0]), As<int32_t>(h, p[1])); });
         f.Extern("UnityEngineMathf.__Min__SystemInt32_SystemInt32__SystemInt32", false, [](auto& h, auto& p) { h[p[2]] = std::min(As<int32_t>(h, p[0]), As<int32_t>(h, p[1])); });
         f.Extern("SystemString.__Format__SystemString_SystemObject_SystemObject__SystemString", false);
         f.Extern("UnityEngineComponent.__GetComponent__T", true);
@@ -231,6 +243,11 @@ namespace {
                 return scratch.back();
             }
             case ValueKind::Array: {
+                if (t == "SystemInt32Array") {
+                    auto ints = std::make_shared<std::vector<int32_t>>();
+                    for (const HeapValue& e : v.arguments) ints->push_back(static_cast<int32_t>(e.integer));
+                    return ints;
+                }
                 std::vector<uint32_t> elements;
                 for (const HeapValue& e : v.arguments) elements.push_back(static_cast<uint32_t>(e.unsignedInteger));
                 return elements;
@@ -793,6 +810,61 @@ end
         Check(std::get<int32_t>(m.Var("n")) == 27213, std::format("insert, remove, create and min ({})", std::get<int32_t>(m.Var("n"))));
         Check(std::get<int32_t>(m.Var("found")) == 1, "find");
         Check(std::ranges::any_of(p->heap, [](const HeapSlot& s) { return s.value.text == "{0} items, {1:F2}% {{x}}"; }), "format string translated");
+    });
+
+    Case("List<T> is an array plus a count", [] {
+        Fixture f = MakeFixture();
+        auto p = Build(f, R"(
+local items: List<int> = {5, 6}
+local total = 0
+local count = 0
+local found = 0
+local removed = 0
+local flag = false
+local size = 0
+-- @inline
+local function sum(xs: List<int>): int
+    local s = 0
+    for _, v in xs do
+        s += v
+    end
+    return s
+end
+function Start()
+    for i = 1, 10 do
+        items:Add(i)
+    end
+    items:Insert(0, 100)
+    items:RemoveAt(1)
+    removed = table.remove(items)
+    table.insert(items, 7)
+    found = items:IndexOf(6)
+    items[2] += 1
+    count = #items
+    total = sum(items)
+end
+export function Local()
+    local ys: List<int> = List.new(1)
+    ys:Add(3)
+    ys:Add(4)
+    ys:Add(5)
+    local ok = ys:Remove(4)
+    flag = ok and ys:Contains(5) and not ys:Contains(4)
+    size = #ys:ToArray()
+end
+)");
+        Check(p.has_value(), "compiles");
+        if (!p) return;
+        Machine m(f, *p);
+        m.Run("_start");
+        Check(std::get<int32_t>(m.Var("count")) == 12 && std::get<int32_t>(m.Var("removed")) == 10 && std::get<int32_t>(m.Var("found")) == 1,
+            std::format("count {} removed {} found {}", std::get<int32_t>(m.Var("count")), std::get<int32_t>(m.Var("removed")), std::get<int32_t>(m.Var("found"))));
+        Check(std::get<int32_t>(m.Var("total")) == 159, std::format("sum through an inlined List parameter ({})", std::get<int32_t>(m.Var("total"))));
+        m.Run("_Local");
+        Check(std::get<bool>(m.Var("flag")) && std::get<int32_t>(m.Var("size")) == 2, "local list remove, contains and ToArray");
+
+        Fixture g = MakeFixture();
+        Check(!Build(g, "local xs: List<int> = {}\nlocal ys: List<int> = {}\nfunction Start()\n    ys = xs\nend\n").has_value(), "lists cannot be copied");
     });
 
     Case("negated conditions branch without an extern", [] {

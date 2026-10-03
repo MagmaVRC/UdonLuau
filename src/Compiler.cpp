@@ -572,6 +572,23 @@ namespace UdonLuau {
             void Store(const Value& value, const Variable& destination, const Location& location);
             Value Evaluate(const Value& value);
             Function* Callee(AstExpr* func) const;
+            struct ListInit {
+                bool                   ok = false;
+                std::vector<AstExpr*>  items;
+                AstExpr*               capacity = nullptr;
+            };
+            ListInit ParseListInit(AstExpr* init) const;
+            Variable DeclareListStorage(const std::string& name, const Type* type, bool field, HeapValue array, int64_t count);
+            void InitList(const Value& list, AstExpr* init, const Location& location);
+            Value ListArray(const Value& list) const { return Value::OfSlot(list.slot, list.type->listArray); }
+            Variable ListCount(const Value& list) const { return { list.slot + 1, types_.Int32 }; }
+            Variable ListCapacity(const Value& list) const { return { list.slot + 2, types_.Int32 }; }
+            void GrowList(const Value& list, const Value& needed, const Location& location);
+            void CheckListIndex(const Value& list, const Value& index, const Location& location);
+            Value ListIndexOf(const Value& list, const Value& item, const Location& location);
+            void ListRemoveAt(const Value& list, const Value& index, const Location& location);
+            std::vector<Value> CallList(const Value& list, std::string_view name, std::vector<Value> args, const Location& location);
+            std::vector<Value> TableOnList(std::string_view name, std::vector<Value> args, const Location& location);
             std::optional<std::string_view> LibraryName(AstExpr* expr) const;
             std::vector<Value> CallLibrary(std::string_view library, std::string_view name, AstExprCall* call, std::vector<Value> args, const Type* typeArg, const Variable* into);
             std::vector<Value> CallMath(std::string_view name, std::vector<Value> args, const Location& location);
@@ -1076,6 +1093,23 @@ namespace UdonLuau {
                 if (!userSymbols_.insert(name).second) Fail(var->location, std::format("'{}' is already declared", name));
 
                 const Type* type = var->annotation ? ResolveType(var->annotation) : nullptr;
+                if (type && type->IsList()) {
+                    if (stat->isExported) Fail(var->location, "a List cannot be exported; export an array instead");
+                    if (stat->isConst) Fail(var->location, "a List cannot be a constant");
+                    if (annotations.synced) Fail(var->location, "a List cannot be synced; sync an array instead");
+                    ListInit parsed = ParseListInit(i < stat->values.size ? stat->values.data[i] : nullptr);
+                    if (!parsed.ok) Fail(var->location, "initialize a List field with {} or constant items, e.g. {1, 2, 3}");
+                    HeapValue array;
+                    array.kind = ValueKind::Array;
+                    array.text = type->element->udonName;
+                    for (AstExpr* item : parsed.items) {
+                        Value v = CompileExpr(item, type->element);
+                        if (!v.IsLiteral()) Fail(item->location, "field initializers must be constants; assign other values in Start");
+                        array.arguments.push_back(Literal(v, type->element, item->location));
+                    }
+                    variables_[var] = DeclareListStorage(name, type, true, std::move(array), static_cast<int64_t>(parsed.items.size()));
+                    continue;
+                }
                 HeapValue initial;
                 if (i < stat->values.size) {
                     AstExpr* init = stat->values.data[i];
@@ -1190,6 +1224,12 @@ namespace UdonLuau {
                 } else {
                     if (!arg->annotation) Fail(arg->location, std::format("parameter '{}' needs a type annotation", arg->name.value));
                     type = ResolveType(arg->annotation);
+                    if (type->IsList()) {
+                        if (f->exported) Fail(arg->location, "public methods cannot take a List; take an array instead");
+                        variables_[arg] = { 0, type };
+                        f->parameters.push_back({ 0, type });
+                        continue;
+                    }
                     slot = f->exported ? emit_.AddSlot(ExportId(std::string(arg->name.value) + "__param"), type) : emit_.Local(arg->name.value, type);
                 }
                 variables_[arg] = { slot, type };
@@ -1200,6 +1240,7 @@ namespace UdonLuau {
                 if (pack->typeList.tailType) Fail(pack->location, "variadic returns are not supported");
                 for (AstType* t : pack->typeList.types) {
                     const Type* type = ResolveType(t);
+                    if (type->IsList()) Fail(t->location, "functions cannot return a List; return list:ToArray() instead");
                     std::string symbol = f->exported ? ExportId(f->entryName + (f->returns.empty() ? std::string("__ret") : std::format("__ret{}", f->returns.size()))) : std::string();
                     f->returns.push_back(type);
                     f->returnSlots.push_back(f->exported ? emit_.AddSlot(symbol, type) : emit_.Hidden(type));
@@ -1217,6 +1258,8 @@ namespace UdonLuau {
 
         void Compiler::CompileFunction(Function& f) {
             if (!f.exported && (f.inlined || f.calls == 0)) return;
+            for (const Variable& p : f.parameters)
+                if (p.type->IsList()) Fail(f.location, std::format("'{}' takes a List, so it must be inlined; mark it '-- @inline'", f.name));
             current_ = &f;
             emit_.ResetTemps();
             for (size_t i = 0; i < f.parameters.size(); ++i) {
@@ -1325,6 +1368,17 @@ namespace UdonLuau {
         void Compiler::CompileLocal(AstStatLocal* stat) {
             std::vector<const Type*> expected;
             for (AstLocal* var : stat->vars) expected.push_back(var->annotation ? ResolveType(var->annotation) : nullptr);
+            if (std::ranges::any_of(expected, [](const Type* t) { return t && t->IsList(); })) {
+                if (stat->vars.size != 1 || stat->values.size > 1) Fail(stat->location, "declare one List per 'local'");
+                if (stat->isConst) Fail(stat->location, "a List cannot be a constant");
+                AstLocal* var = stat->vars.data[0];
+                CheckUserName(var->name.value, var->location);
+                aliases_.erase(var);
+                Variable list = DeclareListStorage(var->name.value, expected[0], false, {}, 0);
+                InitList(Value::OfSlot(list.slot, list.type), stat->values.size ? stat->values.data[0] : nullptr, stat->location);
+                variables_[var] = list;
+                return;
+            }
 
             std::vector<Value> values = EvaluateList(stat->values, stat->vars.size, expected);
             for (size_t i = 0; i < stat->vars.size; ++i) {
@@ -1404,13 +1458,19 @@ namespace UdonLuau {
         }
 
         Value Compiler::Evaluate(const Value& value) {
-            if (value.kind != Value::Kind::Slot || emit_.IsTemp(value.slot) || emit_.IsConstant(value.slot)) return value;
+            if (value.kind != Value::Kind::Slot || value.type->IsList() || emit_.IsTemp(value.slot) || emit_.IsConstant(value.slot)) return value;
             uint32_t t = emit_.Temp(value.type);
             emit_.Copy(value.slot, t);
             return Value::OfSlot(t, value.type);
         }
 
         void Compiler::CompileAssign(AstStatAssign* stat) {
+            if (stat->vars.size == 1 && stat->values.size == 1)
+                if (auto* local = Unwrap(stat->vars.data[0])->as<AstExprLocal>())
+                    if (auto it = variables_.find(local->local); it != variables_.end() && it->second.type->IsList()) {
+                        InitList(Value::OfSlot(it->second.slot, it->second.type), stat->values.data[0], stat->location);
+                        return;
+                    }
             std::vector<Value> values;
             if (stat->vars.size == 1 && stat->values.size == 1) {
                 const Variable* into = nullptr;
@@ -1452,6 +1512,7 @@ namespace UdonLuau {
                 return;
             }
             if (owner.kind != Value::Kind::Slot || !owner.type) Fail(location, std::format("cannot assign to a member of {}", Describe(owner)));
+            if (owner.type->IsList()) Fail(location, std::format("List.{} is read-only", name));
             if (const ScriptInfo* script = owner.type->script) {
                 auto field = std::ranges::find(script->fields, name, &ScriptVariable::name);
                 if (field != script->fields.end()) {
@@ -1473,6 +1534,7 @@ namespace UdonLuau {
 
         Value Compiler::ReadIndex(const Value& owner, const Value& key, const Location& location) {
             if (owner.kind != Value::Kind::Slot || !owner.type) Fail(location, std::format("cannot index {}", Describe(owner)));
+            if (owner.type->IsList()) return CallList(owner, "Get", { key }, location).at(0);
             std::string_view method = owner.type->kind == TypeKind::Array ? "Get" : "get_Item";
             Value item = CallMember(owner, method, { key }, nullptr, location).at(0);
             if (owner.type->kind == TypeKind::Array && owner.type->element && owner.type->element->script) item.type = owner.type->element;
@@ -1481,6 +1543,10 @@ namespace UdonLuau {
 
         void Compiler::WriteIndex(const Value& owner, const Value& key, const Value& value, const Location& location) {
             if (owner.kind != Value::Kind::Slot || !owner.type) Fail(location, std::format("cannot index {}", Describe(owner)));
+            if (owner.type->IsList()) {
+                CallList(owner, "Set", { key, value }, location);
+                return;
+            }
             std::string_view method = owner.type->kind == TypeKind::Array ? "Set" : "set_Item";
             CallMember(owner, method, { key, value }, nullptr, location);
         }
@@ -1829,17 +1895,22 @@ namespace UdonLuau {
                     Fail(source->location, "iterate arrays directly: 'for i, value in array do' (indices start at 0)");
 
             Value collection = CompileExpr(source);
-            if (collection.kind != Value::Kind::Slot || collection.type->kind != TypeKind::Array)
+            bool isList = collection.kind == Value::Kind::Slot && collection.type->IsList();
+            if (!isList && (collection.kind != Value::Kind::Slot || collection.type->kind != TypeKind::Array))
                 Fail(source->location, std::format("cannot iterate {}", Describe(collection)));
 
-            const Type* arrayType = collection.type;
+            const Type* arrayType = isList ? collection.type->listArray : collection.type;
             Variable array{ emit_.Hidden(arrayType), arrayType };
-            Store(collection, array, source->location);
+            Store(isList ? ListArray(collection) : collection, array, source->location);
             Variable index{ emit_.Hidden(types_.Int32), types_.Int32 };
             Store(Value::OfInteger(0), index, stat->location);
             Variable length{ emit_.Hidden(types_.Int32), types_.Int32 };
-            std::vector<Value> len = CallMember(Value::OfSlot(array.slot, arrayType), "get_Length", {}, nullptr, source->location);
-            Store(len.at(0), length, source->location);
+            if (isList) {
+                Store(Value::OfSlot(ListCount(collection).slot, types_.Int32), length, source->location);
+            } else {
+                std::vector<Value> len = CallMember(Value::OfSlot(array.slot, arrayType), "get_Length", {}, nullptr, source->location);
+                Store(len.at(0), length, source->location);
+            }
 
             AstLocal* k = stat->vars.data[0];
             bool keyIsIndex = Immutable(k, types_.Int32);
@@ -1995,6 +2066,7 @@ namespace UdonLuau {
             if (name == "this" || name == "gameObject" || name == "transform") return SelfValue(name);
             if (auto it = globalFunctions_.find(std::string(name)); it != globalFunctions_.end()) return Value::OfFunction(it->second);
             if (auto it = defines_.find(std::string(name)); it != defines_.end()) return it->second;
+            if (name == "List") Fail(expr->location, "declare lists with their type: 'local xs: List<int> = {}'");
 
             if (auto it = typeAliases_.find(std::string(name)); it != typeAliases_.end()) return Value::OfType(it->second);
             if (const ScriptInfo* script = catalog_.FindScript(name)) return Value::OfType(types_.Script(script));
@@ -2017,6 +2089,11 @@ namespace UdonLuau {
         Value Compiler::ReadMember(const Value& owner, std::string_view name, const Location& location) {
             if (owner.kind == Value::Kind::Nil || owner.kind == Value::Kind::None)
                 Fail(location, std::format("cannot read '{}' of {}", name, Describe(owner)));
+            if (owner.kind == Value::Kind::Slot && owner.type->IsList()) {
+                if (name == "Count") return Value::OfSlot(ListCount(owner).slot, types_.Int32);
+                if (name == "Capacity") return Value::OfSlot(ListCapacity(owner).slot, types_.Int32);
+                Fail(location, std::format("List has no property '{}'; call methods with ':'", name));
+            }
 
             if (owner.kind == Value::Kind::Namespace) {
                 std::string path = owner.text + "." + std::string(name);
@@ -2074,6 +2151,7 @@ namespace UdonLuau {
                     Value v = CompileExpr(expr->expr);
                     if (v.kind == Value::Kind::String) return Value::OfInteger(static_cast<int64_t>(v.text.size()));
                     if (v.kind != Value::Kind::Slot) Fail(expr->location, std::format("cannot take the length of {}", Describe(v)));
+                    if (v.type->IsList()) return Value::OfSlot(ListCount(v).slot, types_.Int32);
                     bool hasLength = !types_.Methods(v.type, "get_Length", false, true).empty();
                     return CallMember(v, hasLength ? "get_Length" : "get_Count", {}, nullptr, expr->location).at(0);
                 }
@@ -2461,6 +2539,7 @@ namespace UdonLuau {
                 auto* index = func->as<AstExprIndexName>();
                 Value receiver = *selfReceiver;
                 std::string_view name = index->index.value;
+                if (receiver.kind == Value::Kind::Slot && receiver.type->IsList()) return CallList(receiver, name, std::move(args), call->location);
                 if (receiver.kind == Value::Kind::Network) {
                     std::string entry(name);
                     std::vector<Value> sent{ Value::OfInteger(receiver.integer, receiver.targetType), Value::OfString(entry) };
@@ -2766,6 +2845,7 @@ namespace UdonLuau {
 
         std::vector<Value> Compiler::CallTable(std::string_view name, AstExprCall* call, std::vector<Value> args, const Type* typeArg, const Variable* into) {
             const Location& location = call->location;
+            if (!args.empty() && args[0].kind == Value::Kind::Slot && args[0].type->IsList()) return TableOnList(name, std::move(args), location);
             auto writable = [&](size_t i) {
                 AstExpr* target = Unwrap(call->args.data[i]);
                 if (!target->is<AstExprLocal>() && !target->is<AstExprIndexName>() && !target->is<AstExprIndexExpr>())
@@ -2889,6 +2969,224 @@ namespace UdonLuau {
             Fail(location, std::format("table.{} is not supported", name));
         }
 
+        Compiler::ListInit Compiler::ParseListInit(AstExpr* init) const {
+            ListInit result;
+            if (!init) {
+                result.ok = true;
+                return result;
+            }
+            init = Unwrap(init);
+            if (auto* table = init->as<AstExprTable>()) {
+                for (const AstExprTable::Item& item : table->items) {
+                    if (item.kind != AstExprTable::Item::Kind::List) return result;
+                    result.items.push_back(item.value);
+                }
+                result.ok = true;
+                return result;
+            }
+            auto* call = init->as<AstExprCall>();
+            auto* index = call && !call->self ? Unwrap(call->func)->as<AstExprIndexName>() : nullptr;
+            auto* owner = index ? Unwrap(index->expr)->as<AstExprGlobal>() : nullptr;
+            if (!owner || std::string_view(owner->name.value) != "List" || std::string_view(index->index.value) != "new" || call->args.size > 1) return result;
+            if (call->args.size) result.capacity = call->args.data[0];
+            result.ok = true;
+            return result;
+        }
+
+        Variable Compiler::DeclareListStorage(const std::string& name, const Type* type, bool field, HeapValue array, int64_t count) {
+            HeapValue size;
+            size.kind = ValueKind::Integer;
+            size.integer = count;
+            uint32_t slot = field ? emit_.AddSlot(name, type->listArray, std::move(array)) : emit_.Local(name, type->listArray);
+            uint32_t countSlot = field ? emit_.AddSlot("__lstcount_" + name, types_.Int32, size) : emit_.Local(name + "Count", types_.Int32);
+            uint32_t capacitySlot = field ? emit_.AddSlot("__lstcap_" + name, types_.Int32, size) : emit_.Local(name + "Capacity", types_.Int32);
+            if (countSlot != slot + 1 || capacitySlot != slot + 2) throw std::logic_error("list slots are not adjacent");
+            if (field) fieldSlots_.insert({ slot, countSlot, capacitySlot });
+            return { slot, type };
+        }
+
+        void Compiler::InitList(const Value& list, AstExpr* init, const Location& location) {
+            ListInit parsed = ParseListInit(init);
+            if (!parsed.ok) Fail(init ? init->location : location, "set a List with {}, {a, b, c} or List.new(capacity); lists cannot be copied, use list:ToArray()");
+            const Type* element = list.type->element;
+            int64_t n = static_cast<int64_t>(parsed.items.size());
+            Value capacity = parsed.capacity ? CompileExpr(parsed.capacity, types_.Int32) : Value::OfInteger(n ? n : 4);
+            if (capacity.kind == Value::Kind::Slot && emit_.IsTemp(capacity.slot)) {
+                Variable held{ emit_.Hidden(types_.Int32), types_.Int32 };
+                Store(capacity, held, location);
+                capacity = Value::OfSlot(held.slot, types_.Int32);
+            }
+            Store(NewArray(list.type->listArray, capacity, location), { list.slot, list.type->listArray }, location);
+            for (size_t i = 0; i < parsed.items.size(); ++i)
+                CallMember(ListArray(list), "Set", { Value::OfInteger(static_cast<int64_t>(i)), CompileExpr(parsed.items[i], element) }, nullptr, location);
+            Store(Value::OfInteger(n), ListCount(list), location);
+            Store(capacity, ListCapacity(list), location);
+        }
+
+        void Compiler::GrowList(const Value& list, const Value& needed, const Location& location) {
+            Label enough = emit_.NewLabel();
+            Value capacity = Value::OfSlot(ListCapacity(list).slot, types_.Int32);
+            emit_.JumpIfFalse(TruthySlot(CompareValues(AstExprBinary::CompareGt, needed, capacity, location), location), enough);
+            Value doubled = CompileArithmetic(AstExprBinary::Mul, capacity, Value::OfInteger(2), location);
+            Value grown = CallStatic(types_.Get("UnityEngineMathf"), "Max", { doubled, Value::OfInteger(4) }, nullptr, location).at(0);
+            Value array = NewArray(list.type->listArray, grown, location);
+            CallStatic(types_.Get("SystemArray"), "Copy", { ListArray(list), array, Value::OfSlot(ListCount(list).slot, types_.Int32) }, nullptr, location);
+            Store(array, { list.slot, list.type->listArray }, location);
+            Store(grown, ListCapacity(list), location);
+            emit_.Bind(enough);
+        }
+
+        void Compiler::CheckListIndex(const Value& list, const Value& index, const Location& location) {
+            auto debug = defines_.find("DEBUG");
+            if (debug == defines_.end() || !IsTruthy(debug->second)) return;
+            Label fine = emit_.NewLabel();
+            Value outside = CompareValues(AstExprBinary::CompareGe, index, Value::OfSlot(ListCount(list).slot, types_.Int32), location);
+            emit_.JumpIfFalse(TruthySlot(outside, location), fine);
+            CallStatic(types_.Get("UnityEngineDebug"), "LogError", { Value::OfString(std::format("List index out of range at line {}", location.begin.line + 1)) }, nullptr, location);
+            emit_.Bind(fine);
+        }
+
+        Value Compiler::ListIndexOf(const Value& list, const Value& item, const Location& location) {
+            std::vector<const Method*> methods = StaticMethods({ types_.Get("SystemArray") }, "IndexOf");
+            std::erase_if(methods, [](const Method* m) { return m->ext->isGeneric; });
+            std::vector<Value> args{ ListArray(list), item, Value::OfInteger(0), Value::OfSlot(ListCount(list).slot, types_.Int32) };
+            Resolution r = Resolve(methods, args, nullptr, location, "List:IndexOf");
+            return Invoke(r, std::nullopt, args, location).at(0);
+        }
+
+        void Compiler::ListRemoveAt(const Value& list, const Value& index, const Location& location) {
+            Value count = Value::OfSlot(ListCount(list).slot, types_.Int32);
+            Store(CompileArithmetic(AstExprBinary::Sub, count, Value::OfInteger(1), location), ListCount(list), location);
+            Value moved = CompileArithmetic(AstExprBinary::Sub, count, index, location);
+            CallStatic(types_.Get("SystemArray"), "Copy",
+                { ListArray(list), CompileArithmetic(AstExprBinary::Add, index, Value::OfInteger(1), location), ListArray(list), index, moved }, nullptr, location);
+            if (list.type->element->IsReference()) CallMember(ListArray(list), "Set", { count, Value::OfNil() }, nullptr, location);
+        }
+
+        std::vector<Value> Compiler::CallList(const Value& list, std::string_view name, std::vector<Value> args, const Location& location) {
+            const Type* element = list.type->element;
+            Value count = Value::OfSlot(ListCount(list).slot, types_.Int32);
+            auto arity = [&](size_t n) {
+                if (args.size() != n) Fail(location, std::format("List:{} takes {} argument(s)", name, n));
+            };
+            auto held = [&](const Value& v, const Type* type) {
+                if (v.kind != Value::Kind::Slot || !emit_.IsTemp(v.slot)) return v;
+                Variable h{ emit_.Hidden(type), type };
+                Store(v, h, location);
+                return Value::OfSlot(h.slot, type);
+            };
+            if (name == "Add") {
+                arity(1);
+                Value next = held(CompileArithmetic(AstExprBinary::Add, count, Value::OfInteger(1), location), types_.Int32);
+                GrowList(list, next, location);
+                CallMember(ListArray(list), "Set", { count, args[0] }, nullptr, location);
+                Store(next, ListCount(list), location);
+                return { Value::OfNil() };
+            }
+            if (name == "Insert") {
+                arity(2);
+                Value at = held(args[0], types_.Int32);
+                Value next = held(CompileArithmetic(AstExprBinary::Add, count, Value::OfInteger(1), location), types_.Int32);
+                GrowList(list, next, location);
+                CallStatic(types_.Get("SystemArray"), "Copy",
+                    { ListArray(list), at, ListArray(list), CompileArithmetic(AstExprBinary::Add, at, Value::OfInteger(1), location),
+                      CompileArithmetic(AstExprBinary::Sub, count, at, location) }, nullptr, location);
+                CallMember(ListArray(list), "Set", { at, args[1] }, nullptr, location);
+                Store(next, ListCount(list), location);
+                return { Value::OfNil() };
+            }
+            if (name == "RemoveAt") {
+                arity(1);
+                CheckListIndex(list, args[0], location);
+                ListRemoveAt(list, held(args[0], types_.Int32), location);
+                return { Value::OfNil() };
+            }
+            if (name == "Remove") {
+                arity(1);
+                Value index = held(ListIndexOf(list, args[0], location), types_.Int32);
+                Variable found{ emit_.Hidden(types_.Boolean), types_.Boolean };
+                Store(CompareValues(AstExprBinary::CompareGe, index, Value::OfInteger(0), location), found, location);
+                Label skip = emit_.NewLabel();
+                emit_.JumpIfFalse(found.slot, skip);
+                ListRemoveAt(list, index, location);
+                emit_.Bind(skip);
+                return { Value::OfSlot(found.slot, types_.Boolean) };
+            }
+            if (name == "IndexOf") {
+                arity(1);
+                return { ListIndexOf(list, args[0], location) };
+            }
+            if (name == "Contains") {
+                arity(1);
+                return { CompareValues(AstExprBinary::CompareGe, ListIndexOf(list, args[0], location), Value::OfInteger(0), location) };
+            }
+            if (name == "Clear") {
+                arity(0);
+                if (element->IsReference()) CallStatic(types_.Get("SystemArray"), "Clear", { ListArray(list), Value::OfInteger(0), count }, nullptr, location);
+                Store(Value::OfInteger(0), ListCount(list), location);
+                return { Value::OfNil() };
+            }
+            if (name == "ToArray") {
+                arity(0);
+                Value copy = NewArray(list.type->listArray, count, location);
+                CallStatic(types_.Get("SystemArray"), "Copy", { ListArray(list), copy, count }, nullptr, location);
+                return { copy };
+            }
+            if (name == "Sort" || name == "Reverse") {
+                arity(0);
+                CallStatic(types_.Get("SystemArray"), name, { ListArray(list), Value::OfInteger(0), count }, nullptr, location);
+                return { Value::OfNil() };
+            }
+            if (name == "Get") {
+                arity(1);
+                CheckListIndex(list, args[0], location);
+                return CallMember(ListArray(list), "Get", { args[0] }, nullptr, location);
+            }
+            if (name == "Set") {
+                arity(2);
+                CheckListIndex(list, args[0], location);
+                CallMember(ListArray(list), "Set", { args[0], args[1] }, nullptr, location);
+                return { Value::OfNil() };
+            }
+            Fail(location, std::format("List has no method '{}'; available: Add, Insert, Remove, RemoveAt, IndexOf, Contains, Clear, ToArray, Sort, Reverse, Get, Set", name));
+        }
+
+        std::vector<Value> Compiler::TableOnList(std::string_view name, std::vector<Value> args, const Location& location) {
+            Value list = args[0];
+            std::vector<Value> rest(args.begin() + 1, args.end());
+            if (name == "insert") {
+                std::string_view method = rest.size() == 1 ? "Add" : "Insert";
+                return CallList(list, method, std::move(rest), location);
+            }
+            if (name == "remove") {
+                if (rest.size() > 1) Fail(location, "table.remove takes a list and an optional position");
+                Value index = rest.empty() ? CompileArithmetic(AstExprBinary::Sub, Value::OfSlot(ListCount(list).slot, types_.Int32), Value::OfInteger(1), location) : rest[0];
+                if (index.kind == Value::Kind::Slot && emit_.IsTemp(index.slot)) {
+                    Variable h{ emit_.Hidden(types_.Int32), types_.Int32 };
+                    Store(index, h, location);
+                    index = Value::OfSlot(h.slot, types_.Int32);
+                }
+                CheckListIndex(list, index, location);
+                Value removed = CallMember(ListArray(list), "Get", { index }, nullptr, location).at(0);
+                Variable kept{ emit_.Hidden(list.type->element), list.type->element };
+                Store(removed, kept, location);
+                ListRemoveAt(list, index, location);
+                return { Value::OfSlot(kept.slot, kept.type) };
+            }
+            if (name == "find") {
+                if (rest.size() != 1) Fail(location, "table.find on a List takes the value to find");
+                return { ListIndexOf(list, rest[0], location) };
+            }
+            if (name == "clear") return CallList(list, "Clear", std::move(rest), location);
+            if (name == "sort") return CallList(list, "Sort", std::move(rest), location);
+            if (name == "concat") {
+                if (list.type->element != types_.String) Fail(location, "table.concat needs a list of strings");
+                Value separator = rest.empty() ? Value::OfString("") : rest[0];
+                return CallStatic(types_.String, "Join", { separator, ListArray(list), Value::OfInteger(0), Value::OfSlot(ListCount(list).slot, types_.Int32) }, nullptr, location);
+            }
+            Fail(location, std::format("table.{} does not work on a List", name));
+        }
+
         std::vector<Value> Compiler::Inline(Function* f, std::vector<Value> args, size_t want, const Location& location, const Variable* into) {
             for (const InlineFrame& frame : inlineStack_)
                 if (frame.function == f) Fail(location, std::format("recursion is not supported: '{}' calls itself", f->name));
@@ -2900,6 +3198,11 @@ namespace UdonLuau {
                 Value a = args[i];
                 aliases_.erase(param);
                 variables_.erase(param);
+                if (type->IsList()) {
+                    if (a.kind != Value::Kind::Slot || a.type != type) Fail(location, std::format("argument {} of '{}' must be {}", i + 1, f->name, type->displayName));
+                    aliases_[param] = a;
+                    continue;
+                }
 
                 bool callerOwned = a.kind != Value::Kind::Slot || !fieldSlots_.contains(a.slot);
                 if (Immutable(param, type) && callerOwned) {
@@ -3237,6 +3540,7 @@ namespace UdonLuau {
             switch (v.kind) {
                 case Value::Kind::Slot: {
                     const Type* from = v.type;
+                    if (from->IsList() || to->IsList()) return from == to ? 0 : -1;
                     if (from == to) return 0;
                     if (from->IsNumeric() && to->IsNumeric())
                         return TypeTable::ImplicitNumeric(from->numeric, to->numeric) ? 10 + NumericRank(to->numeric) - NumericRank(from->numeric) : -1;
@@ -3367,6 +3671,8 @@ namespace UdonLuau {
         uint32_t Compiler::Materialize(const Value& v, const Type* to, const Location& location) {
             const Type* natural = NaturalType(v);
             const Type* target = to ? to : natural;
+            if ((v.kind == Value::Kind::Slot && v.type->IsList()) || (target && target->IsList()))
+                Fail(location, "a List cannot be copied or passed as a value; use list:ToArray() for an array copy");
             if (v.kind == Value::Kind::Slot) {
                 if (!target || v.type == target) return v.slot;
                 if (v.type->IsNumeric() && target->IsNumeric() && v.type->numeric != target->numeric) return Convert(v.slot, v.type, target, location);
@@ -3407,6 +3713,8 @@ namespace UdonLuau {
         void Compiler::Store(const Value& value, const Variable& destination, const Location& location) {
             if (value.kind == Value::Kind::Function || value.kind == Value::Kind::Namespace || value.kind == Value::Kind::None)
                 Fail(location, std::format("cannot store {} in a variable", Describe(value)));
+            if (destination.type->IsList() || (value.kind == Value::Kind::Slot && value.type->IsList()))
+                Fail(location, "a List cannot be copied or assigned; reset it with 'list = {}' or use list:ToArray()");
             if (Cost(value, destination.type) < 0) {
                 bool explicitNumeric = ((value.kind == Value::Kind::Slot && value.type->IsNumeric()) || value.IsNumberLiteral()) && destination.type->IsNumeric();
                 Fail(location, std::format("cannot assign {} to {}{}", Describe(value), destination.type->displayName,
@@ -3453,6 +3761,12 @@ namespace UdonLuau {
                     }
                     if (const Type* t = types_.FindByFullName(path)) return t;
                     Fail(ref->location, std::format("unknown type '{}'", path));
+                }
+                if (ref->hasParameterList && ref->name == "List") {
+                    if (ref->parameters.size != 1 || !ref->parameters.data[0].type) Fail(ref->location, "List takes one element type: List<int>");
+                    const Type* element = ResolveType(ref->parameters.data[0].type);
+                    if (element->IsList()) Fail(ref->location, "lists of lists are not supported");
+                    return types_.ListOf(element);
                 }
                 return ResolveTypeName(ref->name.value, ref->location);
             }

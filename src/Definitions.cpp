@@ -253,6 +253,24 @@ namespace UdonLuau {
             for (std::string_view alias : { "int", "uint", "long", "ulong", "short", "ushort", "byte", "sbyte", "char", "float", "double" })
                 out_ += std::format("export type {} = number\n", alias);
             out_ += "export type object = any\n\n";
+            out_ += "export type List<T> = {\n"
+                    "    Count: number,\n"
+                    "    Capacity: number,\n"
+                    "    Add: (self: List<T>, item: T) -> (),\n"
+                    "    Insert: (self: List<T>, index: number, item: T) -> (),\n"
+                    "    Remove: (self: List<T>, item: T) -> boolean,\n"
+                    "    RemoveAt: (self: List<T>, index: number) -> (),\n"
+                    "    IndexOf: (self: List<T>, item: T) -> number,\n"
+                    "    Contains: (self: List<T>, item: T) -> boolean,\n"
+                    "    Clear: (self: List<T>) -> (),\n"
+                    "    ToArray: (self: List<T>) -> { T },\n"
+                    "    Sort: (self: List<T>) -> (),\n"
+                    "    Reverse: (self: List<T>) -> (),\n"
+                    "    Get: (self: List<T>, index: number) -> T,\n"
+                    "    Set: (self: List<T>, index: number, item: T) -> (),\n"
+                    "    [number]: T,\n"
+                    "}\n"
+                    "declare List: { new: <T>(capacity: number?) -> List<T> }\n\n";
 
             Collect();
             const Type* behaviour = types_.Behaviour();

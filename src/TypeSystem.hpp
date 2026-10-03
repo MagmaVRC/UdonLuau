@@ -33,6 +33,7 @@ namespace UdonLuau::Detail {
         const Type*              base = nullptr;
         std::vector<const Type*> interfaces;
         const Type*              element = nullptr;
+        const Type*              listArray = nullptr;
         const TypeInfo*          info = nullptr;
         const ScriptInfo*        script = nullptr;
         Numeric                  numeric = Numeric::None;
@@ -41,6 +42,7 @@ namespace UdonLuau::Detail {
         [[nodiscard]] bool IsReference() const { return !IsValueType(); }
         [[nodiscard]] bool IsNumeric() const { return numeric != Numeric::None; }
         [[nodiscard]] bool IsIntegral() const { return IsNumeric() && numeric != Numeric::Single && numeric != Numeric::Double; }
+        [[nodiscard]] bool IsList() const { return listArray != nullptr; }
     };
 
     struct Parameter {
@@ -66,6 +68,7 @@ namespace UdonLuau::Detail {
 
         [[nodiscard]] const Type* Get(std::string_view udonName);
         [[nodiscard]] const Type* ArrayOf(const Type* element);
+        [[nodiscard]] const Type* ListOf(const Type* element);
         [[nodiscard]] const Type* Script(const ScriptInfo* script);
         [[nodiscard]] const Type* Behaviour() { return Get("VRCUdonUdonBehaviour"); }
         [[nodiscard]] const Type* FindByFullName(std::string_view fullName);
@@ -101,6 +104,7 @@ namespace UdonLuau::Detail {
         std::unordered_map<std::string, const Type*>       byName_;
         std::unordered_map<const ExternInfo*, Method>      methods_;
         std::unordered_map<const ScriptInfo*, const Type*> scripts_;
+        std::unordered_map<const Type*, const Type*>       lists_;
     };
 
 } // namespace UdonLuau::Detail
