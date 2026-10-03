@@ -343,6 +343,35 @@ Reads, writes and calls compile like a typed reference: `GetProgramVariable`, `S
   - A script that calls singleton methods from `Start` or `OnEnable` checks that the singleton has started. If it hasn't, which can happen for objects spawned at run time, the event is rescheduled for the next frame instead of the call being dropped.
   - Fields can always be read and written, because their initial values are in place from scene load.
 
+### Statics
+
+Mark a module-level field or function `-- @static` to share it between every object running the script, like C# `static`:
+
+```lua
+-- Enemy.lua
+-- @static
+local alive: int = 0
+
+-- @static
+local function Register()
+    alive += 1
+end
+
+export local health: int = 100
+
+function Start()
+    Register()
+    print(`{alive} enemies`)
+end
+```
+
+- **Compiled as a companion singleton.** Static fields and functions go into a companion named `<Script>.Static`, stored next to the script as `<Script>.Static.asset`. It follows all the singleton rules above: one per scene under `__UdonLuauSingletons`, wired at build time, and started before other scripts.
+- **No prefix needed.** Instance code uses static names directly. A static read or write costs one `Get`/`SetProgramVariable`, and a static call one `SendCustomEvent` plus one extern per argument. An instance field is a plain heap read, so copy static values into a local in hot loops.
+- **Static code can't use instance fields or functions.** It runs on the companion's own heap, so it can't reach a particular instance's fields; using one is a compile error. In static code, `this`, `gameObject` and `transform` are the companion.
+- **Static events run once.** An event marked `-- @static` (`Update`, `Interact`, ...) runs on the companion, not on every instance.
+- **Constants and type aliases are shared.** They're compile-time only, so both parts see them without marking.
+- A `List` cannot be static.
+
 ### Compile time
 
 - `const NAME = value` declares a constant that takes no heap slot. Module-level constants must be known at compile time. Constants include literals, defines, arithmetic on them, and struct constructors with literal arguments (`const UP = Vector3.new(0, 1, 0)`).
