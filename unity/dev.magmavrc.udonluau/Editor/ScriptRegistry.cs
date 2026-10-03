@@ -28,13 +28,14 @@ namespace Magma.VRC.UdonLuau
     internal sealed class ScriptInterface
     {
         public string Name;
+        public bool Singleton;
         public readonly List<ScriptVariable> Fields = new List<ScriptVariable>();
         public readonly List<ScriptMethod> Methods = new List<ScriptMethod>();
 
         /// <summary>A stable text form used to detect interface changes.</summary>
         public override string ToString()
         {
-            var text = new StringBuilder(Name).Append('{');
+            var text = new StringBuilder(Name).Append(Singleton ? "!" : "").Append('{');
             foreach (ScriptVariable f in Fields) Append(text.Append("f:"), f);
             foreach (ScriptMethod m in Methods)
             {
@@ -198,6 +199,7 @@ namespace Magma.VRC.UdonLuau
         {
             var script = new ScriptInterface { Name = name };
             if (result.IsInvalid || Native.ul_result_has_interface == null || Native.ul_result_has_interface(result) == 0) return script;
+            script.Singleton = Native.ul_result_interface_singleton != null && Native.ul_result_interface_singleton(result) != 0;
 
             int fieldCount = Native.ul_result_interface_field_count(result);
             for (int i = 0; i < fieldCount; i++)
@@ -234,6 +236,7 @@ namespace Magma.VRC.UdonLuau
         {
             byte[] name = Native.Utf8(script.Name);
             Native.ul_catalog_add_script(catalog.Handle, name);
+            if (script.Singleton) Native.ul_catalog_set_script_singleton?.Invoke(catalog.Handle, name, 1);
             foreach (ScriptVariable f in script.Fields)
                 Native.ul_catalog_add_script_field(catalog.Handle, name, Native.Utf8(f.Name), Native.Utf8(f.UdonType), Native.Utf8(f.Script), Native.Utf8(f.Symbol));
             foreach (ScriptMethod m in script.Methods)

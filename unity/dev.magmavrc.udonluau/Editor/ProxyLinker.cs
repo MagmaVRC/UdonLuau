@@ -135,6 +135,8 @@ namespace Magma.VRC.UdonLuau
 
                 Upgrade(behaviour, asset);
             }
+
+            Singletons.EnsureOpenScenes();
         }
 
         private static void Upgrade(UdonBehaviour behaviour, LuauProgramAsset asset)

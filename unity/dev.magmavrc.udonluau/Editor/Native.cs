@@ -181,6 +181,7 @@ namespace Magma.VRC.UdonLuau
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int AddScriptMethodValue(IntPtr catalog, byte[] script, byte[] method, int isReturn, byte[] name, byte[] udonType, byte[] scriptType, byte[] symbol);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate void AddSyncableType(IntPtr catalog, byte[] udonName, int linear, int smooth);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int SetScriptMethodFlag(IntPtr catalog, byte[] script, byte[] method, int value);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int SetScriptFlag(IntPtr catalog, byte[] script, int value);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int GetNetworkCallable(IntPtr result, int index, out NativeNetworkCallable callable);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int GetNetworkParameter(IntPtr result, int index, int parameter, out NativeNetworkParameter value);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate IntPtr CompileSource(IntPtr catalog, byte[] source, UIntPtr length);
@@ -213,6 +214,8 @@ namespace Magma.VRC.UdonLuau
         public static AddScriptMethod ul_catalog_add_script_method;
         public static AddScriptMethodValue ul_catalog_add_script_method_value;
         public static SetScriptMethodFlag ul_catalog_set_script_method_network_callable;
+        public static SetScriptFlag ul_catalog_set_script_singleton;
+        public static ResultInt ul_result_interface_singleton;
         public static AddSyncableType ul_catalog_add_syncable_type;
         public static ResultText ul_catalog_definitions;
         public static ResultInt ul_result_sync_mode;
