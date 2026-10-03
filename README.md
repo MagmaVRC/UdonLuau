@@ -161,6 +161,9 @@ end
   - `-- @networkcallable` above an `export function` makes it callable over the network. `-- @networkcallable(10)` also sets the rate limit in events per second.
     - The entry point is then `Name`, and the program carries VRChat's network-calling metadata.
     - It may take up to 8 parameters, which arrive with the event, and cannot return values.
+  - `-- @entry("OnDataUpdated")` above an `export function` sets its exact entry point name, for callbacks other scripts send by a fixed name. Without `@networkcallable`, a name that doesn't start with `_` can still receive VRChat's legacy network events without arguments.
+  - Events can return a value, as `OnOwnershipRequest` must: `function OnOwnershipRequest(requester: VRCPlayerApi, newOwner: VRCPlayerApi): boolean`. The value goes into `__returnValue`, where VRChat and UdonSharp read it.
+  - The inspector lists each public method's entry point, parameter symbols and return symbol. Plain `UdonBehaviour` callers use those names with `SetProgramVariable`, `SendCustomEvent` and `GetProgramVariable`.
   - `local function` is private.
   - Parameters and return values need type annotations.
 - `this`, `gameObject` and `transform` refer to the behaviour itself.
@@ -177,6 +180,7 @@ end
 - **Inference:** locals take the type of their initializer. Integer literals are `int` and other number literals are `float`, unless the context needs another numeric type.
 - **Constant structs:** a struct produced by a constructor with literal arguments is a shared constant, so changing one of its fields directly is an error. Copy it into a local first; a local that is later modified gets its own copy automatically.
 - **Conversions:** widening numeric conversions are implicit. Narrowing ones are written `value :: int`.
+- **Characters:** a one-character string literal passes where a `char` is expected, and any string literal passes as a `char[]`, so `s:Split(",")` works.
 
 ### Expressions
 
@@ -230,6 +234,7 @@ end
   - a `Network.X(...)` target, for `@networkcallable` methods;
   - a plain `UdonBehaviour`, for custom events without arguments.
 - **No-argument calls** to a public method compile straight to `SendCustomEventDelayedSeconds`/`Frames` and cost nothing extra.
+- **Calling the SDK directly:** `this:SendCustomEventDelayedSeconds(name, t)` also works; the `EventTiming` defaults to `Update`. Sending a function's name instead of its entry point (`"Refresh"` for an entry point `_Refresh`) is a compile warning, because Udon would silently ignore it.
 - **Calls with arguments:** each call site gets a queue for its arguments and a private stub event (`__delayN`). The arguments and the target are captured when the call is made, and the stub delivers them when the delay ends.
   - Delayed network calls are sent when the delay ends, by the client that made the call.
 - **Ordering:** with a constant delay, calls from one site are delivered in the order they were made. When the delay is a variable, each call records its due time and the stub delivers the earliest one first.
@@ -305,6 +310,10 @@ These compile to what Udon understands:
 | `door.speed` | `GetProgramVariable("speed")` |
 | `door.speed = 5` | `SetProgramVariable("speed", 5)` |
 | `Network.All(door):Hit(7)` | `SendCustomNetworkEvent(NetworkEventTarget.All, "Hit", 7)`. Any `NetworkEventTarget` member works as the name. Only `@networkcallable` methods are allowed. |
+
+UdonSharp properties read and write like fields (`manager.Ready`, `manager.Level = 2`); they call the compiled `get_`/`set_` methods. Overloaded UdonSharp methods are picked by their argument types, as C# does.
+
+`Network.All(this):Ping(3)` calls a `@networkcallable` function of the script itself, with its argument types checked.
 
 Names, argument counts and types are checked when compiling. Typed references are also usable in arrays (`{Door}`). Arrays of behaviours are stored as `Component[]`, as UdonSharp does, because Udon has no `UdonBehaviour[]` externs. A plain `UdonBehaviour` still has every SDK member (`SendCustomEvent`, `GetProgramVariable`, ...), and converts to a script type with `behaviour :: Door`.
 
