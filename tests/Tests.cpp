@@ -1871,6 +1871,38 @@ end
             g_machines.clear();
         }
 
+        auto shared = Build(f, R"(
+export local trail = ""
+export local result = 0
+-- @noinline
+local function fade(tag: string): int
+    trail ..= tag
+    task.wait(1)
+    trail ..= "!"
+    return 7
+end
+export function A()
+    result = fade("a")
+end
+export function B()
+    result = fade("b")
+end
+)");
+        Check(shared.has_value(), "a @noinline function that waits compiles once");
+        if (shared) {
+            Machine m(f, *shared);
+            m.Run("_A");
+            m.Run("_B");
+            Check(std::get<std::string>(m.Var("trail")) == "a" && std::get<int32_t>(m.Var("result")) == 0, "a second caller is skipped while the shared body waits");
+            m.Run("__co0");
+            Check(std::get<std::string>(m.Var("trail")) == "a!" && std::get<int32_t>(m.Var("result")) == 7, "the shared body returns to the caller that entered it");
+            m.Run("_B");
+            m.Run("__co0");
+            Check(std::get<std::string>(m.Var("trail")) == "a!b!", "the shared body is free again after returning");
+        }
+        Check(HasError(f, "-- @noinline\nlocal function go()\n task.wait(1)\nend\n-- @reentry(restart)\nexport function Run()\n go()\nend", "@reentry(ignore)"),
+            "shared waiting functions need ignore-mode callers");
+
         Check(HasError(f, "export function Get(): int\n task.wait(1)\n return 1\nend", "cannot return values"), "public methods that wait cannot return values");
         Check(HasError(f, "local function go()\n task.wait(1)\nend\nfunction Start()\n task.cancel(print)\nend", "function of this script"), "task.cancel takes a script function");
         Check(HasError(f, "local t = EventTiming.Update\nfunction Start()\n task.wait(1, t)\nend", "must be a constant"), "the timing of a wait is constant");

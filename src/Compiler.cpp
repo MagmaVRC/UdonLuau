@@ -78,8 +78,10 @@ namespace UdonLuau {
             uint32_t                 cancelReturn = 0;
             Label                    cancelRoutine;
             std::vector<uint32_t>    waitFlags;
+            uint32_t                 returnAddress = 0;
 
             [[nodiscard]] bool IsRoot() const { return async && (exported || entered); }
+            [[nodiscard]] bool Shared() const { return async && noInline && !exported; }
             [[nodiscard]] bool Cancellable() const { return reentry == Reentry::Restart || cancelTarget; }
         };
 
@@ -1353,8 +1355,7 @@ namespace UdonLuau {
                     if (a.name == "noinline") f->noInline = true;
                 }
                 if (f->forceInline && f->noInline) Report(f->location, std::format("'{}' cannot be both @inline and @noinline", f->name));
-                if (f->async && f->noInline) Report(f->location, std::format("'{}' waits, so it is inlined into every caller and cannot be @noinline", f->name));
-                f->inlined = f->async || (!f->noInline && !f->delayTarget && f->calls > 0 && (f->forceInline || f->size <= kInlineBudget || (f->calls == 1 && !f->exported)));
+                f->inlined = f->async ? !f->Shared() : !f->noInline && !f->delayTarget && f->calls > 0 && (f->forceInline || f->size <= kInlineBudget || (f->calls == 1 && !f->exported));
                 f->trampoline = options_.compatibleExitReturn || f->async || !f->exported || (f->calls > 0 && !f->inlined) || (f->event && eventListeners_.contains(f->event->name));
             }
         }
@@ -1444,6 +1445,7 @@ namespace UdonLuau {
             for (auto& f : functions_) {
                 if (f->delayTarget) f->entered = true;
                 for (const FieldAttribute& a : AnnotationsFor(f->location).attributes) {
+                    if (a.name == "noinline") f->noInline = true;
                     if (a.name != "reentry") continue;
                     std::string_view mode = a.arguments.size() == 1 ? std::string_view(a.arguments[0]) : std::string_view{};
                     if (mode == "ignore") f->reentry = Reentry::Ignore;
@@ -1454,7 +1456,10 @@ namespace UdonLuau {
                 }
                 if (f->async && f->exported && !f->returns.empty())
                     Report(f->location, std::format("'{}' waits, so it cannot return values: callers get control back at its first wait", f->name));
-                if (!f->IsRoot()) continue;
+                if (f->Shared() && (f->entered || f->cancelTarget || f->reentry != Reentry::Ignore))
+                    Report(f->location, std::format("'{}' is a @noinline function that waits, so it can only be called directly; it cannot be started, connected, cancelled or use @reentry", f->name));
+                if (f->Shared()) f->returnAddress = emit_.Hidden(types_.UInt32);
+                if (!f->IsRoot() && !f->Shared()) continue;
                 HeapValue yes;
                 yes.kind = ValueKind::Boolean;
                 yes.boolean = true;
@@ -1733,8 +1738,10 @@ namespace UdonLuau {
         }
 
         void Compiler::CompileFunction(Function& f) {
-            bool root = f.IsRoot();
+            bool shared = f.Shared();
+            bool root = f.IsRoot() || shared;
             if (!f.exported && !root && (f.inlined || f.calls == 0)) return;
+            if (shared && f.calls == 0) return;
             for (const Variable& p : f.parameters)
                 if (p.type->IsList()) Fail(f.location, std::format("'{}' takes a List, so it must be inlined; mark it '-- @inline'", f.name));
             current_ = &f;
@@ -1761,7 +1768,8 @@ namespace UdonLuau {
             CompileBody(f.node->body, tail);
             emit_.Bind(f.epilogue);
             if (root) emit_.Copy(TruthySlot(Value::OfBoolean(true), f.location), f.freeSlot);
-            if (f.trampoline) EmitYield();
+            if (shared) emit_.JumpIndirect(f.returnAddress);
+            else if (f.trampoline) EmitYield();
             else emit_.JumpTo(0xFFFFFFFFu);
             if (root) {
                 EmitRootReject(f, reject);
@@ -1793,7 +1801,8 @@ namespace UdonLuau {
                     : Value::OfString(std::format("[UdonLuau] {} ignored: it was triggered again while running", who));
                 CallStatic(types_.Get("UnityEngineDebug"), "LogWarning", { message }, nullptr, f.location);
             }
-            EmitYield();
+            if (f.Shared()) emit_.JumpIndirect(f.returnAddress);
+            else EmitYield();
         }
 
         void Compiler::CallCancel(Function& f) {
@@ -5077,6 +5086,29 @@ namespace UdonLuau {
             for (size_t i = 0; i < args.size(); ++i)
                 if (Cost(args[i], f->parameters[i].type) < 0)
                     Fail(location, std::format("argument {} of '{}' must be {}, got {}", i + 1, f->name, f->parameters[i].type->displayName, Describe(args[i])));
+            if (f->Shared()) {
+                if (!root_ || root_->reentry != Reentry::Ignore || root_->Cancellable())
+                    Fail(location, std::format("'{}' is a @noinline function that waits; call it only from functions with @reentry(ignore) that are never cancelled", f->name));
+                std::vector<Value> results;
+                for (size_t i = 0; i < std::min(want, f->returns.size()); ++i) results.push_back(Value::OfSlot(emit_.Temp(f->returns[i]), f->returns[i]));
+                Label busy = emit_.NewLabel();
+                Label done = emit_.NewLabel();
+                emit_.JumpIfFalse(f->freeSlot, busy);
+                for (size_t i = 0; i < args.size(); ++i) Store(args[i], f->parameters[i], location);
+                if (current_) current_->callees.push_back(f);
+                Label back = emit_.NewLabel();
+                emit_.Copy(emit_.AddressConstant(back), f->returnAddress);
+                emit_.Jump(f->entry);
+                emit_.Bind(back);
+                for (size_t i = 0; i < results.size(); ++i) emit_.Copy(f->returnSlots[i], results[i].slot);
+                emit_.Jump(done);
+                emit_.Bind(busy);
+                if (DebugBuild())
+                    CallStatic(types_.Get("UnityEngineDebug"), "LogWarning", { Value::OfString(std::format("[UdonLuau] line {}: '{}' is still waiting for another caller; this call was skipped", location.begin.line + 1, f->name)) }, nullptr, location);
+                for (const Value& r : results) emit_.Copy(emit_.Constant(r.type, HeapValue{ r.type->IsValueType() ? ValueKind::Default : ValueKind::Null }), r.slot);
+                emit_.Bind(done);
+                return results;
+            }
             if (f->inlined || (f->calls == 0 && !f->exported)) return Inline(f, std::move(args), want, location, into);
             std::vector<uint32_t> slots;
             for (size_t i = 0; i < args.size(); ++i) {
