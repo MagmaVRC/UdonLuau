@@ -76,7 +76,7 @@ namespace Magma.VRC.UdonLuau
         /// <returns>Whether a file was written, which triggers a script compilation.</returns>
         public static bool Generate(IEnumerable<LuauProgramAsset> assets)
         {
-            var compiled = assets.Where(a => a != null && a.SourceScript != null && a.LastInterface != null && a.Program != null).ToList();
+            var compiled = assets.Where(a => a != null && !a.StaticPart && a.SourceScript != null && a.LastInterface != null && a.Program != null).ToList();
             if (compiled.Count == 0) return false;
 
             _luauScripts = new HashSet<string>(compiled.Select(a => a.ScriptName));

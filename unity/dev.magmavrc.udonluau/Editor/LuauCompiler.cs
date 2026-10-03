@@ -71,6 +71,9 @@ namespace Magma.VRC.UdonLuau
         /// <summary>The compiler's readable listing of the program.</summary>
         public string Disassembly = "";
 
+        /// <summary>Whether the script declares statics, which are compiled into a separate companion singleton.</summary>
+        public bool HasStatics;
+
         /// <summary>Whether a program was produced.</summary>
         public bool Succeeded => Program != null;
 
@@ -86,7 +89,8 @@ namespace Magma.VRC.UdonLuau
         /// <summary>Compiles Luau source against the editor's catalog and builds the Udon program.</summary>
         /// <param name="source">The Luau source.</param>
         /// <param name="scriptName">The script's name; when given, the program carries UdonSharp's type identity for the script's generated class.</param>
-        public static LuauCompileResult Compile(string source, string scriptName = null)
+        /// <param name="staticPart">Compile the script's static declarations as its companion singleton instead of the per-instance program.</param>
+        public static LuauCompileResult Compile(string source, string scriptName = null, bool staticPart = false)
         {
             var output = new LuauCompileResult();
             LuauCatalog catalog = LuauCatalog.Current;
@@ -97,12 +101,13 @@ namespace Magma.VRC.UdonLuau
             }
 
             byte[] bytes = Encoding.UTF8.GetBytes(source ?? "");
-            using ResultHandle result = Invoke(catalog, bytes, LuauSettings.instance.Defines);
+            using ResultHandle result = Invoke(catalog, bytes, LuauSettings.instance.Defines, scriptName, staticPart);
             if (result.IsInvalid)
             {
                 output.Error("the compiler returned no result");
                 return output;
             }
+            output.HasStatics = Native.ul_result_has_statics != null && Native.ul_result_has_statics(result) != 0;
 
             int diagnosticCount = Native.ul_result_diagnostic_count(result);
             for (int i = 0; i < diagnosticCount; i++)
@@ -113,7 +118,7 @@ namespace Magma.VRC.UdonLuau
 
             if (Native.ul_result_succeeded(result) == 0) return output;
 
-            output.Interface = ScriptRegistry.ReadInterface(result, scriptName);
+            output.Interface = ScriptRegistry.ReadInterface(result, staticPart ? ScriptRegistry.StaticName(scriptName) : scriptName);
             foreach (ScriptVariable field in output.Interface.Fields)
                 if (!string.IsNullOrEmpty(field.Script)) output.ScriptReferences.Add(new LuauScriptReference { symbol = field.Symbol, script = field.Script });
             if (Native.ul_result_sync_mode != null) output.SyncMode = (UdonSharp.BehaviourSyncMode)Native.ul_result_sync_mode(result);
@@ -123,7 +128,7 @@ namespace Magma.VRC.UdonLuau
             try
             {
                 ReadNetworkCallables(catalog, result, output);
-                string typeName = scriptName == null ? null : ProxyGenerator.UdonSharpTypeName(scriptName);
+                string typeName = scriptName == null || staticPart ? null : ProxyGenerator.UdonSharpTypeName(scriptName);
                 output.Program = new ProgramBuilder(catalog, result, output, typeName).Build();
             }
             catch (Exception e)
@@ -134,8 +139,10 @@ namespace Magma.VRC.UdonLuau
             return output;
         }
 
-        private static ResultHandle Invoke(LuauCatalog catalog, byte[] source, string defines)
+        private static ResultHandle Invoke(LuauCatalog catalog, byte[] source, string defines, string scriptName, bool staticPart)
         {
+            if (Native.ul_compile_part != null)
+                return new ResultHandle(Native.ul_compile_part(catalog.Handle, source, (UIntPtr)source.Length, Native.Utf8(defines ?? ""), Native.Utf8(scriptName ?? ""), staticPart ? 1 : 0));
             IntPtr result = Native.ul_compile_with_defines != null
                 ? Native.ul_compile_with_defines(catalog.Handle, source, (UIntPtr)source.Length, Native.Utf8(defines ?? ""))
                 : Native.ul_compile(catalog.Handle, source, (UIntPtr)source.Length);

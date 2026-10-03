@@ -94,6 +94,8 @@ namespace Magma.VRC.UdonLuau
                     Changes.Enqueue((pair.Key, pair.Value));
                     continue;
                 }
+                LuauProgramAsset statics = LuauProgramAsset.StaticsForScript(script);
+                if (statics != null) Reload(statics, source, pair.Value);
                 Reload(asset, source, pair.Value);
             }
         }

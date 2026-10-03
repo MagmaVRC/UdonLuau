@@ -186,6 +186,7 @@ namespace Magma.VRC.UdonLuau
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int GetNetworkParameter(IntPtr result, int index, int parameter, out NativeNetworkParameter value);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate IntPtr CompileSource(IntPtr catalog, byte[] source, UIntPtr length);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate IntPtr CompileWithDefines(IntPtr catalog, byte[] source, UIntPtr length, byte[] defines);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate IntPtr CompilePart(IntPtr catalog, byte[] source, UIntPtr length, byte[] defines, byte[] scriptName, int staticPart);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int ResultInt(IntPtr result);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int ResultAt(IntPtr result, int index);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate IntPtr ResultText(IntPtr result);
@@ -226,6 +227,9 @@ namespace Magma.VRC.UdonLuau
         public static CompileWithDefines ul_extract_interface;
         public static CompileSource ul_compile;
         public static CompileWithDefines ul_compile_with_defines;
+        public static CompilePart ul_compile_part;
+        public static CompilePart ul_extract_interface_part;
+        public static ResultInt ul_result_has_statics;
         public static Destroy ul_result_destroy;
         public static ResultInt ul_result_succeeded;
         public static ResultInt ul_result_diagnostic_count;

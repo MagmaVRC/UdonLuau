@@ -58,6 +58,7 @@ namespace Magma.VRC.UdonLuau
         {
             public string Key;
             public ScriptInterface Interface;
+            public ScriptInterface Statics;
         }
 
         private static readonly Dictionary<string, CachedInterface> LuauCache = new Dictionary<string, CachedInterface>();
@@ -72,6 +73,9 @@ namespace Magma.VRC.UdonLuau
         /// <summary>The script name of a Luau source: its file name without extension.</summary>
         public static string ScriptName(UnityEngine.Object source) =>
             source == null ? null : Path.GetFileNameWithoutExtension(AssetDatabase.GetAssetPath(source));
+
+        /// <summary>The name of the companion singleton holding a script's static fields and functions.</summary>
+        public static string StaticName(string scriptName) => scriptName + ".Static";
 
         /// <summary>Returns why the program's script name cannot be used, or null.</summary>
         public static string Conflict(LuauProgramAsset asset) => ConflictMessages.TryGetValue(asset, out string message) ? message : null;
@@ -156,10 +160,12 @@ namespace Magma.VRC.UdonLuau
                 string key = Hash(source) + "|" + context;
                 if (!LuauCache.TryGetValue(group.Key, out CachedInterface cached) || cached.Key != key)
                 {
-                    cached = new CachedInterface { Key = key, Interface = Extract(catalog, name, source, defines) };
+                    var (main, statics) = Extract(catalog, name, source, defines);
+                    cached = new CachedInterface { Key = key, Interface = main, Statics = statics };
                     LuauCache[group.Key] = cached;
                 }
                 interfaces.Add(cached.Interface);
+                if (cached.Statics != null) interfaces.Add(cached.Statics);
             }
 
             foreach (var entry in sharp)
@@ -188,11 +194,20 @@ namespace Magma.VRC.UdonLuau
             return changed;
         }
 
-        private static ScriptInterface Extract(LuauCatalog catalog, string name, string source, string defines)
+        private static (ScriptInterface main, ScriptInterface statics) Extract(LuauCatalog catalog, string name, string source, string defines)
         {
             byte[] bytes = Encoding.UTF8.GetBytes(source);
-            using var result = new ResultHandle(Native.ul_extract_interface(catalog.Handle, bytes, (UIntPtr)bytes.Length, Native.Utf8(defines)));
-            return ReadInterface(result, name);
+            if (Native.ul_extract_interface_part == null)
+            {
+                using var plain = new ResultHandle(Native.ul_extract_interface(catalog.Handle, bytes, (UIntPtr)bytes.Length, Native.Utf8(defines)));
+                return (ReadInterface(plain, name), null);
+            }
+
+            using var result = new ResultHandle(Native.ul_extract_interface_part(catalog.Handle, bytes, (UIntPtr)bytes.Length, Native.Utf8(defines), Native.Utf8(name), 0));
+            ScriptInterface main = ReadInterface(result, name);
+            if (Native.ul_result_has_statics == null || Native.ul_result_has_statics(result) == 0) return (main, null);
+            using var part = new ResultHandle(Native.ul_extract_interface_part(catalog.Handle, bytes, (UIntPtr)bytes.Length, Native.Utf8(defines), Native.Utf8(name), 1));
+            return (main, ReadInterface(part, StaticName(name)));
         }
 
         internal static ScriptInterface ReadInterface(ResultHandle result, string name)
