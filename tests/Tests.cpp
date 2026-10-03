@@ -1903,6 +1903,52 @@ end
         Check(HasError(f, "-- @noinline\nlocal function go()\n task.wait(1)\nend\n-- @reentry(restart)\nexport function Run()\n go()\nend", "@reentry(ignore)"),
             "shared waiting functions need ignore-mode callers");
 
+        auto nested = Build(f, R"(
+export local after = 0
+-- @reentry(restart)
+local function runner()
+    task.wait(1)
+    after += 1
+    this:SendCustomEvent("_Stop")
+    after += 100
+end
+export function Go()
+    task.spawn(runner)
+end
+export function Stop()
+    task.cancel(runner)
+end
+)");
+        Check(nested.has_value(), "cancelling from a nested event compiles");
+        if (nested) {
+            Machine m(f, *nested);
+            g_machines = { &m };
+            for (size_t i = 0; i < nested->heap.size(); ++i)
+                if (nested->heap[i].value.kind == ValueKind::This && nested->heap[i].type == "VRCUdonUdonBehaviour") m.heap[i] = BehaviourRef{ 0 };
+            m.Run("_Go");
+            m.Run("__co0");
+            Check(std::get<int32_t>(m.Var("after")) == 1, std::format("a run cancelled by a nested event stops when control returns ({})", std::get<int32_t>(m.Var("after"))));
+            g_machines.clear();
+        }
+        Check(HasError(f, R"(
+local sig: Signal<int> = Signal()
+-- @noinline
+local function announce(n: int)
+    sig:Fire(n)
+    print(n)
+end
+local function onSig(n: int)
+    if n > 0 then
+        announce(n - 1)
+    end
+end
+function Start()
+    sig:Connect(onSig)
+    announce(3)
+end
+)", "recursion"), "recursion through a signal handler is reported");
+        Check(HasError(f, "local s = Signal()\n-- @reentry(overlap)\nexport function W()\n s:Wait()\nend", "overlap"), "signal waits reject overlap mode");
+
         Check(HasError(f, "export function Get(): int\n task.wait(1)\n return 1\nend", "cannot return values"), "public methods that wait cannot return values");
         Check(HasError(f, "local function go()\n task.wait(1)\nend\nfunction Start()\n task.cancel(print)\nend", "function of this script"), "task.cancel takes a script function");
         Check(HasError(f, "local t = EventTiming.Update\nfunction Start()\n task.wait(1, t)\nend", "must be a constant"), "the timing of a wait is constant");

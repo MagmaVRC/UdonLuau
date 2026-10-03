@@ -329,7 +329,13 @@ namespace UdonLuau {
             std::vector<std::string>          symbols;
             bool                              exported = false;
             std::vector<ListenSite*>          sites;
-            std::map<Function*, uint32_t>     connections;
+            std::vector<std::pair<Function*, uint32_t>> connections;
+            uint32_t                          busy = 0;
+
+            uint32_t* Connection(Function* fn) {
+                auto it = std::ranges::find(connections, fn, &std::pair<Function*, uint32_t>::first);
+                return it == connections.end() ? nullptr : &it->second;
+            }
             std::vector<Value>                staging;
             Value                             waitTargets;
             Value                             waitEntries;
@@ -352,7 +358,11 @@ namespace UdonLuau {
             Label              back;
             std::vector<Value> values;
             Location           location;
+            Function*          from = nullptr;
+            int                depth = 0;
         };
+
+        constexpr int kMaxFireDepth = 16;
 
         struct EventListeners {
             const EventInfo*         event = nullptr;
@@ -730,7 +740,8 @@ namespace UdonLuau {
             const EventInfo* EventOf(AstExpr* expr) const;
             std::optional<std::vector<Value>> CallListenable(AstExprCall* call, size_t want);
             std::vector<Value> EmitListen(const std::vector<const Type*>& types, std::vector<ListenSite*>& registry, size_t want, const Location& location);
-            void EmitDispatch(const std::vector<ListenSite*>& sites, const std::vector<Value>& values, const std::map<Function*, uint32_t>& connections, const Location& location);
+            std::vector<Value> BeginDispatch(uint32_t busy, const std::vector<Value>& values, Label skip, const Location& location);
+            void EmitDispatch(const std::vector<ListenSite*>& sites, const std::vector<Value>& values, const std::vector<std::pair<Function*, uint32_t>>& connections, const Location& location);
             void EmitFireBlock(const FireSite& fire);
             void EmitEventDispatch(EventListeners& listeners);
             uint32_t SignalSlot(const std::string& symbol, const Type* type);
@@ -861,6 +872,7 @@ namespace UdonLuau {
             Function*                                      current_ = nullptr;
             Function*                                      root_ = nullptr;
             int                                            waitSites_ = 0;
+            int                                            fireDepth_ = 0;
             std::deque<ListenSite>                         listenSites_;
             std::unordered_map<AstLocal*, SignalInfo>      signals_;
             std::vector<AstLocal*>                         signalOrder_;
@@ -1382,7 +1394,7 @@ namespace UdonLuau {
                             Function* fn = method == "Connect" && c->args.size == 1 ? Callee(c->args.data[0]) : nullptr;
                             if (fn) {
                                 fn->entered = true;
-                                if (!signal->connections.contains(fn)) signal->connections.emplace(fn, emit_.Hidden(types_.Boolean));
+                                if (!signal->Connection(fn)) signal->connections.emplace_back(fn, emit_.Hidden(types_.Boolean));
                             }
                         } else if (const EventInfo* event = member ? EventOf(member->expr) : nullptr; event && method == "Wait") {
                             self->async = true;
@@ -1435,7 +1447,7 @@ namespace UdonLuau {
                     listeners.values = listeners.handler->parameters;
                     continue;
                 }
-                if (name == "Interact" || name == "OnAnimatorMove" || name == "OnRenderObject" || name.starts_with("OnCollision"))
+                if (name == "Interact" || name == "OnAnimatorMove" || name == "OnRenderObject" || name == "OnOwnershipRequest" || name.starts_with("OnCollision"))
                     Report(listeners.location, std::format("Events.{}:Wait() needs a handler for {} in this script: declaring the event changes how VRChat treats the object", name, name));
                 for (const EventParameter& p : listeners.event->parameters) {
                     const Type* type = types_.Get(p.type);
@@ -1456,6 +1468,10 @@ namespace UdonLuau {
                 }
                 if (f->async && f->exported && !f->returns.empty())
                     Report(f->location, std::format("'{}' waits, so it cannot return values: callers get control back at its first wait", f->name));
+                if (f->reentry == Reentry::Overlap && f->cancelTarget)
+                    Report(f->location, std::format("'{}' uses @reentry(overlap), so its runs cannot be told apart and task.cancel cannot stop one", f->name));
+                if (f->async && f->exported && f->noInline)
+                    Report(f->location, std::format("@noinline is ignored on '{}': public functions that wait are inlined into same-script callers", f->name), Severity::Warning);
                 if (f->Shared() && (f->entered || f->cancelTarget || f->reentry != Reentry::Ignore))
                     Report(f->location, std::format("'{}' is a @noinline function that waits, so it can only be called directly; it cannot be started, connected, cancelled or use @reentry", f->name));
                 if (f->Shared()) f->returnAddress = emit_.Hidden(types_.UInt32);
@@ -1664,6 +1680,7 @@ namespace UdonLuau {
                 const std::string& entry = a.arguments[0];
                 if (!std::ranges::all_of(entry, [](char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; }))
                     Fail(location, std::format("'{}' is not a valid entry point name", entry));
+                if (entry.starts_with("__")) Fail(location, std::format("'{}': entry points starting with '__' are reserved", entry));
                 if (f->networkCallable && entry.starts_with('_')) Fail(location, "network callable entry points cannot start with '_'");
                 entryOverride = entry;
             }
@@ -1976,6 +1993,7 @@ namespace UdonLuau {
             SignalInfo info;
             info.name = var->name.value;
             info.exported = exported;
+            info.busy = emit_.Hidden(types_.Boolean);
             if (annotated) {
                 for (const AstTypeOrPack& p : ref->parameters) {
                     if (!p.type) Fail(ref->location, "a signal's values are listed as types, e.g. Signal<VRCPlayerApi, number>");
@@ -2038,11 +2056,14 @@ namespace UdonLuau {
                 }
                 if (method == "Fire") {
                     if (call->args.size != signal->types.size()) Fail(location, std::format("'{}' carries {} value(s), got {}", signal->name, signal->types.size(), call->args.size));
+                    if (fireDepth_ > kMaxFireDepth) Fail(location, std::format("'{}' is fired by its own handlers without end; recursion is not supported", signal->name));
                     FireSite fire;
                     fire.signal = signal;
                     fire.block = emit_.NewLabel();
                     fire.back = emit_.NewLabel();
                     fire.location = location;
+                    fire.from = current_;
+                    fire.depth = fireDepth_;
                     for (size_t i = 0; i < call->args.size; ++i) {
                         const Type* type = signal->types[i];
                         Value v = CompileExpr(call->args.data[i], type);
@@ -2063,23 +2084,27 @@ namespace UdonLuau {
                     if (fn->parameters.size() != signal->types.size() ||
                         !std::ranges::equal(fn->parameters, signal->types, [](const Variable& p, const Type* t) { return p.type == t; }))
                         Fail(location, std::format("'{}' must take the values '{}' carries", fn->name, signal->name));
-                    auto connection = signal->connections.find(fn);
-                    if (connection == signal->connections.end()) {
+                    uint32_t* connection = signal->Connection(fn);
+                    if (!connection) {
                         if (method == "Disconnect") return std::vector<Value>{};
-                        connection = signal->connections.emplace(fn, emit_.Hidden(types_.Boolean)).first;
+                        connection = &signal->connections.emplace_back(fn, emit_.Hidden(types_.Boolean)).second;
                     }
-                    emit_.Copy(TruthySlot(Value::OfBoolean(method == "Connect"), location), connection->second);
+                    emit_.Copy(TruthySlot(Value::OfBoolean(method == "Connect"), location), *connection);
                     return std::vector<Value>{};
                 }
                 Fail(location, std::format("signals have Wait, Fire, Connect and Disconnect, not '{}'", method));
             }
             if (auto* member = Unwrap(index->expr)->as<AstExprIndexName>()) {
-                auto* local = Unwrap(member->expr)->as<AstExprLocal>();
-                auto owner = local ? variables_.find(local->local) : variables_.end();
-                const ScriptInfo* script = owner != variables_.end() ? owner->second.type->script : nullptr;
+                std::optional<Value> owner;
+                if (auto* local = Unwrap(member->expr)->as<AstExprLocal>()) {
+                    if (auto it = variables_.find(local->local); it != variables_.end()) owner = Value::OfSlot(it->second.slot, it->second.type);
+                } else if (auto* global = Unwrap(member->expr)->as<AstExprGlobal>(); global && singletons_.contains(global->name.value)) {
+                    owner = CompileExpr(global);
+                }
+                const ScriptInfo* script = owner && owner->kind == Value::Kind::Slot ? owner->type->script : nullptr;
                 if (script)
                     for (const ScriptSignal& signal : script->signals)
-                        if (signal.name == member->index.value) return CallRemoteSignal(Value::OfSlot(owner->second.slot, owner->second.type), signal, method, call, want);
+                        if (signal.name == member->index.value) return CallRemoteSignal(*owner, signal, method, call, want);
             }
             if (const EventInfo* event = EventOf(index->expr)) {
                 if (method != "Wait") Fail(location, std::format("Events.{} only has Wait", event->name));
@@ -2105,6 +2130,7 @@ namespace UdonLuau {
         std::vector<Value> Compiler::EmitListen(const std::vector<const Type*>& types, std::vector<ListenSite*>& registry, size_t want, const Location& location) {
             Function* root = root_;
             if (!root) Fail(location, "waits can only be used in events, public methods and functions they call or start");
+            if (root->reentry == Reentry::Overlap) Fail(location, "signal and event waits track one waiting run per place, so they cannot be used with @reentry(overlap)");
             ListenSite& site = listenSites_.emplace_back();
             site.root = root;
             site.waiting = emit_.Hidden(types_.Boolean);
@@ -2126,17 +2152,25 @@ namespace UdonLuau {
             return out;
         }
 
-        void Compiler::EmitDispatch(const std::vector<ListenSite*>& sites, const std::vector<Value>& values, const std::map<Function*, uint32_t>& connections, const Location& location) {
+        std::vector<Value> Compiler::BeginDispatch(uint32_t busy, const std::vector<Value>& values, Label skip, const Location& location) {
+            Label start = emit_.NewLabel();
+            emit_.JumpIfFalse(busy, start);
+            if (DebugBuild()) CallStatic(types_.Get("UnityEngineDebug"), "LogWarning", { Value::OfString(std::format("[UdonLuau] line {}: fired again while it was still being delivered; ignored", location.begin.line + 1)) }, nullptr, location);
+            emit_.Jump(skip);
+            emit_.Bind(start);
+            emit_.Copy(TruthySlot(Value::OfBoolean(true), location), busy);
+            std::vector<Value> held;
+            for (const Value& v : values) {
+                uint32_t slot = emit_.Hidden(v.type);
+                emit_.Copy(v.slot, slot);
+                held.push_back(Value::OfSlot(slot, v.type));
+            }
+            return held;
+        }
+
+        void Compiler::EmitDispatch(const std::vector<ListenSite*>& sites, const std::vector<Value>& values, const std::vector<std::pair<Function*, uint32_t>>& connections, const Location& location) {
             uint32_t yes = TruthySlot(Value::OfBoolean(true), location);
             uint32_t no = TruthySlot(Value::OfBoolean(false), location);
-            uint32_t busy = emit_.Hidden(types_.Boolean);
-            Label start = emit_.NewLabel();
-            Label done = emit_.NewLabel();
-            emit_.JumpIfFalse(busy, start);
-            if (DebugBuild()) CallStatic(types_.Get("UnityEngineDebug"), "LogWarning", { Value::OfString(std::format("[UdonLuau] line {}: fired again while it was still being handled; ignored", location.begin.line + 1)) }, nullptr, location);
-            emit_.Jump(done);
-            emit_.Bind(start);
-            emit_.Copy(yes, busy);
             std::vector<uint32_t> snapshots;
             for (const ListenSite* site : sites) {
                 uint32_t snapshot = emit_.Hidden(types_.Boolean);
@@ -2171,18 +2205,25 @@ namespace UdonLuau {
                 EnterRoot(fn, values, location);
                 emit_.Bind(next);
             }
-            emit_.Copy(no, busy);
-            emit_.Bind(done);
         }
 
         void Compiler::EmitFireBlock(const FireSite& fire) {
-            current_ = nullptr;
+            current_ = fire.from;
             root_ = nullptr;
             emit_.ResetTemps();
+            if (fire.from && !fire.from->IsRoot())
+                for (const ListenSite* site : fire.signal->sites) fire.from->callees.push_back(site->root);
+            fireDepth_ = fire.depth + 1;
             emit_.Bind(fire.block);
-            EmitDispatch(fire.signal->sites, fire.values, fire.signal->connections, fire.location);
-            if (fire.signal->exported) EmitRemoteFire(*fire.signal, fire.values, fire.location);
+            Label skip = emit_.NewLabel();
+            std::vector<Value> values = BeginDispatch(fire.signal->busy, fire.values, skip, fire.location);
+            EmitDispatch(fire.signal->sites, values, fire.signal->connections, fire.location);
+            if (fire.signal->exported) EmitRemoteFire(*fire.signal, values, fire.location);
+            emit_.Copy(TruthySlot(Value::OfBoolean(false), fire.location), fire.signal->busy);
+            emit_.Bind(skip);
             emit_.Jump(fire.back);
+            fireDepth_ = 0;
+            current_ = nullptr;
         }
 
         void Compiler::EmitEventDispatch(EventListeners& listeners) {
@@ -2203,7 +2244,11 @@ namespace UdonLuau {
             emit_.Bind(listeners.dispatch);
             std::vector<Value> values;
             for (const Variable& v : listeners.values) values.push_back(Value::OfSlot(v.slot, v.type));
-            EmitDispatch(listeners.sites, values, {}, location);
+            uint32_t busy = emit_.Hidden(types_.Boolean);
+            Label skip = emit_.NewLabel();
+            EmitDispatch(listeners.sites, BeginDispatch(busy, values, skip, location), {}, location);
+            emit_.Copy(TruthySlot(Value::OfBoolean(false), location), busy);
+            emit_.Bind(skip);
             emit_.JumpTo(0xFFFFFFFFu);
         }
 
@@ -2219,20 +2264,22 @@ namespace UdonLuau {
                 if (call->args.size) Fail(location, "Wait takes no arguments");
                 Function* root = root_;
                 if (!root) Fail(location, "waits can only be used in events, public methods and functions they call or start");
+                if (root->reentry == Reentry::Overlap) Fail(location, "signal and event waits track one waiting run per place, so they cannot be used with @reentry(overlap)");
                 std::string entry = std::format("__co{}", waitSites_++);
                 uint32_t waiting = emit_.Hidden(types_.Boolean);
-                uint32_t registered = emit_.Hidden(types_.Boolean);
+                uint32_t registeredWith = emit_.Hidden(types_.Behaviour());
                 root->waitFlags.push_back(waiting);
                 std::vector<Variable> results;
                 for (const Type* t : types) results.push_back({ emit_.Hidden(t), t });
 
                 Label enlist = emit_.NewLabel();
                 Label enlisted = emit_.NewLabel();
-                emit_.JumpIfFalse(registered, enlist);
+                Value same = CompareValues(AstExprBinary::CompareEq, Value::OfSlot(registeredWith, types_.Behaviour()), receiver, location);
+                emit_.JumpIfFalse(TruthySlot(same, location), enlist);
                 emit_.Jump(enlisted);
                 emit_.Bind(enlist);
                 RegisterWith(owner, signal.name, "wait", entry, location);
-                emit_.Copy(yes, registered);
+                emit_.Copy(receiver.slot, registeredWith);
                 emit_.Bind(enlisted);
                 emit_.Copy(yes, waiting);
                 if (root->lineSlot) emit_.Copy(Materialize(Value::OfInteger(location.begin.line + 1), types_.Int32, location), root->lineSlot);
@@ -2245,7 +2292,7 @@ namespace UdonLuau {
                 emit_.Bind(resume);
                 entries_.push_back({ entry, *emit_.AddressOf(resume) });
                 emit_.Push(haltSlot_);
-                emit_.Copy(no, registered);
+                emit_.Copy(emit_.Constant(types_.Behaviour(), HeapValue{ ValueKind::Null }), registeredWith);
                 emit_.JumpIfFalse(waiting, stale);
                 emit_.Copy(no, waiting);
                 for (size_t i = 0; i < results.size(); ++i) emit_.Copy(SignalSlot(signal.values[i].symbol, types[i]), results[i].slot);
@@ -4145,7 +4192,8 @@ namespace UdonLuau {
                 emit_.Bind(wait);
                 CallMember(SelfValue("this"), "SendCustomEventDelayedFrames",
                     { Value::OfString(f.entryName), Value::OfInteger(1), Value::OfInteger(0, types_.Get("VRCUdonCommonEnumsEventTiming")) }, nullptr, f.location);
-                emit_.Jump(f.epilogue);
+                if (f.trampoline) emit_.Pop();
+                emit_.JumpTo(0xFFFFFFFFu);
                 emit_.Bind(go);
             }
         }
@@ -5123,6 +5171,7 @@ namespace UdonLuau {
             emit_.Push(emit_.AddressConstant(back));
             emit_.Jump(f->entry);
             emit_.Bind(back);
+            EmitAliveCheck();
 
             std::vector<Value> results;
             for (size_t i = 0; i < std::min(want, f->returns.size()); ++i) {
@@ -5212,7 +5261,9 @@ namespace UdonLuau {
                 if (auto r = TryResolve(generic, rest, args.back().type, ambiguous)) return Invoke(*r, receiver, rest, location);
             }
             Resolution r = Resolve(methods, args, typeArg, location, std::format("{}.{}", receiver.type->displayName, name));
-            return Invoke(r, receiver, args, location);
+            std::vector<Value> results = Invoke(r, receiver, args, location);
+            if (name == "SendCustomEvent" || name == "SendCustomNetworkEvent" || name == "SetProgramVariable") EmitAliveCheck();
+            return results;
         }
 
         Value Compiler::FindBehaviour(const Value& receiver, std::string_view getter, const Type* wanted, const Location& location) {
