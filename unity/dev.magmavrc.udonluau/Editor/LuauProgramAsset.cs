@@ -60,9 +60,11 @@ namespace Magma.VRC.UdonLuau
         [SerializeField] private string interfaceText = "";
         [SerializeField] private string disassembly = "";
         [SerializeField] private List<LuauLine> lines = new List<LuauLine>();
+        [SerializeField] private List<LuauCoroutine> coroutines = new List<LuauCoroutine>();
 
         [NonSerialized] private bool _showDisassembly;
         [NonSerialized] private bool _showMethods;
+        [NonSerialized] private bool _showCoroutines;
         [NonSerialized] private NetworkCallingEntrypointMetadata[] _networkCallables;
         [NonSerialized] private readonly Dictionary<string, bool> _referenceFoldouts = new Dictionary<string, bool>();
 
@@ -130,6 +132,7 @@ namespace Magma.VRC.UdonLuau
             fieldAnnotations.Clear();
             scriptReferences.Clear();
             lines.Clear();
+            coroutines.Clear();
             _networkCallables = null;
             behaviourSyncMode = BehaviourSyncMode.Any;
             disassembly = "";
@@ -177,6 +180,7 @@ namespace Magma.VRC.UdonLuau
             fieldAnnotations.AddRange(result.Fields);
             scriptReferences.AddRange(result.ScriptReferences);
             lines.AddRange(result.Lines);
+            coroutines.AddRange(result.Coroutines);
             _networkCallables = result.NetworkCallables.Count > 0 ? result.NetworkCallables.ToArray() : null;
             disassembly = result.Disassembly;
             behaviourSyncMode = result.SyncMode;
@@ -323,6 +327,7 @@ namespace Magma.VRC.UdonLuau
 
         private void DrawMethods()
         {
+            DrawCoroutines();
             if (methods.Count == 0) return;
             _showMethods = EditorGUILayout.Foldout(_showMethods, $"Methods ({methods.Count})", true);
             if (!_showMethods) return;
@@ -342,6 +347,28 @@ namespace Magma.VRC.UdonLuau
                             : "Local only";
                         EditorGUILayout.LabelField("Network", network, EditorStyles.miniLabel);
                     }
+                }
+            }
+        }
+
+        private void DrawCoroutines()
+        {
+            if (coroutines.Count == 0) return;
+            _showCoroutines = EditorGUILayout.Foldout(_showCoroutines, $"Waiting functions ({coroutines.Count})", true);
+            if (!_showCoroutines) return;
+
+            using (new EditorGUI.IndentLevelScope())
+            {
+                foreach (LuauCoroutine c in coroutines)
+                {
+                    string mode = c.mode switch
+                    {
+                        "restart" => "restarts when triggered while waiting",
+                        "overlap" => "runs again alongside, sharing locals",
+                        "shared" => "one caller at a time; others skip the call",
+                        _ => "ignores triggers while waiting",
+                    };
+                    EditorGUILayout.LabelField(c.function, mode, EditorStyles.miniLabel);
                 }
             }
         }

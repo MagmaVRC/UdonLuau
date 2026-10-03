@@ -55,6 +55,13 @@ namespace Magma.VRC.UdonLuau
         public int line;
     }
 
+    [Serializable]
+    internal struct LuauCoroutine
+    {
+        public string function;
+        public string mode;
+    }
+
     internal sealed class LuauCompileResult
     {
         /// <summary>The program, or null when compilation or program construction failed.</summary>
@@ -68,6 +75,9 @@ namespace Magma.VRC.UdonLuau
 
         /// <summary>The code address where each statement starts and its zero-based source line, sorted by address.</summary>
         public readonly List<LuauLine> Lines = new List<LuauLine>();
+
+        /// <summary>The functions that can wait and their @reentry mode.</summary>
+        public readonly List<LuauCoroutine> Coroutines = new List<LuauCoroutine>();
 
         /// <summary>Max events per second declared with @networkcallable(n) by entry point; 0 means the SDK default.</summary>
         public readonly Dictionary<string, int> NetworkRates = new Dictionary<string, int>();
@@ -135,6 +145,7 @@ namespace Magma.VRC.UdonLuau
             output.ModuleAnnotations.AddRange(ReadAnnotations(result, -1));
             output.Disassembly = Native.Read(Native.ul_result_disassembly(result)) ?? "";
             ReadLines(result, output);
+            ReadCoroutines(result, output);
 
             try
             {
@@ -191,6 +202,15 @@ namespace Magma.VRC.UdonLuau
             int count = Native.ul_result_line_count(result);
             for (int i = 0; i < count; i++)
                 if (Native.ul_result_line(result, i, out uint address, out int line) != 0) output.Lines.Add(new LuauLine { address = address, line = line });
+        }
+
+        private static void ReadCoroutines(ResultHandle result, LuauCompileResult output)
+        {
+            if (Native.ul_result_coroutine_count == null || Native.ul_result_coroutine == null) return;
+            int count = Native.ul_result_coroutine_count(result);
+            for (int i = 0; i < count; i++)
+                if (Native.ul_result_coroutine(result, i, out IntPtr function, out IntPtr mode) != 0)
+                    output.Coroutines.Add(new LuauCoroutine { function = Native.Read(function), mode = Native.Read(mode) });
         }
 
         internal static List<LuauAnnotation> ReadAnnotations(ResultHandle result, int address)

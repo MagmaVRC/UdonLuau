@@ -73,6 +73,13 @@ namespace UdonLuau {
         int      line = 0;
     };
 
+    /// <summary>A function that can wait, and what a second trigger does while it waits: "ignore",
+    /// "restart" or "overlap", or "shared" for a @noinline helper that serves one caller at a time.</summary>
+    struct CoroutineInfo {
+        std::string function;
+        std::string mode;
+    };
+
     enum class SyncInterpolation : uint8_t {
         None,
         Linear,
@@ -120,6 +127,7 @@ namespace UdonLuau {
         int                       updateOrder = 0;
         /// <summary>Code addresses where each compiled statement starts, sorted by address, with zero-based source lines.</summary>
         std::vector<LineEntry>    lines;
+        std::vector<CoroutineInfo> coroutines;
 
         /// <summary>The code in Udon's serialized big-endian byte order.</summary>
         [[nodiscard]] std::vector<uint8_t> ByteCode() const;

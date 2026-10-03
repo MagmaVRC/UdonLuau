@@ -1600,6 +1600,7 @@ end
             { .defines = { { "DEBUG", "true" } } });
         Check(basic.has_value(), "waits compile");
         if (basic) {
+            Check(basic->coroutines.size() == 2 && basic->coroutines[0].function == "Interact" && basic->coroutines[0].mode == "ignore", "waiting functions are listed with their mode");
             Machine m(f, *basic);
             m.Run("_interact");
             Check(std::get<int32_t>(m.Var("step")) == 1 && f.log.back() == "delay:__co0:2", std::format("the event runs until its first wait ({})", log()));

@@ -984,6 +984,11 @@ namespace UdonLuau {
                 result.program->syncMode = syncMode_;
                 if (singleton_) result.program->updateOrder = std::numeric_limits<int>::min() / 2;
                 for (const auto& f : functions_) {
+                    if (!f->IsRoot() && !f->Shared()) continue;
+                    std::string_view mode = f->Shared() ? "shared" : f->reentry == Reentry::Restart ? "restart" : f->reentry == Reentry::Overlap ? "overlap" : "ignore";
+                    result.program->coroutines.push_back({ f->name, std::string(mode) });
+                }
+                for (const auto& f : functions_) {
                     if (!f->networkCallable) continue;
                     NetworkCallable n{ f->entryName, f->maxEventsPerSecond, {} };
                     for (const Variable& p : f->parameters) n.parameters.push_back({ result.program->heap[p.slot].symbol, p.type->udonName });

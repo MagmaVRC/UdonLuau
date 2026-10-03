@@ -206,6 +206,7 @@ namespace Magma.VRC.UdonLuau
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int GetLine(IntPtr result, int index, out uint address, out int line);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int AddScriptSignalValue(IntPtr catalog, byte[] script, byte[] signal, byte[] udonType, byte[] scriptType, byte[] symbol);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int GetInterfaceSignalValue(IntPtr result, int signal, int index, out NativeScriptVariable variable);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int GetCoroutine(IntPtr result, int index, out IntPtr function, out IntPtr mode);
 
         public static Create ul_catalog_create;
         public static Destroy ul_catalog_destroy;
@@ -268,6 +269,8 @@ namespace Magma.VRC.UdonLuau
         public static ResultInt ul_result_interface_signal_count;
         public static GetInterfaceMethod ul_result_interface_signal;
         public static GetInterfaceSignalValue ul_result_interface_signal_value;
+        public static ResultInt ul_result_coroutine_count;
+        public static GetCoroutine ul_result_coroutine;
 
         private static IntPtr _module;
 

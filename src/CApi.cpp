@@ -281,6 +281,18 @@ int32_t ul_result_line(const ul_result* result, int32_t index, uint32_t* address
     return 1;
 }
 
+int32_t ul_result_coroutine_count(const ul_result* result) {
+    return result && result->result.program ? static_cast<int32_t>(result->result.program->coroutines.size()) : 0;
+}
+
+int32_t ul_result_coroutine(const ul_result* result, int32_t index, const char** function, const char** mode) {
+    if (!result || !result->result.program || !function || !mode || !InRange(index, result->result.program->coroutines.size())) return 0;
+    const UdonLuau::CoroutineInfo& c = result->result.program->coroutines[static_cast<size_t>(index)];
+    *function = c.function.c_str();
+    *mode = c.mode.c_str();
+    return 1;
+}
+
 int32_t ul_result_has_statics(const ul_result* result) {
     return result && result->result.hasStatics ? 1 : 0;
 }

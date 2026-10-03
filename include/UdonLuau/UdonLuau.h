@@ -211,6 +211,11 @@ UDONLUAU_API int32_t ul_result_line_count(const ul_result* result);
 /// <returns>0 when the index is out of range.</returns>
 UDONLUAU_API int32_t ul_result_line(const ul_result* result, int32_t index, uint32_t* address, int32_t* line);
 
+/// <summary>Functions that can wait, with what a second trigger does while one waits: "ignore", "restart",
+/// "overlap", or "shared" for a @noinline helper that serves one caller at a time.</summary>
+UDONLUAU_API int32_t ul_result_coroutine_count(const ul_result* result);
+UDONLUAU_API int32_t ul_result_coroutine(const ul_result* result, int32_t index, const char** function, const char** mode);
+
 /// <summary>Whether the module declares static fields or functions, so its companion singleton must also be compiled and placed.</summary>
 UDONLUAU_API int32_t ul_result_has_statics(const ul_result* result);
 
