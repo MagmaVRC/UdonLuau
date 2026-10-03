@@ -33,6 +33,12 @@ namespace Magma.VRC.UdonLuau
 
         /// <summary>The network rate limit in events per second; 0 means the SDK default.</summary>
         public int maxEventsPerSecond;
+
+        /// <summary>The heap symbols that receive the arguments, in order, for callers that use SetProgramVariable.</summary>
+        public string parameterSymbols;
+
+        /// <summary>The heap symbol that holds the return value after the call, for callers that use GetProgramVariable; empty when there is none.</summary>
+        public string returnSymbol;
     }
 
     /// <summary>An Udon program source compiled from a .lua or .luau script.</summary>
@@ -186,6 +192,8 @@ namespace Magma.VRC.UdonLuau
                     entryPoint = m.EntryPoint,
                     networkCallable = m.NetworkCallable,
                     maxEventsPerSecond = m.NetworkCallable ? rate : 0,
+                    parameterSymbols = string.Join(", ", m.Parameters.Select(p => p.Symbol)),
+                    returnSymbol = m.Returns.Count > 0 ? m.Returns[0].Symbol : "",
                 });
             }
         }
@@ -302,6 +310,8 @@ namespace Magma.VRC.UdonLuau
                     using (new EditorGUI.IndentLevelScope())
                     {
                         EditorGUILayout.LabelField("Entry point", method.entryPoint, EditorStyles.miniLabel);
+                        if (!string.IsNullOrEmpty(method.parameterSymbols)) EditorGUILayout.LabelField("Parameters", method.parameterSymbols, EditorStyles.miniLabel);
+                        if (!string.IsNullOrEmpty(method.returnSymbol)) EditorGUILayout.LabelField("Returns", method.returnSymbol, EditorStyles.miniLabel);
                         string network = method.networkCallable
                             ? $"Network callable · max {(method.maxEventsPerSecond > 0 ? method.maxEventsPerSecond + "/s" : "SDK default")}"
                             : "Local only";
