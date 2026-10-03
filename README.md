@@ -203,6 +203,40 @@ Luau's `math`, `string` and `table` libraries are compiled onto Udon externs. Wh
 | `string` | `format`, `len`, `upper`, `lower`, `rep`, `split` | `format` takes a literal format string. It is translated to `String.Format` when compiling and supports `%d %i %s %f %.Nf %g %e %x %X %%`, widths and `-`/`0` flags. For anything else, use the string's own methods (`s:Substring(0, 3)`). |
 | `table` | `insert`, `remove`, `find`, `create`, `clone`, `clear`, `concat`, `sort`, `move` | Udon arrays have a fixed size. `insert` and `remove` build a new array and store it back into the variable or field you passed, so other references keep the old array. `find` returns -1 when the value is missing. `create(n, value)` fills by doubling copies, so it costs about 5·log2(n) externs rather than n. `sort` takes no comparison function. |
 
+Every polyfilled function is listed in one registry, `src/Polyfills.hpp`, together with its Luau signature. The registry decides which library calls the compiler accepts, produces the "available: ..." list in error messages, and generates the luau-lsp declarations for libraries Luau does not have (such as `Delay`). To add a polyfill, add a registry entry and handle the call in the matching `Call*` function in `Compiler.cpp`.
+
+### Delayed calls
+
+Udon can delay an event with no arguments (`SendCustomEventDelayedSeconds`) or send a network event with arguments right away (`SendCustomNetworkEvent`). It cannot do both at once, and it cannot delay a call with arguments at all. `Delay` adds both:
+
+```lua
+export local door: Door
+
+local function flash(times: int, color: Color)
+    -- ...
+end
+
+function Interact()
+    Delay.Seconds(2, this):flash(3, Color.red)              -- a local function, with arguments
+    Delay.Frames(10, door):Open()                           -- another script's method
+    Delay.Seconds(1.5, Network.All(door)):Hit(25)           -- a network event with arguments, sent later
+    Delay.Seconds(0.5, this, EventTiming.LateUpdate):flash(1, Color.white)
+end
+```
+
+- **Targets:**
+  - `this`, for any function in the script;
+  - a typed script reference, for its public methods;
+  - a `Network.X(...)` target, for `@networkcallable` methods;
+  - a plain `UdonBehaviour`, for custom events without arguments.
+- **No-argument calls** to a public method compile straight to `SendCustomEventDelayedSeconds`/`Frames` and cost nothing extra.
+- **Calls with arguments:** each call site gets a queue for its arguments and a private stub event (`__delayN`). The arguments and the target are captured when the call is made, and the stub delivers them when the delay ends.
+  - Delayed network calls are sent when the delay ends, by the client that made the call.
+- **Ordering:** with a constant delay, calls from one site are delivered in the order they were made. When the delay is a variable, each call records its due time and the stub delivers the earliest one first.
+  - A delayed call with arguments needs a constant `EventTiming`.
+- **Repeating calls:** a function can delay a call to itself, as in a repeating tick. Functions used this way are compiled as real functions rather than inlined.
+- **Cost:** queuing a call costs about 3 externs per argument. Delivering it costs about 4 per argument.
+
 ### Lists
 
 `List<T>` is a growable list compiled to an array and a count, with the capacity doubling as it fills:
@@ -272,7 +306,7 @@ These compile to what Udon understands:
 | `door.speed = 5` | `SetProgramVariable("speed", 5)` |
 | `Network.All(door):Hit(7)` | `SendCustomNetworkEvent(NetworkEventTarget.All, "Hit", 7)`. Any `NetworkEventTarget` member works as the name. Only `@networkcallable` methods are allowed. |
 
-Names, argument counts and types are checked when compiling. Typed references are also usable in arrays (`{Door}`). A plain `UdonBehaviour` still has every SDK member (`SendCustomEvent`, `GetProgramVariable`, ...), and converts to a script type with `behaviour :: Door`.
+Names, argument counts and types are checked when compiling. Typed references are also usable in arrays (`{Door}`). Arrays of behaviours are stored as `Component[]`, as UdonSharp does, because Udon has no `UdonBehaviour[]` externs. A plain `UdonBehaviour` still has every SDK member (`SendCustomEvent`, `GetProgramVariable`, ...), and converts to a script type with `behaviour :: Door`.
 
 The host registers scripts with `Catalog::AddScript`. `ExtractInterface` reads a Luau module's public interface without compiling it, so scripts that reference each other can all be registered before any is compiled.
 
