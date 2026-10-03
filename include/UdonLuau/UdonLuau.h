@@ -147,6 +147,10 @@ UDONLUAU_API void ul_catalog_add_syncable_type(ul_catalog* catalog, const char* 
 /// <summary>Adds a behaviour script that Luau code can hold typed references to, replacing any earlier one with the same name.</summary>
 UDONLUAU_API void ul_catalog_add_script(ul_catalog* catalog, const char* name);
 
+/// <summary>Marks a script added earlier as a singleton (singleton 1) or a regular script (singleton 0).</summary>
+/// <returns>0 when the script is unknown.</returns>
+UDONLUAU_API int32_t ul_catalog_set_script_singleton(ul_catalog* catalog, const char* script, int32_t singleton);
+
 /// <summary>Adds a public field to a script added earlier. script_type names a behaviour script when the field holds a typed reference to one.</summary>
 /// <returns>0 when the script is unknown.</returns>
 UDONLUAU_API int32_t ul_catalog_add_script_field(ul_catalog* catalog, const char* script, const char* name, const char* udon_type, const char* script_type, const char* symbol);
@@ -220,6 +224,9 @@ UDONLUAU_API int32_t ul_result_interface_field_count(const ul_result* result);
 UDONLUAU_API int32_t ul_result_interface_field(const ul_result* result, int32_t index, ul_script_variable* out);
 UDONLUAU_API int32_t ul_result_interface_method_count(const ul_result* result);
 UDONLUAU_API int32_t ul_result_interface_method(const ul_result* result, int32_t index, ul_script_method* out);
+
+/// <summary>Whether the module is marked @singleton.</summary>
+UDONLUAU_API int32_t ul_result_interface_singleton(const ul_result* result);
 
 /// <summary>Whether a public method is marked @networkcallable.</summary>
 UDONLUAU_API int32_t ul_result_interface_method_network_callable(const ul_result* result, int32_t index);

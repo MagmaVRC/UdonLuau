@@ -623,6 +623,9 @@ namespace UdonLuau {
             std::vector<Value> CallDelay(std::string_view name, std::vector<Value> args, const Location& location);
             std::vector<Value> CallDelayed(const Value& receiver, std::string_view name, std::vector<Value> args, const Location& location);
             void CompileDelaySite(const DelaySite& site);
+            void FindSingletonUses(AstStatBlock* root);
+            void EmitEntryPrologue(const Function& f);
+            void EmitSingletonResolver();
             std::optional<std::string_view> LibraryName(AstExpr* expr);
             std::vector<Value> CallLibrary(std::string_view library, std::string_view name, AstExprCall* call, std::vector<Value> args, const Type* typeArg, const Variable* into);
             std::vector<Value> CallMath(std::string_view name, std::vector<Value> args, const Location& location);
@@ -687,6 +690,19 @@ namespace UdonLuau {
             std::vector<std::pair<std::string, const Type*>> exportedFields_;
             bool                                           interfaceOnly_ = false;
             BehaviourSyncMode                              syncMode_ = BehaviourSyncMode::Any;
+            struct SingletonUse {
+                const ScriptInfo* script = nullptr;
+                uint32_t          slot = 0;
+                bool              methods = false;
+            };
+            bool                                           singleton_ = false;
+            bool                                           singletonStarted_ = false;
+            uint32_t                                       startedSlot_ = 0;
+            std::map<std::string, SingletonUse, std::less<>> singletons_;
+            uint32_t                                       singletonsReadySlot_ = 0;
+            uint32_t                                       resolveReturnSlot_ = 0;
+            Label                                          resolveRoutine_;
+            std::vector<std::pair<Label, Label>>           resolveStubs_;
             AstStat*                                       tail_ = nullptr;
             std::vector<size_t>                            lineStarts_;
             std::map<unsigned, std::vector<std::pair<FieldAttribute, Location>>> commentAttributes_;
@@ -738,6 +754,13 @@ namespace UdonLuau {
             halt.unsignedInteger = 0xFFFFFFFFu;
             haltSlot_ = emit_.Constant(types_.UInt32, halt);
             returnJumpSlot_ = emit_.AddSlot("__intnl_returnJump_SystemUInt32_0", types_.UInt32);
+            singleton_ = std::ranges::any_of(ModuleAttributes(parsed.root), [](const FieldAttribute& a) { return a.name == "singleton"; });
+            if (singleton_) {
+                HeapValue no;
+                no.kind = ValueKind::Boolean;
+                startedSlot_ = emit_.AddSlot("__started", types_.Boolean, no, true);
+                emit_.Slot(startedSlot_).attributes.push_back({ "hideininspector", {} });
+            }
 
             DeclareModule(parsed.root);
             bool declared = std::ranges::none_of(diagnostics_, [](const Diagnostic& d) { return d.severity == Severity::Error; });
@@ -745,6 +768,11 @@ namespace UdonLuau {
             if (interfaceOnly_) {
                 result.diagnostics = std::move(diagnostics_);
                 return result;
+            }
+            try {
+                FindSingletonUses(parsed.root);
+            } catch (const CompileError& e) {
+                Report(e.location, e.message);
             }
             Analyze(parsed.root);
             for (auto& f : functions_) {
@@ -761,6 +789,21 @@ namespace UdonLuau {
                     Report(e.location, e.message);
                 }
             }
+            if (singleton_ && !singletonStarted_) {
+                Label start = emit_.NewLabel();
+                emit_.Bind(start);
+                entries_.push_back({ "_start", *emit_.AddressOf(start) });
+                HeapValue yes;
+                yes.kind = ValueKind::Boolean;
+                yes.boolean = true;
+                emit_.Copy(emit_.Constant(types_.Boolean, yes), startedSlot_);
+                emit_.JumpTo(0xFFFFFFFFu);
+            }
+            try {
+                EmitSingletonResolver();
+            } catch (const CompileError& e) {
+                Report(e.location, e.message);
+            }
             CheckRecursion();
 
             bool failed = std::ranges::any_of(diagnostics_, [](const Diagnostic& d) { return d.severity == Severity::Error; });
@@ -768,6 +811,7 @@ namespace UdonLuau {
                 result.program = emit_.Finish(std::move(entries_), std::move(sync_));
                 result.program->attributes = ModuleAttributes(parsed.root);
                 result.program->syncMode = syncMode_;
+                if (singleton_) result.program->updateOrder = std::numeric_limits<int>::min() / 2;
                 for (const auto& f : functions_) {
                     if (!f->networkCallable) continue;
                     NetworkCallable n{ f->entryName, f->maxEventsPerSecond, {} };
@@ -849,10 +893,12 @@ namespace UdonLuau {
             while (attached > 0 && commentLines_.contains(attached - 1)) --attached;
             if (!root->body.size) attached = first;
 
+            static const std::set<std::string, std::less<>> moduleOnly{ "singleton", "syncmode", "define" };
             std::vector<FieldAttribute> out;
             for (const auto& [line, entries] : commentAttributes_) {
-                if (line >= attached) break;
-                for (const auto& entry : entries) out.push_back(entry.first);
+                if (line >= first) break;
+                for (const auto& entry : entries)
+                    if (line < attached || moduleOnly.contains(entry.first.name)) out.push_back(entry.first);
             }
             return out;
         }
@@ -907,6 +953,7 @@ namespace UdonLuau {
 
         ScriptInfo Compiler::BuildInterface() {
             ScriptInfo info;
+            info.singleton = singleton_;
             for (const auto& [name, type] : exportedFields_) info.fields.push_back(MakeVariable(name, type, name));
             for (const auto& f : functions_) {
                 if (!f->exported || f->event) continue;
@@ -1334,6 +1381,7 @@ namespace UdonLuau {
                 emit_.Bind(f.exportedEntry);
                 entries_.push_back({ f.entryName, *emit_.AddressOf(f.exportedEntry) });
                 if (f.trampoline) emit_.Push(haltSlot_);
+                EmitEntryPrologue(f);
             }
             emit_.Bind(f.entry);
             AstStat* tail = nullptr;
@@ -2130,6 +2178,7 @@ namespace UdonLuau {
             if (auto it = globalFunctions_.find(std::string(name)); it != globalFunctions_.end()) return Value::OfFunction(it->second);
             if (auto it = defines_.find(std::string(name)); it != defines_.end()) return it->second;
             if (name == "List") Fail(expr->location, "declare lists with their type: 'local xs: List<int> = {}'");
+            if (auto it = singletons_.find(name); it != singletons_.end()) return Value::OfSlot(it->second.slot, types_.Script(it->second.script));
 
             if (auto it = typeAliases_.find(std::string(name)); it != typeAliases_.end()) return Value::OfType(it->second);
             if (const ScriptInfo* script = catalog_.FindScript(name)) return Value::OfType(types_.Script(script));
@@ -2785,6 +2834,13 @@ namespace UdonLuau {
             emit_.Bind(site.label);
             entries_.push_back({ site.entry, *emit_.AddressOf(site.label) });
             const Location& location = site.location;
+            if (!singletons_.empty()) {
+                Label resolve = emit_.NewLabel();
+                Label resolved = emit_.NewLabel();
+                emit_.JumpIfFalse(singletonsReadySlot_, resolve);
+                emit_.Bind(resolved);
+                resolveStubs_.emplace_back(resolve, resolved);
+            }
 
             if (site.due || !site.queues.empty()) {
                 const Value& first = site.due ? *site.due : site.queues.front();
@@ -2840,6 +2896,97 @@ namespace UdonLuau {
                 CallScriptMethod(target, *method, values, 0, location);
             }
             emit_.JumpTo(0xFFFFFFFFu);
+        }
+
+        void Compiler::FindSingletonUses(AstStatBlock* root) {
+            class Finder : public AstVisitor {
+            public:
+                std::set<std::string, std::less<>> names;
+                std::set<std::string, std::less<>> called;
+                bool visit(AstExprGlobal* g) override {
+                    names.insert(g->name.value);
+                    return true;
+                }
+                bool visit(AstExprCall* c) override {
+                    auto* index = c->self ? Unwrap(c->func)->as<AstExprIndexName>() : nullptr;
+                    if (auto* g = index ? Unwrap(index->expr)->as<AstExprGlobal>() : nullptr) called.insert(g->name.value);
+                    return true;
+                }
+            };
+            Finder finder;
+            root->visit(&finder);
+            for (const std::string& name : finder.names) {
+                const ScriptInfo* script = catalog_.FindScript(name);
+                if (!script || !script->singleton || globalFunctions_.contains(name) || defines_.contains(name)) continue;
+                HeapValue none;
+                none.kind = ValueKind::Null;
+                uint32_t slot = emit_.AddSlot("__singleton_" + name, types_.Script(script), none, true);
+                emit_.Slot(slot).attributes.push_back({ "hideininspector", {} });
+                singletons_[name] = { script, slot, finder.called.contains(name) };
+            }
+            if (singletons_.empty()) return;
+            HeapValue no;
+            no.kind = ValueKind::Boolean;
+            singletonsReadySlot_ = emit_.AddSlot("__singletons_ready", types_.Boolean, no, true);
+            emit_.Slot(singletonsReadySlot_).attributes.push_back({ "hideininspector", {} });
+            resolveReturnSlot_ = emit_.Hidden(types_.UInt32);
+            resolveRoutine_ = emit_.NewLabel();
+        }
+
+        void Compiler::EmitEntryPrologue(const Function& f) {
+            if (!singletons_.empty()) {
+                Label resolve = emit_.NewLabel();
+                Label resolved = emit_.NewLabel();
+                emit_.JumpIfFalse(singletonsReadySlot_, resolve);
+                emit_.Bind(resolved);
+                resolveStubs_.emplace_back(resolve, resolved);
+            }
+            if (!f.event) return;
+            if (singleton_ && f.name == "Start") {
+                singletonStarted_ = true;
+                emit_.Copy(TruthySlot(Value::OfBoolean(true), f.location), startedSlot_);
+            }
+            if (f.name != "Start" && f.name != "OnEnable") return;
+            for (const auto& [name, use] : singletons_) {
+                if (!use.methods) continue;
+                Value started = CallMember(Value::OfSlot(use.slot, types_.Behaviour()), "GetProgramVariable", { Value::OfString("__started") }, nullptr, f.location).at(0);
+                Label wait = emit_.NewLabel();
+                Label go = emit_.NewLabel();
+                emit_.JumpIfFalse(started.slot, wait);
+                emit_.Jump(go);
+                emit_.Bind(wait);
+                CallMember(SelfValue("this"), "SendCustomEventDelayedFrames",
+                    { Value::OfString(f.entryName), Value::OfInteger(1), Value::OfInteger(0, types_.Get("VRCUdonCommonEnumsEventTiming")) }, nullptr, f.location);
+                emit_.Jump(f.epilogue);
+                emit_.Bind(go);
+            }
+        }
+
+        void Compiler::EmitSingletonResolver() {
+            if (resolveStubs_.empty()) return;
+            current_ = nullptr;
+            emit_.ResetTemps();
+            for (const auto& [stub, back] : resolveStubs_) {
+                emit_.Bind(stub);
+                emit_.Copy(emit_.AddressConstant(back), resolveReturnSlot_);
+                emit_.Jump(resolveRoutine_);
+            }
+            emit_.Bind(resolveRoutine_);
+            Location location;
+            for (const auto& [name, use] : singletons_) {
+                Value found = CallStatic(types_.Get("UnityEngineGameObject"), "Find", { Value::OfString("/__UdonLuauSingletons/" + name) }, nullptr, location).at(0);
+                Label missing = emit_.NewLabel();
+                Label next = emit_.NewLabel();
+                emit_.JumpIfFalse(TruthySlot(found, location), missing);
+                Value behaviour = CallMember(found, "GetComponent", {}, types_.Behaviour(), location).at(0);
+                emit_.Copy(behaviour.slot, use.slot);
+                emit_.Jump(next);
+                emit_.Bind(missing);
+                CallStatic(types_.Get("UnityEngineDebug"), "LogError", { Value::OfString(std::format("[UdonLuau] the {} singleton was not found", name)) }, nullptr, location);
+                emit_.Bind(next);
+            }
+            emit_.Copy(TruthySlot(Value::OfBoolean(true), location), singletonsReadySlot_);
+            emit_.JumpIndirect(resolveReturnSlot_);
         }
 
         void Compiler::CompileAssert(AstExprCall* call) {

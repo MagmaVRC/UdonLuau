@@ -891,6 +891,61 @@ end
         Check(!Build(g, "local xs: List<int> = {}\nlocal ys: List<int> = {}\nfunction Start()\n    ys = xs\nend\n").has_value(), "lists cannot be copied");
     });
 
+    Case("singletons", [] {
+        Fixture f = MakeFixture();
+        f.Extern("UnityEngineGameObject.__Find__SystemString__UnityEngineGameObject", false, [&log = f.log](auto& h, auto& p) {
+            log.push_back("find:" + As<std::string>(h, p[0]));
+            h[p[1]] = BehaviourRef{ 0 };
+        });
+        f.Extern("UnityEngineGameObject.__GetComponent__T", true, [](auto& h, auto& p) { h[p[2]] = h[p[0]]; });
+        f.impls["UnityEngineObject.__op_Inequality__UnityEngineObject_UnityEngineObject__SystemBoolean"] = [](auto& h, auto& p) {
+            h[p[2]] = std::holds_alternative<BehaviourRef>(h[p[0]]) && std::get<BehaviourRef>(h[p[0]]).id >= 0;
+        };
+        const char* stateSource = R"(-- @singleton
+export local score: int = 0
+export function AddScore(n: int)
+    score += n
+end
+)";
+        CompileResult face = ExtractInterface(f.catalog, stateSource);
+        Check(face.scriptInterface && face.scriptInterface->singleton, "the interface is marked singleton");
+        if (!face.scriptInterface) return;
+        ScriptInfo state = *face.scriptInterface;
+        state.name = "GameState";
+        f.catalog.AddScript(state);
+
+        auto stateProgram = Build(f, stateSource);
+        auto user = Build(f, R"(
+local seen = 0
+function Start()
+    GameState:AddScore(5)
+end
+function Update()
+    seen = GameState.score
+end
+)");
+        auto bystander = Build(f, "local n = 0\nfunction Update()\n    n += 1\nend\n");
+        Check(stateProgram && user && bystander, "compiles");
+        if (!stateProgram || !user || !bystander) return;
+        Check(stateProgram->updateOrder < -1000000, "singletons start before other scripts");
+        Check(std::ranges::none_of(bystander->heap, [](const HeapSlot& s) { return s.symbol.starts_with("__singleton"); }), "scripts that never use a singleton pay nothing");
+
+        Machine stateMachine(f, *stateProgram);
+        Machine userMachine(f, *user);
+        g_machines = { &stateMachine, &userMachine };
+        userMachine.Run("_start");
+        Check(f.log.size() == 2 && f.log[0] == "find:/__UdonLuauSingletons/GameState" && f.log[1] == "frames:_start:1",
+            "resolved by its fixed root path once, and Start waits for the singleton to start");
+        Check(std::get<int32_t>(stateMachine.Var("score")) == 0, "nothing was called before the singleton started");
+        stateMachine.Run("_start");
+        Check(std::get<bool>(stateMachine.Var("__started")), "a singleton without Start still marks itself started");
+        f.log.clear();
+        userMachine.Run("_start");
+        Check(std::get<int32_t>(stateMachine.Var("score")) == 5 && f.log.empty(), "the retried Start reaches the singleton without resolving again");
+        userMachine.Run("_update");
+        Check(std::get<int32_t>(userMachine.Var("seen")) == 5, "fields read through the singleton");
+    });
+
     Case("negated conditions branch without an extern", [] {
         Fixture f = MakeFixture();
         auto p = Build(f, R"(

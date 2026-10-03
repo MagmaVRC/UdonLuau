@@ -86,6 +86,7 @@ namespace UdonLuau {
         std::string                 name;
         std::vector<ScriptMethod>   methods;
         std::vector<ScriptVariable> fields;
+        bool                        singleton = false;
     };
 
     /// <summary>Everything the host exposes to Udon: types, extern signatures and events.

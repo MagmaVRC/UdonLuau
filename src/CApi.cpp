@@ -156,6 +156,13 @@ void ul_catalog_add_script(ul_catalog* catalog, const char* name) {
     });
 }
 
+int32_t ul_catalog_set_script_singleton(ul_catalog* catalog, const char* script, int32_t singleton) {
+    return EditScript(catalog, script, [&](UdonLuau::ScriptInfo& s) {
+        s.singleton = singleton != 0;
+        return true;
+    });
+}
+
 int32_t ul_catalog_add_script_field(ul_catalog* catalog, const char* script, const char* name, const char* udon_type, const char* script_type, const char* symbol) {
     return EditScript(catalog, script, [&](UdonLuau::ScriptInfo& s) {
         s.fields.push_back(MakeVariable(name, udon_type, script_type, symbol));
@@ -379,6 +386,10 @@ int32_t ul_result_interface_method(const ul_result* result, int32_t index, ul_sc
     const UdonLuau::ScriptMethod& m = result->result.scriptInterface->methods[static_cast<size_t>(index)];
     *out = { m.name.c_str(), m.entryPoint.c_str(), static_cast<int32_t>(m.parameters.size()), static_cast<int32_t>(m.returns.size()) };
     return 1;
+}
+
+int32_t ul_result_interface_singleton(const ul_result* result) {
+    return ul_result_has_interface(result) && result->result.scriptInterface->singleton ? 1 : 0;
 }
 
 int32_t ul_result_interface_method_network_callable(const ul_result* result, int32_t index) {
