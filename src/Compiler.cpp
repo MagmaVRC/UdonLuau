@@ -651,6 +651,7 @@ namespace UdonLuau {
             void CompileDelaySite(const DelaySite& site);
             void EmitReturn();
             void DeclareConstTable(AstLocal* var, AstExprTable* table);
+            void SortWith(const Value& array, const Value& length, const Value& comparer, const Location& location);
             Value FindBehaviour(const Value& receiver, std::string_view getter, const Type* wanted, const Location& location);
             void RecordChangeHandler(const Annotations& annotations, const std::string& field, const Variable& variable, const Location& location);
             void CompileChangeHandler(const ChangeHandler& handler);
@@ -3832,8 +3833,13 @@ namespace UdonLuau {
                 return CallStatic(types_.String, "Join", { args.size() == 2 ? args[1] : Value::OfString(""), array }, nullptr, location);
             }
             if (name == "sort") {
-                if (args.size() != 1) Fail(location, "table.sort takes an array; comparison functions are not supported");
-                CallStatic(types_.Get("SystemArray"), "Sort", { ArrayArgument(args, 0, name, location) }, nullptr, location);
+                if (args.empty() || args.size() > 2) Fail(location, "table.sort takes an array and an optional comparison function");
+                Value array = ArrayArgument(args, 0, name, location);
+                if (args.size() == 2) {
+                    SortWith(array, CallMember(array, "get_Length", {}, nullptr, location).at(0), args[1], location);
+                    return { Value::OfNil() };
+                }
+                CallStatic(types_.Get("SystemArray"), "Sort", { array }, nullptr, location);
                 return { Value::OfNil() };
             }
             Fail(location, std::format("table.{} is not supported", name));
@@ -4021,6 +4027,47 @@ namespace UdonLuau {
             Fail(location, std::format("List has no method '{}'; available: Add, Insert, Remove, RemoveAt, IndexOf, Contains, Clear, ToArray, Sort, Reverse, Get, Set", name));
         }
 
+        void Compiler::SortWith(const Value& array, const Value& length, const Value& comparer, const Location& location) {
+            if (comparer.kind != Value::Kind::Function) Fail(location, "the comparison function must be a named local function, e.g. table.sort(xs, byScore)");
+            Function* less = comparer.function;
+            const Type* element = array.type->element;
+            if (less->parameters.size() != 2 || less->returns.size() != 1 || less->returns[0] != types_.Boolean)
+                Fail(location, std::format("'{}' must take two {} values and return a boolean", less->name, element->displayName));
+
+            Variable count{ emit_.Hidden(types_.Int32), types_.Int32 };
+            Store(length, count, location);
+            Variable i{ emit_.Hidden(types_.Int32), types_.Int32 };
+            Variable j{ emit_.Hidden(types_.Int32), types_.Int32 };
+            Variable key{ emit_.Hidden(element), element };
+            Variable other{ emit_.Hidden(element), element };
+            Value iv = Value::OfSlot(i.slot, types_.Int32);
+            Value jv = Value::OfSlot(j.slot, types_.Int32);
+            auto get = [&](const Value& index) { return Narrow(CallMember(array, "Get", { index }, nullptr, location).at(0), element); };
+
+            Store(Value::OfInteger(1), i, location);
+            Label outer = emit_.NewLabel();
+            Label inner = emit_.NewLabel();
+            Label place = emit_.NewLabel();
+            Label finished = emit_.NewLabel();
+            emit_.Bind(outer);
+            emit_.JumpIfFalse(TruthySlot(CompareValues(AstExprBinary::CompareLt, iv, Value::OfSlot(count.slot, types_.Int32), location), location), finished);
+            Store(get(iv), key, location);
+            Store(CompileArithmetic(AstExprBinary::Sub, iv, Value::OfInteger(1), location), j, location);
+            emit_.Bind(inner);
+            emit_.JumpIfFalse(TruthySlot(CompareValues(AstExprBinary::CompareGe, jv, Value::OfInteger(0), location), location), place);
+            Store(get(jv), other, location);
+            Value before = CallFunction(less, { Value::OfSlot(key.slot, element), Value::OfSlot(other.slot, element) }, 1, location, nullptr).at(0);
+            emit_.JumpIfFalse(TruthySlot(before, location), place);
+            CallMember(array, "Set", { CompileArithmetic(AstExprBinary::Add, jv, Value::OfInteger(1), location), Value::OfSlot(other.slot, element) }, nullptr, location);
+            Store(CompileArithmetic(AstExprBinary::Sub, jv, Value::OfInteger(1), location), j, location);
+            emit_.Jump(inner);
+            emit_.Bind(place);
+            CallMember(array, "Set", { CompileArithmetic(AstExprBinary::Add, jv, Value::OfInteger(1), location), Value::OfSlot(key.slot, element) }, nullptr, location);
+            Store(CompileArithmetic(AstExprBinary::Add, iv, Value::OfInteger(1), location), i, location);
+            emit_.Jump(outer);
+            emit_.Bind(finished);
+        }
+
         std::vector<Value> Compiler::TableOnList(std::string_view name, std::vector<Value> args, const Location& location) {
             Value list = args[0];
             std::vector<Value> rest(args.begin() + 1, args.end());
@@ -4048,7 +4095,13 @@ namespace UdonLuau {
                 return { ListIndexOf(list, rest[0], location) };
             }
             if (name == "clear") return CallList(list, "Clear", std::move(rest), location);
-            if (name == "sort") return CallList(list, "Sort", std::move(rest), location);
+            if (name == "sort") {
+                if (rest.size() == 1) {
+                    SortWith(ListArray(list), Value::OfSlot(ListCount(list).slot, types_.Int32), rest[0], location);
+                    return { Value::OfNil() };
+                }
+                return CallList(list, "Sort", std::move(rest), location);
+            }
             if (name == "concat") {
                 if (list.type->element != types_.String) Fail(location, "table.concat needs a list of strings");
                 Value separator = rest.empty() ? Value::OfString("") : rest[0];
@@ -4136,7 +4189,7 @@ namespace UdonLuau {
             for (size_t i = 0; i < args.size(); ++i)
                 if (Cost(args[i], f->parameters[i].type) < 0)
                     Fail(location, std::format("argument {} of '{}' must be {}, got {}", i + 1, f->name, f->parameters[i].type->displayName, Describe(args[i])));
-            if (f->inlined) return Inline(f, std::move(args), want, location, into);
+            if (f->inlined || (f->calls == 0 && !f->exported)) return Inline(f, std::move(args), want, location, into);
             std::vector<uint32_t> slots;
             for (size_t i = 0; i < args.size(); ++i) {
                 if (Cost(args[i], f->parameters[i].type) < 0)

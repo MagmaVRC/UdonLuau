@@ -1110,6 +1110,32 @@ end
         Check(std::get<int32_t>(m.Var("folded")) == 81 && std::get<int32_t>(m.Var("codepoints")) == 5, "constant bit32, string.byte and utf8.len fold");
     });
 
+    Case("table.sort with a comparison function", [] {
+        Fixture f = MakeFixture();
+        auto p = Build(f, R"(
+local xs: {int}
+local scores: List<int> = {}
+local result = 0
+local function descending(a: int, b: int): boolean
+    return a > b
+end
+function Start()
+    xs = {3, 9, 1, 7}
+    table.sort(xs, descending)
+    scores:Add(2)
+    scores:Add(8)
+    scores:Add(5)
+    table.sort(scores, descending)
+    result = xs[0] * 1000 + xs[3] * 100 + scores[0] * 10 + scores[2]
+end
+)");
+        Check(p.has_value(), "compiles");
+        if (!p) return;
+        Machine m(f, *p);
+        m.Run("_start");
+        Check(std::get<int32_t>(m.Var("result")) == 9182, std::format("sorted descending ({})", std::get<int32_t>(m.Var("result"))));
+    });
+
     Case("change callbacks and GetComponent by script type", [] {
         Fixture f = MakeFixture();
         f.Extern("UnityEngineComponent.__GetComponents__SystemType__UnityEngineComponentArray", true);
