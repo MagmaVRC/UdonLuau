@@ -77,6 +77,14 @@ namespace Magma.VRC.UdonLuau
         /// <summary>The name of the companion singleton holding a script's static fields and functions.</summary>
         public static string StaticName(string scriptName) => scriptName + ".Static";
 
+        /// <summary>The public interface last read from a program's script, even when its function bodies do not compile, or null.</summary>
+        public static ScriptInterface InterfaceFor(LuauProgramAsset asset)
+        {
+            if (asset == null || asset.SourceScript == null) return null;
+            if (!LuauCache.TryGetValue(AssetDatabase.GetAssetPath(asset.SourceScript), out CachedInterface cached)) return null;
+            return asset.StaticPart ? cached.Statics : cached.Interface;
+        }
+
         /// <summary>Returns why the program's script name cannot be used, or null.</summary>
         public static string Conflict(LuauProgramAsset asset) => ConflictMessages.TryGetValue(asset, out string message) ? message : null;
 

@@ -154,7 +154,11 @@ namespace Magma.VRC.UdonLuau
             diagnostics.AddRange(result.Diagnostics);
             LogDiagnostics();
             if (!staticPart && (result.HasStatics || program != null)) LuauEditorHooks.SyncStatics(this, result.HasStatics);
-            if (program == null) return;
+            if (program == null)
+            {
+                if (!staticPart && !ScriptRegistry.CompilingAll) ProxyGenerator.Generate(new[] { this });
+                return;
+            }
 
             Apply(result);
             if (!ScriptRegistry.CompilingAll && !staticPart) ProxyGenerator.Generate(new[] { this });

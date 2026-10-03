@@ -76,7 +76,8 @@ namespace Magma.VRC.UdonLuau
         /// <returns>Whether a file was written, which triggers a script compilation.</returns>
         public static bool Generate(IEnumerable<LuauProgramAsset> assets)
         {
-            var compiled = assets.Where(a => a != null && !a.StaticPart && a.SourceScript != null && a.LastInterface != null && a.Program != null).ToList();
+            ScriptInterface InterfaceOf(LuauProgramAsset a) => a.Program != null ? a.LastInterface : ScriptRegistry.InterfaceFor(a);
+            var compiled = assets.Where(a => a != null && !a.StaticPart && a.SourceScript != null && InterfaceOf(a) != null).ToList();
             if (compiled.Count == 0) return false;
 
             _luauScripts = new HashSet<string>(compiled.Select(a => a.ScriptName));
@@ -89,7 +90,7 @@ namespace Magma.VRC.UdonLuau
             AssetDatabase.StartAssetEditing();
             try
             {
-                foreach (LuauProgramAsset asset in compiled) written |= Generate(asset, asset.LastInterface, asset.Program, asset.NetworkRates);
+                foreach (LuauProgramAsset asset in compiled) written |= Generate(asset, InterfaceOf(asset), asset.Program, asset.NetworkRates);
             }
             finally
             {
@@ -261,7 +262,8 @@ namespace Magma.VRC.UdonLuau
             foreach (ScriptVariable field in script.Fields)
             {
                 string type = StubTypeName(field);
-                if (type == null || reserved.Contains(field.Name) || !used.Add(field.Name) || !program.SymbolTable.HasAddressForSymbol(field.Symbol) || field.Symbol != field.Name) continue;
+                if (type == null || reserved.Contains(field.Name) || !used.Add(field.Name) || field.Symbol != field.Name) continue;
+                if (program != null && !program.SymbolTable.HasAddressForSymbol(field.Symbol)) continue;
                 text.Append($"        public {type} {Identifier(field.Name)};\n");
             }
             if (used.Count > 0) text.Append('\n');
@@ -276,7 +278,7 @@ namespace Magma.VRC.UdonLuau
                 candidates.Add(new StubMethod { Method = method, Name = name });
             }
 
-            var entries = new HashSet<string>(program.EntryPoints.GetExportedSymbols());
+            var entries = new HashSet<string>(program != null ? program.EntryPoints.GetExportedSymbols() : script.Methods.Select(m => m.EntryPoint));
             while (true)
             {
                 Layout(candidates);
