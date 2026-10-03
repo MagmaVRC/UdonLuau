@@ -1059,6 +1059,57 @@ end
             "static code cannot use instance fields");
     });
 
+    Case("event returns, entry names and own network calls", [] {
+        Fixture f = MakeFixture();
+        f.Extern("SystemString.__Split__SystemCharArray__SystemStringArray", true, [](auto&, auto&) {});
+        const char* source = R"(-- @syncmode(manual)
+local allowed = true
+local hits = 0
+
+function OnOwnershipRequest(requester: VRCPlayerApi, newOwner: VRCPlayerApi): boolean
+    return allowed
+end
+
+-- @entry("OnDataUpdated")
+export function Refresh()
+    hits += 1
+end
+
+-- @networkcallable
+export function Ping(n: int)
+    hits += n
+end
+
+function Start()
+    Network.All(this):Ping(3)
+    this:SendCustomEventDelayedSeconds("OnDataUpdated", 1)
+    local parts = ("a,b"):Split(",")
+end
+
+export function Wrong()
+    this:SendCustomEvent("Refresh")
+end
+)";
+        CompileResult r = Compile(f.catalog, source);
+        for (const Diagnostic& d : r.diagnostics) std::printf("    %d:%d %s\n", d.line + 1, d.column + 1, d.message.c_str());
+        Check(r.program.has_value(), "compiles");
+        if (!r.program) return;
+        Check(std::ranges::any_of(r.program->entryPoints, [](const EntryPoint& e) { return e.name == "OnDataUpdated"; }), "@entry sets the exact entry point");
+        Check(std::ranges::any_of(r.diagnostics, [](const Diagnostic& d) { return d.severity == Severity::Warning && d.message.find("entry point 'OnDataUpdated'") != std::string::npos; }),
+            "sending a function's name instead of its entry point warns");
+        Check(std::ranges::any_of(r.program->heap, [](const HeapSlot& s) { return s.type == "SystemCharArray"; }), "a string literal passes as char[]");
+
+        Machine m(f, *r.program);
+        g_machines = { &m };
+        m.Run("_onOwnershipRequest");
+        Check(std::get<bool>(m.Var("__returnValue")), "events return through __returnValue");
+        m.Var("__this_VRCUdonUdonBehaviour_0") = BehaviourRef{ 0 };
+        m.Run("_start");
+        Check(std::ranges::any_of(f.log, [](const std::string& l) { return l == "net:0:Ping"; }), "Network.All(this) reaches an own network callable");
+        Check(std::ranges::any_of(f.log, [](const std::string& l) { return l == "delay:OnDataUpdated:1"; }), "a delayed event without EventTiming defaults to Update");
+        Check(HasError(f, "-- @entry(\"_X\")\n-- @networkcallable\nexport function A()\nend\n", "cannot start with '_'"), "network entries cannot start with '_'");
+    });
+
     Case("negated conditions branch without an extern", [] {
         Fixture f = MakeFixture();
         auto p = Build(f, R"(

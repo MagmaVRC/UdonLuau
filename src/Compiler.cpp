@@ -493,6 +493,22 @@ namespace UdonLuau {
             return std::nullopt;
         }
 
+        std::vector<std::string> SplitChars(std::string_view text) {
+            std::vector<std::string> chars;
+            for (size_t i = 0; i < text.size();) {
+                auto lead = static_cast<unsigned char>(text[i]);
+                size_t length = lead < 0x80 ? 1 : lead < 0xE0 ? 2 : lead < 0xF0 ? 3 : 4;
+                chars.emplace_back(text.substr(i, length));
+                i += length;
+            }
+            return chars;
+        }
+
+        bool IsSingleChar(std::string_view text) {
+            std::vector<std::string> chars = SplitChars(text);
+            return chars.size() == 1 && chars[0].size() < 4;
+        }
+
         bool IsComparison(AstExprBinary::Op op) {
             return op == AstExprBinary::CompareEq || op == AstExprBinary::CompareNe || op == AstExprBinary::CompareLt ||
                    op == AstExprBinary::CompareLe || op == AstExprBinary::CompareGt || op == AstExprBinary::CompareGe;
@@ -699,6 +715,8 @@ namespace UdonLuau {
             };
             bool                                           singleton_ = false;
             bool                                           hasStatics_ = false;
+            uint32_t                                       eventReturnSlot_ = 0;
+            std::set<std::string, std::less<>>             entryNames_;
             std::unordered_map<AstLocal*, std::string>     staticFields_;
             std::unordered_map<AstLocal*, std::string>     staticFunctions_;
             std::unordered_set<AstLocal*>                  instanceLocals_;
@@ -1341,10 +1359,23 @@ namespace UdonLuau {
                     f->maxEventsPerSecond = static_cast<int>(rate);
                 }
             }
+            std::optional<std::string> entryOverride;
+            for (const FieldAttribute& a : AnnotationsFor(location).attributes) {
+                if (a.name != "entry") continue;
+                if (!f->exported || f->event) Fail(location, "only 'export function' methods can set their entry name with @entry");
+                if (a.arguments.size() != 1 || a.arguments[0].empty()) Fail(location, "@entry takes the entry point name, e.g. @entry(\"OnDataUpdated\")");
+                const std::string& entry = a.arguments[0];
+                if (!std::ranges::all_of(entry, [](char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; }))
+                    Fail(location, std::format("'{}' is not a valid entry point name", entry));
+                if (f->networkCallable && entry.starts_with('_')) Fail(location, "network callable entry points cannot start with '_'");
+                entryOverride = entry;
+            }
             if (f->exported) {
                 if (f->event) f->entryName = "_" + LowerFirst(name);
+                else if (entryOverride) f->entryName = *entryOverride;
                 else if (f->networkCallable) f->entryName = name;
                 else f->entryName = node->args.size ? ExportId("_" + name) : "_" + name;
+                if (!entryNames_.insert(f->entryName).second) Fail(location, std::format("entry point '{}' is already used by another function", f->entryName));
                 for (const EventInfo* e : catalog_.Events())
                     if (!f->event && "_" + LowerFirst(e->name) == f->entryName)
                         Fail(location, std::format("'{}' would share its entry point with the {} event; rename it", name, e->name));
@@ -1388,6 +1419,13 @@ namespace UdonLuau {
                 for (AstType* t : pack->typeList.types) {
                     const Type* type = ResolveType(t);
                     if (type->IsList()) Fail(t->location, "functions cannot return a List; return list:ToArray() instead");
+                    if (f->event) {
+                        if (!f->returns.empty()) Fail(t->location, "events return at most one value");
+                        if (eventReturnSlot_ == 0) eventReturnSlot_ = emit_.AddSlot("__returnValue", types_.Object, {}, false);
+                        f->returns.push_back(type);
+                        f->returnSlots.push_back(eventReturnSlot_);
+                        continue;
+                    }
                     std::string symbol = f->exported ? ExportId(f->entryName + (f->returns.empty() ? std::string("__ret") : std::format("__ret{}", f->returns.size()))) : std::string();
                     f->returns.push_back(type);
                     f->returnSlots.push_back(f->exported ? emit_.AddSlot(symbol, type) : emit_.Hidden(type));
@@ -1395,7 +1433,6 @@ namespace UdonLuau {
             } else if (node->returnAnnotation) {
                 Fail(node->returnAnnotation->location, "unsupported return annotation");
             }
-            if (f->event && !f->returns.empty()) Fail(location, "events cannot return values");
 
             Function* raw = f.get();
             functions_.push_back(std::move(f));
@@ -2108,7 +2145,6 @@ namespace UdonLuau {
             if (!inlineStack_.empty()) frame = inlineStack_.back();
             Function& f = frame ? *frame->function : *current_;
             if (stat->list.size && f.returns.empty()) {
-                if (f.event) Fail(stat->location, "events cannot return values");
                 Fail(stat->location, std::format("'{}' has no return type annotation", f.name));
             }
             if (stat->list.size && stat->list.size != f.returns.size() && !(stat->list.size == 1 && Unwrap(stat->list.data[0])->is<AstExprCall>()))
@@ -2759,7 +2795,23 @@ namespace UdonLuau {
 
         std::vector<Value> Compiler::SendNetwork(const Value& receiver, std::string_view name, std::vector<Value> args, const Location& location) {
             std::vector<Value> sent{ Value::OfInteger(receiver.integer, receiver.targetType), Value::OfString(std::string(name)) };
-            if (const ScriptMethod* method = NetworkMethod(receiver, name, args.size(), location)) {
+            const Function* own = nullptr;
+            if (receiver.slot == SelfValue("this").slot)
+                for (const auto& f : functions_)
+                    if (f->name == name && !f->event) own = f.get();
+            if (own) {
+                if (!own->networkCallable) Fail(location, std::format("'{}' is not network callable; mark it with '-- @networkcallable'", name));
+                if (args.size() != own->parameters.size()) Fail(location, std::format("'{}' takes {} argument(s), got {}", name, own->parameters.size(), args.size()));
+                sent[1] = Value::OfString(own->entryName);
+                for (size_t i = 0; i < args.size(); ++i) {
+                    const Type* type = own->parameters[i].type;
+                    if (Cost(args[i], type) < 0) Fail(location, std::format("argument {} of '{}' must be {}, got {}", i + 1, name, type->displayName, Describe(args[i])));
+                    Value arg = args[i].IsLiteral() ? Value::OfSlot(Materialize(args[i], type, location), type) : args[i];
+                    if (arg.kind == Value::Kind::Slot && arg.type != type && arg.type->IsNumeric() && type->IsNumeric())
+                        arg = Value::OfSlot(Convert(arg.slot, arg.type, type, location), type);
+                    sent.push_back(arg);
+                }
+            } else if (const ScriptMethod* method = NetworkMethod(receiver, name, args.size(), location)) {
                 sent[1] = Value::OfString(method->entryPoint);
                 for (size_t i = 0; i < args.size(); ++i) {
                     const Type* type = VariableType(method->parameters[i]);
@@ -3813,6 +3865,18 @@ namespace UdonLuau {
 
         std::vector<Value> Compiler::CallMember(const Value& receiver, std::string_view name, std::vector<Value> args, const Type* typeArg, const Location& location) {
             if (receiver.kind != Value::Kind::Slot || !receiver.type) Fail(location, std::format("cannot call '{}' on {}", name, Describe(receiver)));
+            bool delayed = name == "SendCustomEventDelayedSeconds" || name == "SendCustomEventDelayedFrames";
+            if (delayed && args.size() == 2) args.push_back(Value::OfInteger(0, types_.Get("VRCUdonCommonEnumsEventTiming")));
+            size_t eventArg = name == "SendCustomNetworkEvent" ? 1 : 0;
+            if ((delayed || name == "SendCustomEvent" || name == "SendCustomNetworkEvent") && args.size() > eventArg && args[eventArg].kind == Value::Kind::String &&
+                receiver.slot == SelfValue("this").slot) {
+                const std::string& event = args[eventArg].text;
+                for (const auto& f : functions_) {
+                    if (f->name != event || f->event) continue;
+                    if (!f->exported) Report(location, std::format("'{}' is a local function and has no entry point; export it, or call it with Delay", event), Severity::Warning);
+                    else if (f->entryName != event) Report(location, std::format("'{}' runs as entry point '{}'; send that name, or call it with Delay or Network", event, f->entryName), Severity::Warning);
+                }
+            }
             auto methods = MembersWithRenames(receiver.type, name, false);
             if (methods.empty()) {
                 std::string_view shown = name;
@@ -4045,6 +4109,8 @@ namespace UdonLuau {
                     return toObject ? 40 : -1;
                 case Value::Kind::String: {
                     if (to == types_.String) return 0;
+                    if (to->numeric == Numeric::Char) return IsSingleChar(v.text) ? 30 : -1;
+                    if (to->kind == TypeKind::Array && to->element && to->element->numeric == Numeric::Char) return 30;
                     int d = types_.ReferenceDistance(types_.String, to);
                     if (d < 0 && toObject) d = 16;
                     return d < 0 ? -1 : 20 + d;
@@ -4111,6 +4177,17 @@ namespace UdonLuau {
                     h.boolean = v.boolean;
                     return h;
                 case Value::Kind::String:
+                    if (type && type->kind == TypeKind::Array && type->element && type->element->numeric == Numeric::Char) {
+                        h.kind = ValueKind::Array;
+                        h.text = type->element->udonName;
+                        for (const std::string& c : SplitChars(v.text)) {
+                            HeapValue element;
+                            element.kind = ValueKind::String;
+                            element.text = c;
+                            h.arguments.push_back(std::move(element));
+                        }
+                        return h;
+                    }
                     h.kind = ValueKind::String;
                     h.text = v.text;
                     return h;
@@ -4158,9 +4235,11 @@ namespace UdonLuau {
             if (!v.IsLiteral() && v.kind != Value::Kind::TypeRef) Fail(location, std::format("{} is not a value", Describe(v)));
 
             const Type* storage = target;
+            bool charText = v.kind == Value::Kind::String &&
+                            (target->numeric == Numeric::Char || (target->kind == TypeKind::Array && target->element && target->element->numeric == Numeric::Char));
             bool literalFits = (v.kind == Value::Kind::Integer || v.kind == Value::Kind::Real) ? (target->IsNumeric() || target->kind == TypeKind::Enum)
                              : v.kind == Value::Kind::TypeRef ? target == types_.SystemType
-                             : target == natural;
+                             : charText || target == natural;
             if (!literalFits) storage = natural;
             return emit_.Constant(storage, Literal(v, storage, location));
         }
