@@ -203,6 +203,49 @@ Luau's `math`, `string` and `table` libraries are compiled onto Udon externs. Wh
 | `string` | `format`, `len`, `upper`, `lower`, `rep`, `split` | `format` takes a literal format string. It is translated to `String.Format` when compiling and supports `%d %i %s %f %.Nf %g %e %x %X %%`, widths and `-`/`0` flags. For anything else, use the string's own methods (`s:Substring(0, 3)`). |
 | `table` | `insert`, `remove`, `find`, `create`, `clone`, `clear`, `concat`, `sort`, `move` | Udon arrays have a fixed size. `insert` and `remove` build a new array and store it back into the variable or field you passed, so other references keep the old array. `find` returns -1 when the value is missing. `create(n, value)` fills by doubling copies, so it costs about 5·log2(n) externs rather than n. `sort` takes no comparison function. |
 
+### Lists
+
+`List<T>` is a growable list compiled to an array and a count, with the capacity doubling as it fills:
+
+```lua
+local enemies: List<Transform> = {}
+local scores: List<int> = {10, 20}
+
+function Start()
+    local buffer: List<Vector3> = List.new(64)
+    scores:Add(30)
+    table.insert(scores, 0, 5)
+    for i, score in scores do
+        print(i, score)
+    end
+    print(#scores, scores:Contains(20))
+end
+```
+
+| Operation | Externs |
+|---|---|
+| `list[i]`, `list[i] = v` | 1 |
+| `#list`, `list.Count`, `list.Capacity` | 0 |
+| `Add` | 3, plus a copy when the capacity doubles |
+| `Insert`, `RemoveAt` | about 5, shifting the elements with one `Array.Copy` |
+| `Remove`, `IndexOf`, `Contains` | 1-2 for the search |
+| `Clear`, `ToArray`, `Sort`, `Reverse` | 1-2 |
+| One step of `for i, v in list` | 3 |
+
+`table.insert`, `table.remove`, `table.find`, `table.clear`, `table.sort` and `table.concat` also work on lists.
+
+- **Element types:** struct elements such as `Vector3` stay unboxed.
+- **Removing elements:** removed reference elements are cleared, so they can be garbage collected.
+- **Index checks:** when `DEBUG` is defined, every index is checked against the count.
+
+A list is two hidden variables, so a few restrictions apply:
+
+- A list cannot be copied or reassigned from another list. `list = {}` or `list = List.new(n)` resets it, and `list:ToArray()` gives a copy.
+- A list cannot be exported, synced or returned, and public methods cannot take one. Export or sync an array instead.
+- Local functions can take a list if they are inlined. Mark larger ones `-- @inline`.
+
+For lists shared between behaviours or turned into JSON, use VRChat's `DataList`.
+
 Each `insert` or `remove` costs a constant 5-8 externs whatever the array's length. Each one also allocates a new array, so prefer `table.create` with a known size in hot loops.
 
 ### Other behaviours
