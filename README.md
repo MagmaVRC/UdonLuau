@@ -310,6 +310,39 @@ Names, argument counts and types are checked when compiling. Typed references ar
 
 The host registers scripts with `Catalog::AddScript`. `ExtractInterface` reads a Luau module's public interface without compiling it, so scripts that reference each other can all be registered before any is compiled.
 
+### Singletons
+
+A script marked `-- @singleton` anywhere above its first declaration exists once per scene. Every other script uses it by name, without holding a reference:
+
+```lua
+-- GameState.lua
+-- @singleton
+
+export local score: int = 0
+
+export function AddScore(n: int)
+    score += n
+end
+```
+
+```lua
+function Interact()
+    GameState:AddScore(5)
+    print(GameState.score)
+end
+```
+
+Reads, writes and calls compile like a typed reference: `GetProgramVariable`, `SetProgramVariable`, `SendCustomEvent`. Constants declared in the singleton are folded into the callers.
+
+- **The singleton's object:** the editor keeps one object per singleton the scene uses, at `__UdonLuauSingletons/<Name>`. That root must stay at the top of the scene hierarchy and stay active. The editor reactivates it, and it warns about duplicate roots and about singleton scripts placed anywhere else.
+- **Finding it:**
+  - Each script that uses a singleton gets one hidden reference to it, filled in when the scene is built or played, so no lookup happens at run time. Scripts that never use one get nothing.
+  - Objects spawned at run time from prefabs can't hold scene references. They find the singleton once, on their first event, with `GameObject.Find("/__UdonLuauSingletons/<Name>")`. The leading `/` only matches the top-level root, so other objects named after the singleton are never picked up.
+  - Every event checks a single flag to know the reference is ready, which costs no extern.
+- **Start order:** Udon runs no script code before a behaviour is ready; there is no `Awake`. Every scene behaviour becomes ready at the same point, and singletons are given the lowest update order, so their `Start` runs first.
+  - A script that calls singleton methods from `Start` or `OnEnable` checks that the singleton has started. If it hasn't, which can happen for objects spawned at run time, the event is rescheduled for the next frame instead of the call being dropped.
+  - Fields can always be read and written, because their initial values are in place from scene load.
+
 ### Compile time
 
 - `const NAME = value` declares a constant that takes no heap slot. Module-level constants must be known at compile time. Constants include literals, defines, arithmetic on them, and struct constructors with literal arguments (`const UP = Vector3.new(0, 1, 0)`).
