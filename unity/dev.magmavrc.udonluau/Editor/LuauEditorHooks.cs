@@ -178,6 +178,7 @@ namespace Magma.VRC.UdonLuau
                 });
                 LuauProgramAsset.ApplySyncModesInOpenScenes();
             };
+            EditorApplication.QueuePlayerLoopUpdate();
         }
 
         private static bool _registryRefreshQueued;
@@ -191,6 +192,7 @@ namespace Magma.VRC.UdonLuau
                 _registryRefreshQueued = false;
                 if (!EditorApplication.isPlayingOrWillChangePlaymode) ScriptRegistry.Refresh();
             };
+            EditorApplication.QueuePlayerLoopUpdate();
         }
 
         private static bool IsUdonSharpProgram(string path)
