@@ -140,7 +140,7 @@ end
 
 ### Declarations
 
-- Module-level `local`s are behaviour variables; their initializers must be constants.
+- Module-level `local`s are behaviour variables; their initializers must be constants, including arrays of constants (`local ids: {int} = {}` or `{2, 3, 5}`).
 - `export local` exposes a variable in the inspector, using Luau's export syntax.
 - `-- @sync`, `-- @sync(linear)` and `-- @sync(smooth)` add sync metadata.
 - `-- @syncmode(mode)` at the top of the file sets the behaviour sync mode. It uses UdonSharp's five modes and enforces the same rules at compile time:
@@ -515,6 +515,15 @@ Every optimization targets what costs time in VRChat's own Udon VM. In order of 
 - Struct constructors with literal arguments become constants built when the program is created, so they cost no extern at run time. The same applies to constant statics such as `Vector3.up` or `Color.red`, and to pure functions with literal arguments such as `Quaternion.Euler(0, 90, 0)` or `Mathf.Sqrt(2)`.
 - Repeated reads of the same property, such as `transform.position` used three times in one expression, run the extern once. The value is reused until a write, a branch target, or a call that could change it.
 - `not x` in a condition flips the branch instead of calling a negation extern.
+- Checks already known to hold are removed. Within one event run, nothing outside the script can make a checked value invalid: a player cannot leave and `Destroy` waits for the end of the frame. So after `if not player then return end`, `Utilities.IsValid(x)`, `x ~= nil`, or a successful `x:Method()`, later checks of `x` cost nothing, including inside inlined helpers. That knowledge is dropped:
+  - when the variable is written;
+  - at loops that write it;
+  - where branches merge, unless every branch knows it;
+  - at every wait.
+
+  For fields, it is also dropped after calls that can run other script code (`SendCustomEvent`, `SetProgramVariable`, `SetActive`, UI value setters, non-inlined functions).
+- `not s or s == ""` (and `s == nil or #s == 0`, or the `and` form) compiles to one `String.IsNullOrEmpty` call.
+- `if cond then return end` (or `break`/`continue`) is a single conditional jump to the exit.
 - Operands are only copied before a call when that call could change them. Local functions that write no behaviour variables are recognised and skip the copy.
 - Loops test their condition at the bottom, which saves one jump per iteration. Loops with constant bounds skip the first test.
 - An `if`/`elseif` chain comparing one `int` against eight or more constants becomes a jump table: two bounds checks, an array read and an indirect jump.
