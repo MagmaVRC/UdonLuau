@@ -224,7 +224,16 @@ namespace {
             As<StrArray>(h, p[0])->at(static_cast<size_t>(As<int32_t>(h, p[1]))) = std::holds_alternative<std::string>(h[p[2]]) ? As<std::string>(h, p[2]) : std::string();
         });
         f.Extern("SystemStringArray.__get_Length__SystemInt32", true, [](auto& h, auto& p) { h[p[1]] = static_cast<int32_t>(As<StrArray>(h, p[0])->size()); });
-        f.Extern("SystemString.__op_Equality__SystemString_SystemString__SystemBoolean", false, [](auto& h, auto& p) { h[p[2]] = As<std::string>(h, p[0]) == As<std::string>(h, p[1]); });
+        auto sameString = [](const Cell& a, const Cell& b) {
+            const auto* x = std::get_if<std::string>(&a);
+            const auto* y = std::get_if<std::string>(&b);
+            return x && y ? *x == *y : !x && !y;
+        };
+        f.Extern("SystemString.__op_Equality__SystemString_SystemString__SystemBoolean", false, [sameString](auto& h, auto& p) { h[p[2]] = sameString(h[p[0]], h[p[1]]); });
+        f.Extern("SystemString.__op_Inequality__SystemString_SystemString__SystemBoolean", false, [sameString](auto& h, auto& p) { h[p[2]] = !sameString(h[p[0]], h[p[1]]); });
+        f.Extern("SystemString.__IsNullOrEmpty__SystemString__SystemBoolean", false, [](auto& h, auto& p) {
+            h[p[1]] = !std::holds_alternative<std::string>(h[p[0]]) || As<std::string>(h, p[0]).empty();
+        });
         f.Type("VRC.SDKBase.Utilities", TypeKind::Class);
         f.Extern("VRCSDKBaseUtilities.__IsValid__SystemObject__SystemBoolean", false, [](auto& h, auto& p) {
             h[p[1]] = std::holds_alternative<BehaviourRef>(h[p[0]]) && std::get<BehaviourRef>(h[p[0]]).id >= 0;
@@ -2004,6 +2013,82 @@ end
         Check(HasError(f, "export function Get(): int\n task.wait(1)\n return 1\nend", "cannot return values"), "public methods that wait cannot return values");
         Check(HasError(f, "local function go()\n task.wait(1)\nend\nfunction Start()\n task.cancel(print)\nend", "function of this script"), "task.cancel takes a script function");
         Check(HasError(f, "local t = EventTiming.Update\nfunction Start()\n task.wait(1, t)\nend", "must be a constant"), "the timing of a wait is constant");
+    });
+
+    Case("known checks", [] {
+        Fixture f = MakeFixture();
+        auto count = [](const Program& p, std::string_view what) {
+            std::string text = Disassemble(p);
+            size_t n = 0;
+            for (size_t at = text.find(what); at != std::string::npos; at = text.find(what, at + 1)) ++n;
+            return n;
+        };
+        auto checks = Build(f, R"(
+export local hits = 0
+export local name: string = ""
+local function guard(s: string)
+    if not s then
+        return
+    end
+    hits += 1
+end
+export function Run(s: string)
+    if not s then
+        return
+    end
+    guard(s)
+    if s then hits += 1 end
+    if s ~= nil and s then hits += 1 end
+    print(s:ToString())
+end
+export function Field()
+    if not name then
+        return
+    end
+    if name then hits += 1 end
+    this:SendCustomEvent("_Run")
+    if name then hits += 1 end
+end
+export function Looping(s: string)
+    if not s then
+        return
+    end
+    while hits < 3 do
+        if s then hits += 1 end
+        s = nil
+    end
+end
+export function Empty(s: string)
+    if not s or s == "" then
+        return
+    end
+    hits += 10
+end
+)");
+        Check(checks.has_value(), "fact tracking compiles");
+        if (!checks) return;
+        std::string listing = Disassemble(*checks);
+        bool fused = count(*checks, "EXTERN") && listing.find("IsNullOrEmpty") != std::string::npos && listing.find("__op_Equality__SystemString") == std::string::npos;
+        Check(fused, "'not s or s == \"\"' becomes one IsNullOrEmpty call");
+        if (!fused) std::printf("%s\n", listing.c_str());
+        Machine m(f, *checks);
+        m.Var("__0_s__param") = std::string("x");
+        m.Run("__0__Run");
+        Check(std::get<int32_t>(m.Var("hits")) == 3, "known checks keep their result");
+        m.Var("__0_s__param") = std::monostate{};
+        m.Run("__0__Run");
+        Check(std::get<int32_t>(m.Var("hits")) == 3, "the first check still runs");
+        m.Var("__2_s__param") = std::string("");
+        m.Run("__0__Empty");
+        m.Var("__2_s__param") = std::monostate{};
+        m.Run("__0__Empty");
+        Check(std::get<int32_t>(m.Var("hits")) == 3, "IsNullOrEmpty rejects empty and nil strings");
+        m.Var("__2_s__param") = std::string("ok");
+        m.Run("__0__Empty");
+        Check(std::get<int32_t>(m.Var("hits")) == 13, "IsNullOrEmpty accepts other strings");
+        size_t inequality = count(*checks, "; SystemString.__op_Inequality");
+        Check(inequality == 5, std::format("only checks that can change run: one per function, one after an event, one in the loop ({})", inequality));
+        if (inequality != 5) std::printf("%s\n", listing.c_str());
     });
 
     Case("UdonSharp-compatible export layout", [] {

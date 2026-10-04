@@ -68,6 +68,17 @@ namespace UdonLuau::Detail {
         freeTemps_.clear();
         liveTemps_.clear();
         reads_.clear();
+        facts_.clear();
+    }
+
+    int Emitter::Fact(uint32_t slot) const {
+        auto it = facts_.find(slot);
+        return it == facts_.end() ? 0 : it->second;
+    }
+
+    void Emitter::Learn(uint32_t slot, int level) {
+        int& known = facts_[slot];
+        known = std::max(known, level);
     }
 
     std::optional<uint32_t> Emitter::CachedRead(uint32_t externSlot, uint32_t receiver) const {
@@ -81,6 +92,7 @@ namespace UdonLuau::Detail {
 
     void Emitter::Forget(uint32_t slot) {
         std::erase_if(reads_, [slot](const auto& entry) { return entry.first.second == slot || entry.second == slot; });
+        facts_.erase(slot);
     }
 
     void Emitter::Promote(uint32_t slot) {
@@ -222,6 +234,7 @@ namespace UdonLuau::Detail {
         Emit(OpCode::Extern, externSlot);
         if (!pure || !resultPushed) reads_.clear();
         else Forget(code_[operand]);
+        if (resultPushed) facts_.erase(code_[operand]);
         if (resultPushed) lastResultOperand_ = operand;
     }
 

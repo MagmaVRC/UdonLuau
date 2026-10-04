@@ -40,6 +40,7 @@ namespace UdonLuau::Detail {
 
         [[nodiscard]] Label NewLabel();
         void Bind(Label label);
+        void BindAddress(Label label, uint32_t address) { labels_[label.id] = address; }
 
         void Push(uint32_t slot);
         void Pop();
@@ -55,6 +56,13 @@ namespace UdonLuau::Detail {
         void RememberRead(uint32_t externSlot, uint32_t receiver, uint32_t result);
 
         bool RetargetLastResult(uint32_t from, uint32_t to);
+
+        using Facts = std::unordered_map<uint32_t, int>;
+        [[nodiscard]] int Fact(uint32_t slot) const;
+        void Learn(uint32_t slot, int level);
+        void Unlearn(uint32_t slot) { facts_.erase(slot); }
+        [[nodiscard]] const Facts& KnownFacts() const { return facts_; }
+        void SetFacts(Facts facts) { facts_ = std::move(facts); }
 
         [[nodiscard]] const HeapSlot& Slot(uint32_t address) const { return heap_[address]; }
         [[nodiscard]] HeapSlot& Slot(uint32_t address) { return heap_[address]; }
@@ -86,6 +94,7 @@ namespace UdonLuau::Detail {
         std::optional<size_t>                       lastResultOperand_;
         std::map<std::pair<uint32_t, uint32_t>, uint32_t> reads_;
         std::vector<LineEntry>                      lines_;
+        Facts                                       facts_;
     };
 
 } // namespace UdonLuau::Detail

@@ -97,11 +97,30 @@ namespace UdonLuau {
         constexpr size_t kJumpTableMinimum = 8;
 
         struct InlineFrame {
-            Function*               function = nullptr;
-            std::vector<Variable>   results;
-            Label                   end;
-            AstStat*                tail = nullptr;
+            Function*                     function = nullptr;
+            std::vector<Variable>         results;
+            Label                         end;
+            AstStat*                      tail = nullptr;
+            std::vector<Emitter::Facts>   exits;
         };
+
+        constexpr int kKnownNonNull = 1;
+        constexpr int kKnownValid = 2;
+
+        Emitter::Facts Intersect(const Emitter::Facts& a, const Emitter::Facts& b) {
+            Emitter::Facts out;
+            for (const auto& [slot, level] : a)
+                if (auto it = b.find(slot); it != b.end()) out[slot] = std::min(level, it->second);
+            return out;
+        }
+
+        bool Exits(AstStat* stat) {
+            if (!stat) return false;
+            if (stat->is<AstStatReturn>() || stat->is<AstStatBreak>() || stat->is<AstStatContinue>()) return true;
+            if (auto* block = stat->as<AstStatBlock>()) return block->body.size && Exits(block->body.data[block->body.size - 1]);
+            if (auto* branch = stat->as<AstStatIf>()) return branch->elsebody && Exits(branch->thenbody) && Exits(branch->elsebody);
+            return false;
+        }
 
         class Analysis : public AstVisitor {
         public:
@@ -747,6 +766,26 @@ namespace UdonLuau {
             void EmitRootReject(Function& f, Label reject);
             void EmitCancelRoutine(const CoroutineRun& run, const Location& location);
             void EmitAliveCheck();
+            [[nodiscard]] int TruthLevel(const Type* type);
+            [[nodiscard]] std::optional<Variable> FactVariable(AstExpr* expr) const;
+            [[nodiscard]] bool IsValidCall(AstExpr* expr, AstExpr*& subject) const;
+            [[nodiscard]] std::optional<bool> KnownCondition(AstExpr* expr) const;
+            void Imply(AstExpr* expr, bool truth);
+            void DropFieldFacts();
+            void ForgetAll();
+            bool ContainsWait(AstNode* node);
+            std::optional<Label> ExitLabel(AstStat* stat);
+            Emitter::Facts LoopFacts(AstNode* body);
+            void EndLoopFacts(const Emitter::Facts& entry, int resumesBefore);
+            struct LoopFactScope {
+                Compiler&      compiler;
+                int            resumes;
+                Emitter::Facts entry;
+                LoopFactScope(Compiler& c, AstNode* loop) : compiler(c), resumes(c.resumes_), entry(c.LoopFacts(loop)) {}
+                ~LoopFactScope() { compiler.EndLoopFacts(entry, resumes); }
+            };
+            [[nodiscard]] static bool MayRunScripts(const ExternInfo& ext);
+            AstExpr* NullOrEmptySubject(AstExprBinary* b, bool& emptyWhenTrue) const;
             bool DeclareSignal(AstLocal* var, AstExpr* init, bool exported);
             SignalInfo* SignalOf(AstExpr* expr);
             const EventInfo* EventOf(AstExpr* expr) const;
@@ -886,6 +925,7 @@ namespace UdonLuau {
             CoroutineRun*                                  run_ = nullptr;
             int                                            waitSites_ = 0;
             int                                            fireDepth_ = 0;
+            int                                            resumes_ = 0;
             std::deque<ListenSite>                         listenSites_;
             std::unordered_map<AstLocal*, SignalInfo>      signals_;
             std::vector<AstLocal*>                         signalOrder_;
@@ -2003,6 +2043,7 @@ namespace UdonLuau {
             emit_.Bind(resume);
             entries_.push_back({ entry, *emit_.AddressOf(resume) });
             emit_.Push(haltSlot_);
+            ForgetAll();
             if (cancellable) {
                 Label stale = emit_.NewLabel();
                 Label fresh = emit_.NewLabel();
@@ -2044,6 +2085,7 @@ namespace UdonLuau {
             emit_.Push(emit_.AddressConstant(back));
             emit_.Jump(f->entry);
             emit_.Bind(back);
+            DropFieldFacts();
             EmitAliveCheck();
         }
 
@@ -2142,6 +2184,7 @@ namespace UdonLuau {
                     emit_.Jump(fire.block);
                     emit_.Bind(fire.back);
                     fireSites_.push_back(std::move(fire));
+                    DropFieldFacts();
                     EmitAliveCheck();
                     return std::vector<Value>{};
                 }
@@ -2212,6 +2255,7 @@ namespace UdonLuau {
             if (root->reentry == Reentry::Restart) emit_.Copy(TruthySlot(Value::OfBoolean(true), location), run_->freeSlot);
             EmitYield();
             emit_.Bind(site.direct);
+            ForgetAll();
             if (root->reentry == Reentry::Restart) emit_.Copy(TruthySlot(Value::OfBoolean(false), location), run_->freeSlot);
             std::vector<Value> out;
             for (size_t i = 0; i < std::min(want, site.results.size()); ++i) out.push_back(Value::OfSlot(site.results[i].slot, site.results[i].type));
@@ -2359,6 +2403,7 @@ namespace UdonLuau {
                 emit_.Bind(resume);
                 entries_.push_back({ entry, *emit_.AddressOf(resume) });
                 emit_.Push(haltSlot_);
+                ForgetAll();
                 emit_.Copy(emit_.Constant(types_.Behaviour(), HeapValue{ ValueKind::Null }), registeredWith);
                 emit_.JumpIfFalse(waiting, stale);
                 emit_.Copy(no, waiting);
@@ -2869,15 +2914,40 @@ namespace UdonLuau {
                 else if (stat->elsebody) CompileStatementGuarded(stat->elsebody);
                 return;
             }
-            if (TryJumpTable(stat)) return;
+            if (auto known = KnownCondition(stat->condition)) {
+                if (*known) CompileBlock(stat->thenbody);
+                else if (stat->elsebody) CompileStatementGuarded(stat->elsebody);
+                return;
+            }
+            if (TryJumpTable(stat)) {
+                ForgetAll();
+                return;
+            }
+            if (!stat->elsebody && stat->thenbody->body.size == 1)
+                if (std::optional<Label> exit = ExitLabel(stat->thenbody->body.data[0])) {
+                    CompileCondition(stat->condition, *exit, true);
+                    if (!inlineStack_.empty() && stat->thenbody->body.data[0]->is<AstStatReturn>()) inlineStack_.back().exits.push_back(emit_.KnownFacts());
+                    Imply(stat->condition, false);
+                    return;
+                }
             Label otherwise = emit_.NewLabel();
             Label end = emit_.NewLabel();
             CompileCondition(stat->condition, otherwise);
+            Emitter::Facts tested = emit_.KnownFacts();
+            Imply(stat->condition, true);
             CompileBlock(stat->thenbody);
+            Emitter::Facts whenTrue = emit_.KnownFacts();
             if (stat->elsebody) emit_.Jump(end);
             emit_.Bind(otherwise);
+            emit_.SetFacts(tested);
+            Imply(stat->condition, false);
             if (stat->elsebody) CompileStatementGuarded(stat->elsebody);
             emit_.Bind(end);
+            bool thenExits = Exits(stat->thenbody);
+            bool elseExits = Exits(stat->elsebody);
+            if (thenExits && !elseExits) return;
+            if (elseExits && !thenExits) emit_.SetFacts(std::move(whenTrue));
+            else emit_.SetFacts(Intersect(whenTrue, emit_.KnownFacts()));
         }
 
         void Compiler::CompileLoopBody(AstStatBlock* body, LoopLabels labels) {
@@ -2887,6 +2957,7 @@ namespace UdonLuau {
         }
 
         void Compiler::CompileWhile(AstStatWhile* stat) {
+            LoopFactScope facts(*this, stat);
             Label top = emit_.NewLabel();
             Label test = emit_.NewLabel();
             Label end = emit_.NewLabel();
@@ -3094,6 +3165,7 @@ namespace UdonLuau {
         }
 
         void Compiler::CompileRepeat(AstStatRepeat* stat) {
+            LoopFactScope facts(*this, stat);
             Label top = emit_.NewLabel();
             Label next = emit_.NewLabel();
             Label end = emit_.NewLabel();
@@ -3105,6 +3177,7 @@ namespace UdonLuau {
         }
 
         void Compiler::CompileFor(AstStatFor* stat) {
+            LoopFactScope facts(*this, stat);
             Value from = CompileExpr(stat->from);
             Value to = CompileExpr(stat->to);
             Value step = stat->step ? CompileExpr(stat->step) : Value::OfInteger(1);
@@ -3173,6 +3246,7 @@ namespace UdonLuau {
         void Compiler::CompileForIn(AstStatForIn* stat) {
             if (stat->values.size != 1 || stat->vars.size < 1 || stat->vars.size > 2)
                 Fail(stat->location, "use 'for i, value in array do'");
+            LoopFactScope facts(*this, stat);
             AstExpr* source = Unwrap(stat->values.data[0]);
             if (auto* call = source->as<AstExprCall>())
                 if (auto* g = Unwrap(call->func)->as<AstExprGlobal>(); g && (g->name == "ipairs" || g->name == "pairs"))
@@ -3257,7 +3331,10 @@ namespace UdonLuau {
             }
 
             if (frame) {
-                if (stat != frame->tail) emit_.Jump(frame->end);
+                if (stat != frame->tail) {
+                    inlineStack_.back().exits.push_back(emit_.KnownFacts());
+                    emit_.Jump(frame->end);
+                }
                 return;
             }
             if (stat == tail_) return;
@@ -3723,20 +3800,47 @@ namespace UdonLuau {
 
         void Compiler::CompileCondition(AstExpr* expr, Label whenFalse, bool negate) {
             expr = Unwrap(expr);
+            struct Merge {
+                Emitter&       emit;
+                Emitter::Facts entry;
+                ~Merge() { emit.SetFacts(Intersect(entry, emit.KnownFacts())); }
+            } merge{ emit_, emit_.KnownFacts() };
+            if (auto known = KnownCondition(expr)) {
+                if (*known == negate) emit_.Jump(whenFalse);
+                return;
+            }
             if (auto* b = expr->as<AstExprBinary>()) {
                 bool isAnd = b->op == AstExprBinary::And;
                 bool isOr = b->op == AstExprBinary::Or;
+                bool emptyWhenTrue = false;
+                if (AstExpr* subject = NullOrEmptySubject(b, emptyWhenTrue)) {
+                    Value empty = CallStatic(types_.String, "IsNullOrEmpty", { CompileExpr(subject) }, nullptr, b->location).at(0);
+                    uint32_t slot = TruthySlot(empty, b->location);
+                    if (emptyWhenTrue != negate) {
+                        emit_.JumpIfFalse(slot, whenFalse);
+                    } else {
+                        Label skip = emit_.NewLabel();
+                        emit_.JumpIfFalse(slot, skip);
+                        emit_.Jump(whenFalse);
+                        emit_.Bind(skip);
+                    }
+                    return;
+                }
                 if ((isAnd && !negate) || (isOr && negate)) {
                     CompileCondition(b->left, whenFalse, negate);
+                    Imply(b->left, !negate);
                     CompileCondition(b->right, whenFalse, negate);
                     return;
                 }
                 if ((isOr && !negate) || (isAnd && negate)) {
+                    Emitter::Facts before = emit_.KnownFacts();
                     Label right = emit_.NewLabel();
                     Label pass = emit_.NewLabel();
                     CompileCondition(b->left, right, negate);
                     emit_.Jump(pass);
                     emit_.Bind(right);
+                    emit_.SetFacts(Intersect(before, emit_.KnownFacts()));
+                    Imply(b->left, negate);
                     CompileCondition(b->right, whenFalse, negate);
                     emit_.Bind(pass);
                     return;
@@ -3804,6 +3908,191 @@ namespace UdonLuau {
                     }
                     Fail(location, std::format("{} cannot be used as a condition", Describe(value)));
             }
+        }
+
+        int Compiler::TruthLevel(const Type* type) {
+            const Type* object = types_.FindByFullName("UnityEngine.Object");
+            return object && types_.ReferenceDistance(type, object) >= 0 ? kKnownValid : kKnownNonNull;
+        }
+
+        std::optional<Variable> Compiler::FactVariable(AstExpr* expr) const {
+            auto* local = Unwrap(expr)->as<AstExprLocal>();
+            if (!local) return std::nullopt;
+            std::optional<Variable> found;
+            if (auto it = variables_.find(local->local); it != variables_.end()) found = it->second;
+            else if (auto alias = aliases_.find(local->local); alias != aliases_.end() && alias->second.kind == Value::Kind::Slot) found = Variable{ alias->second.slot, alias->second.type };
+            if (!found || !found->type || !found->type->IsReference() || found->type->IsList()) return std::nullopt;
+            return found;
+        }
+
+        bool Compiler::IsValidCall(AstExpr* expr, AstExpr*& subject) const {
+            auto* call = Unwrap(expr)->as<AstExprCall>();
+            if (!call || call->self || call->args.size != 1) return false;
+            auto* index = Unwrap(call->func)->as<AstExprIndexName>();
+            auto* owner = index ? Unwrap(index->expr)->as<AstExprGlobal>() : nullptr;
+            if (!owner || std::string_view(owner->name.value) != "Utilities" || std::string_view(index->index.value) != "IsValid" || globalFunctions_.contains("Utilities")) return false;
+            subject = call->args.data[0];
+            return true;
+        }
+
+        std::optional<bool> Compiler::KnownCondition(AstExpr* expr) const {
+            expr = Unwrap(expr);
+            if (auto* u = expr->as<AstExprUnary>(); u && u->op == AstExprUnary::Op::Not) {
+                if (auto inner = KnownCondition(u->expr)) return !*inner;
+                return std::nullopt;
+            }
+            if (auto* b = expr->as<AstExprBinary>()) {
+                if (b->op == AstExprBinary::And || b->op == AstExprBinary::Or) {
+                    std::optional<bool> left = KnownCondition(b->left);
+                    if (!left) return std::nullopt;
+                    if (*left == (b->op == AstExprBinary::Or)) return *left;
+                    return KnownCondition(b->right);
+                }
+                if (b->op == AstExprBinary::CompareEq || b->op == AstExprBinary::CompareNe) {
+                    AstExpr* other = Unwrap(b->left)->is<AstExprConstantNil>() ? b->right : Unwrap(b->right)->is<AstExprConstantNil>() ? b->left : nullptr;
+                    if (auto v = other ? FactVariable(other) : std::nullopt; v && emit_.Fact(v->slot) >= kKnownNonNull) return b->op == AstExprBinary::CompareNe;
+                }
+                return std::nullopt;
+            }
+            if (AstExpr* subject = nullptr; IsValidCall(expr, subject)) {
+                if (auto v = FactVariable(subject); v && emit_.Fact(v->slot) >= kKnownValid) return true;
+                return std::nullopt;
+            }
+            if (auto v = FactVariable(expr); v && emit_.Fact(v->slot) >= kKnownNonNull) return true;
+            return std::nullopt;
+        }
+
+        void Compiler::Imply(AstExpr* expr, bool truth) {
+            expr = Unwrap(expr);
+            if (auto* u = expr->as<AstExprUnary>(); u && u->op == AstExprUnary::Op::Not) return Imply(u->expr, !truth);
+            if (auto* b = expr->as<AstExprBinary>()) {
+                if ((b->op == AstExprBinary::And && truth) || (b->op == AstExprBinary::Or && !truth)) {
+                    Imply(b->left, truth);
+                    Imply(b->right, truth);
+                }
+                if ((b->op == AstExprBinary::CompareNe && truth) || (b->op == AstExprBinary::CompareEq && !truth)) {
+                    AstExpr* other = Unwrap(b->left)->is<AstExprConstantNil>() ? b->right : Unwrap(b->right)->is<AstExprConstantNil>() ? b->left : nullptr;
+                    if (auto v = other ? FactVariable(other) : std::nullopt) emit_.Learn(v->slot, TruthLevel(v->type));
+                }
+                return;
+            }
+            if (!truth) return;
+            if (AstExpr* subject = nullptr; IsValidCall(expr, subject)) {
+                if (auto v = FactVariable(subject)) emit_.Learn(v->slot, kKnownValid);
+                return;
+            }
+            if (auto v = FactVariable(expr)) emit_.Learn(v->slot, TruthLevel(v->type));
+        }
+
+        void Compiler::DropFieldFacts() {
+            Emitter::Facts kept = emit_.KnownFacts();
+            std::erase_if(kept, [&](const auto& fact) { return fieldSlots_.contains(fact.first); });
+            emit_.SetFacts(std::move(kept));
+        }
+
+        void Compiler::ForgetAll() {
+            emit_.SetFacts({});
+            ++resumes_;
+        }
+
+        std::optional<Label> Compiler::ExitLabel(AstStat* stat) {
+            if (stat->is<AstStatBreak>()) return loops_.empty() ? std::nullopt : std::optional<Label>(loops_.back().exit);
+            if (stat->is<AstStatContinue>()) return loops_.empty() ? std::nullopt : std::optional<Label>(loops_.back().next);
+            auto* ret = stat->as<AstStatReturn>();
+            if (!ret || ret->list.size) return std::nullopt;
+            if (!inlineStack_.empty()) return inlineStack_.back().end;
+            if (!current_) return std::nullopt;
+            if (current_->trampoline) return current_->epilogue;
+            Label halt = emit_.NewLabel();
+            emit_.BindAddress(halt, 0xFFFFFFFFu);
+            return halt;
+        }
+
+        bool Compiler::ContainsWait(AstNode* node) {
+            class WaitScan : public AstVisitor {
+            public:
+                Compiler& compiler;
+                bool found = false;
+                explicit WaitScan(Compiler& compiler) : compiler(compiler) {}
+                bool visit(AstExprCall* c) override {
+                    auto* index = Unwrap(c->func)->as<AstExprIndexName>();
+                    if (c->self && index && std::string_view(index->index.value) == "Wait") found = true;
+                    if (!c->self && index)
+                        if (auto library = compiler.LibraryName(index->expr); library && *library == "task") found = true;
+                    if (Function* f = c->self ? nullptr : compiler.Callee(CallTarget(c)); f && f->async) found = true;
+                    return !found;
+                }
+            };
+            WaitScan scan(*this);
+            node->visit(&scan);
+            return scan.found;
+        }
+
+        Emitter::Facts Compiler::LoopFacts(AstNode* body) {
+            if (ContainsWait(body)) {
+                ForgetAll();
+                return {};
+            }
+            std::unordered_set<AstLocal*> written;
+            std::unordered_set<AstLocal*> members;
+            Analysis scan(written, members, [](AstExpr*) {});
+            body->visit(&scan);
+            Emitter::Facts kept = emit_.KnownFacts();
+            for (AstLocal* local : written)
+                if (auto it = variables_.find(local); it != variables_.end()) kept.erase(it->second.slot);
+            std::erase_if(kept, [&](const auto& fact) { return fieldSlots_.contains(fact.first); });
+            emit_.SetFacts(kept);
+            return kept;
+        }
+
+        void Compiler::EndLoopFacts(const Emitter::Facts& entry, int resumesBefore) {
+            emit_.SetFacts(resumes_ == resumesBefore ? Intersect(entry, emit_.KnownFacts()) : Emitter::Facts{});
+        }
+
+        bool Compiler::MayRunScripts(const ExternInfo& ext) {
+            static const std::set<std::string_view> methods{ "SendCustomEvent", "SendCustomNetworkEvent", "SetProgramVariable", "SetActive", "set_enabled", "Instantiate",
+                "Invoke", "Select", "TeleportTo", "Respawn", "UseStation", "ExitStation", "SetOwner", "Drop", "SetAllTogglesOff", "NotifyToggleOn" };
+            static const std::set<std::string_view> selectables{ "UnityEngineUIToggle", "UnityEngineUISlider", "UnityEngineUIScrollbar", "UnityEngineUIDropdown",
+                "UnityEngineUIInputField", "TMProTMP_InputField", "TMProTMP_Dropdown", "UnityEngineUIToggleGroup" };
+            if (methods.contains(ext.method)) return true;
+            return selectables.contains(ext.module) && !ext.method.starts_with("get_");
+        }
+
+        AstExpr* Compiler::NullOrEmptySubject(AstExprBinary* b, bool& emptyWhenTrue) const {
+            if (b->op != AstExprBinary::And && b->op != AstExprBinary::Or) return nullptr;
+            bool isOr = b->op == AstExprBinary::Or;
+            auto local = [](AstExpr* e) -> AstExprLocal* { return Unwrap(e)->as<AstExprLocal>(); };
+            auto emptyString = [](AstExpr* e) { auto* s = Unwrap(e)->as<AstExprConstantString>(); return s && s->value.size == 0; };
+            auto zero = [](AstExpr* e) { auto* n = Unwrap(e)->as<AstExprConstantNumber>(); return n && n->value == 0; };
+            auto nilTest = [&](AstExpr* e) -> AstExprLocal* {
+                e = Unwrap(e);
+                if (auto* u = e->as<AstExprUnary>(); u && u->op == AstExprUnary::Op::Not) return isOr ? local(u->expr) : nullptr;
+                if (!isOr) return local(e);
+                auto* c = e->as<AstExprBinary>();
+                if (!c || c->op != AstExprBinary::CompareEq) return nullptr;
+                if (Unwrap(c->right)->is<AstExprConstantNil>()) return local(c->left);
+                if (Unwrap(c->left)->is<AstExprConstantNil>()) return local(c->right);
+                return nullptr;
+            };
+            auto emptyTest = [&](AstExpr* e) -> AstExprLocal* {
+                auto* c = Unwrap(e)->as<AstExprBinary>();
+                if (!c || c->op != (isOr ? AstExprBinary::CompareEq : AstExprBinary::CompareNe)) return nullptr;
+                if (emptyString(c->right)) return local(c->left);
+                if (emptyString(c->left)) return local(c->right);
+                auto* len = Unwrap(c->left)->as<AstExprUnary>();
+                if (len && len->op == AstExprUnary::Op::Len && zero(c->right)) return local(len->expr);
+                return nullptr;
+            };
+            for (auto [first, second] : { std::pair{ b->left, b->right }, std::pair{ b->right, b->left } }) {
+                AstExprLocal* nil = nilTest(first);
+                AstExprLocal* empty = nil ? emptyTest(second) : nullptr;
+                if (!empty || nil->local != empty->local) continue;
+                auto it = variables_.find(nil->local);
+                if (it == variables_.end() || it->second.type != types_.String) return nullptr;
+                emptyWhenTrue = isOr;
+                return nil;
+            }
+            return nullptr;
         }
 
         uint32_t Compiler::NotSlot(uint32_t slot, const Location& location) {
@@ -5186,6 +5475,7 @@ namespace UdonLuau {
                 throw;
             }
             emit_.Bind(inlineStack_.back().end);
+            for (const Emitter::Facts& exit : inlineStack_.back().exits) emit_.SetFacts(Intersect(exit, emit_.KnownFacts()));
             std::vector<Variable> results = std::move(inlineStack_.back().results);
             inlineStack_.pop_back();
             loops_ = std::move(savedLoops);
@@ -5222,6 +5512,7 @@ namespace UdonLuau {
                     CallStatic(types_.Get("UnityEngineDebug"), "LogWarning", { Value::OfString(std::format("[UdonLuau] line {}: '{}' is still waiting for another caller; this call was skipped", location.begin.line + 1, f->name)) }, nullptr, location);
                 for (const Value& r : results) emit_.Copy(emit_.Constant(r.type, HeapValue{ r.type->IsValueType() ? ValueKind::Default : ValueKind::Null }), r.slot);
                 emit_.Bind(done);
+                ForgetAll();
                 return results;
             }
             if (f->inlined || (f->calls == 0 && !f->exported)) return Inline(f, std::move(args), want, location, into);
@@ -5238,6 +5529,7 @@ namespace UdonLuau {
             emit_.Push(emit_.AddressConstant(back));
             emit_.Jump(f->entry);
             emit_.Bind(back);
+            if (!pure_.contains(f)) DropFieldFacts();
             EmitAliveCheck();
 
             std::vector<Value> results;
@@ -5552,6 +5844,12 @@ namespace UdonLuau {
 
             for (uint32_t s : pushes) emit_.Push(s);
             emit_.Extern(externSlot, returnType != nullptr, refResults.empty() && HasNoSideEffects(*m.ext, receiver.has_value()));
+            bool runsScripts = MayRunScripts(*m.ext);
+            if (runsScripts) DropFieldFacts();
+            static const std::set<std::string_view> toleratesDestroyed{ "GetInstanceID", "GetHashCode", "Equals", "ToString", "GetType" };
+            if (receiver && receiver->kind == Value::Kind::Slot && receiver->type && receiver->type->IsReference() && !toleratesDestroyed.contains(m.ext->method) &&
+                !(runsScripts && fieldSlots_.contains(receiver->slot)))
+                emit_.Learn(receiver->slot, TruthLevel(receiver->type));
             if (stable) emit_.RememberRead(externSlot, pushes.front(), results.front().slot);
             if (!returnType) results.push_back(Value::OfNil());
             for (Value& v : refResults) results.push_back(std::move(v));
