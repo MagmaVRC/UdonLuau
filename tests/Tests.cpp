@@ -30,7 +30,8 @@ namespace {
     using IntArray = std::shared_ptr<std::vector<int32_t>>;
     using RefArray = std::shared_ptr<std::vector<BehaviourRef>>;
     using StrArray = std::shared_ptr<std::vector<std::string>>;
-    using Cell = std::variant<std::monostate, bool, int32_t, uint32_t, int64_t, float, double, std::string, Vec3, IntArray, std::vector<uint32_t>, BehaviourRef, RefArray, StrArray>;
+    using FloatArray = std::shared_ptr<std::vector<float>>;
+    using Cell = std::variant<std::monostate, bool, int32_t, uint32_t, int64_t, float, double, std::string, Vec3, IntArray, std::vector<uint32_t>, BehaviourRef, RefArray, StrArray, FloatArray>;
     using Impl = std::function<void(std::vector<Cell>&, const std::vector<uint32_t>&)>;
 
     int32_t g_frame = 100;
@@ -191,6 +192,7 @@ namespace {
             };
             if (std::holds_alternative<RefArray>(h[p[0]])) move(*As<RefArray>(h, p[0]), *As<RefArray>(h, p[2]));
             else if (std::holds_alternative<StrArray>(h[p[0]])) move(*As<StrArray>(h, p[0]), *As<StrArray>(h, p[2]));
+            else if (std::holds_alternative<FloatArray>(h[p[0]])) move(*As<FloatArray>(h, p[0]), *As<FloatArray>(h, p[2]));
             else move(*As<IntArray>(h, p[0]), *As<IntArray>(h, p[2]));
         });
         f.Extern("SystemArray.__IndexOf__SystemArray_SystemObject__SystemInt32", false, [](auto& h, auto& p) {
@@ -218,6 +220,11 @@ namespace {
             As<RefArray>(h, p[0])->at(static_cast<size_t>(As<int32_t>(h, p[1]))) = value;
         });
         f.Extern("UnityEngineComponentArray.__get_Length__SystemInt32", true, [](auto& h, auto& p) { h[p[1]] = static_cast<int32_t>(As<RefArray>(h, p[0])->size()); });
+        f.Extern("SystemSingleArray.__ctor__SystemInt32__SystemSingleArray", false, [](auto& h, auto& p) { h[p[1]] = std::make_shared<std::vector<float>>(static_cast<size_t>(As<int32_t>(h, p[0]))); });
+        f.Extern("SystemSingleArray.__Set__SystemInt32_SystemSingle__SystemVoid", true, [](auto& h, auto& p) {
+            As<FloatArray>(h, p[0])->at(static_cast<size_t>(As<int32_t>(h, p[1]))) = As<float>(h, p[2]);
+        });
+        f.Extern("SystemSingleArray.__get_Length__SystemInt32", true, [](auto& h, auto& p) { h[p[1]] = static_cast<int32_t>(As<FloatArray>(h, p[0])->size()); });
         f.Extern("SystemStringArray.__ctor__SystemInt32__SystemStringArray", false, [](auto& h, auto& p) { h[p[1]] = std::make_shared<std::vector<std::string>>(static_cast<size_t>(As<int32_t>(h, p[0]))); });
         f.Extern("SystemStringArray.__Get__SystemInt32__SystemString", true, [](auto& h, auto& p) { h[p[2]] = As<StrArray>(h, p[0])->at(static_cast<size_t>(As<int32_t>(h, p[1]))); });
         f.Extern("SystemStringArray.__Set__SystemInt32_SystemString__SystemVoid", true, [](auto& h, auto& p) {
@@ -2089,6 +2096,31 @@ end
         size_t inequality = count(*checks, "; SystemString.__op_Inequality");
         Check(inequality == 5, std::format("only checks that can change run: one per function, one after an event, one in the loop ({})", inequality));
         if (inequality != 5) std::printf("%s\n", listing.c_str());
+    });
+
+    Case("porting fixes", [] {
+        Fixture f = MakeFixture();
+        auto p = Build(f, R"(
+local empty: {int} = {}
+local primes: {int} = {2, 3, 5}
+export local total: number = 0
+export local count = 0
+export function Run(flag: boolean, scale: number)
+    local fills: {number} = table.create(3, 0)
+    total = if flag then 0 else scale
+    count = #empty + #primes + #fills + primes[2]
+end
+)");
+        Check(p.has_value(), "empty and constant array fields, table.create with the declared type, and if-expressions with a literal first branch compile");
+        if (!p) return;
+        Machine m(f, *p);
+        m.Var("__0_flag__param") = false;
+        m.Var("__0_scale__param") = 2.5f;
+        m.Run("__0__Run");
+        Check(std::get<float>(m.Var("total")) == 2.5f && std::get<int32_t>(m.Var("count")) == 11, std::format("values are right ({}, {})", std::get<float>(m.Var("total")), std::get<int32_t>(m.Var("count"))));
+        m.Var("__0_flag__param") = true;
+        m.Run("__0__Run");
+        Check(std::get<float>(m.Var("total")) == 0.0f, "the literal branch is converted");
     });
 
     Case("UdonSharp-compatible export layout", [] {

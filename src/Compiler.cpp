@@ -926,6 +926,7 @@ namespace UdonLuau {
             int                                            waitSites_ = 0;
             int                                            fireDepth_ = 0;
             int                                            resumes_ = 0;
+            const Type*                                    expectedCall_ = nullptr;
             std::deque<ListenSite>                         listenSites_;
             std::unordered_map<AstLocal*, SignalInfo>      signals_;
             std::vector<AstLocal*>                         signalOrder_;
@@ -1661,7 +1662,16 @@ namespace UdonLuau {
                     continue;
                 }
                 HeapValue initial;
-                if (i < stat->values.size) {
+                auto* table = i < stat->values.size ? Unwrap(stat->values.data[i])->as<AstExprTable>() : nullptr;
+                if (table && type && type->kind == TypeKind::Array && !stat->isConst) {
+                    initial.kind = ValueKind::Array;
+                    initial.text = type->udonName.ends_with("Array") ? type->udonName.substr(0, type->udonName.size() - 5) : type->element->udonName;
+                    for (const AstExprTable::Item& item : table->items) {
+                        std::optional<Value> v = item.kind == AstExprTable::Item::Kind::List ? TryConstant(item.value) : std::nullopt;
+                        if (!v || !v->IsLiteral()) Fail(item.value->location, "array field initializers must be constants; fill other values in Start");
+                        initial.arguments.push_back(Literal(*v, type->element, item.value->location));
+                    }
+                } else if (i < stat->values.size) {
                     AstExpr* init = stat->values.data[i];
                     Value v = CompileExpr(init, type);
                     if (!type && (v.kind == Value::Kind::TypeRef || v.kind == Value::Kind::Namespace)) {
@@ -3371,7 +3381,16 @@ namespace UdonLuau {
             if (auto* e = expr->as<AstExprIndexExpr>()) return CompileIndexExpr(e);
             if (auto* e = expr->as<AstExprCall>()) {
                 if (auto network = TryNetworkTarget(e)) return *network;
-                std::vector<Value> results = CompileCall(e, 1, into);
+                const Type* outer = expectedCall_;
+                expectedCall_ = expected;
+                std::vector<Value> results;
+                try {
+                    results = CompileCall(e, 1, into);
+                } catch (...) {
+                    expectedCall_ = outer;
+                    throw;
+                }
+                expectedCall_ = outer;
                 if (results.empty() || results[0].kind == Value::Kind::Nil) Fail(e->location, "this call does not return a value");
                 return results[0];
             }
@@ -3751,8 +3770,23 @@ namespace UdonLuau {
             if (auto c = TryConstant(expr->condition)) return CompileExpr(IsTruthy(*c) ? expr->trueExpr : expr->falseExpr, expected, into);
             Label otherwise = emit_.NewLabel();
             Label end = emit_.NewLabel();
-            CompileCondition(expr->condition, otherwise);
             const Type* hint = expected ? expected : into ? into->type : nullptr;
+            if (std::optional<Value> literal = hint ? std::nullopt : TryConstant(expr->trueExpr); literal && literal->IsNumberLiteral()) {
+                CompileCondition(expr->condition, otherwise, true);
+                Value b = CompileExpr(expr->falseExpr, nullptr, into);
+                const Type* other = NaturalType(b);
+                const Type* own = NaturalType(*literal);
+                const Type* type = other && Cost(*literal, other) >= 0 ? other : own && Cost(b, own) >= 0 ? own : nullptr;
+                if (!type) Fail(expr->location, std::format("the branches of this if-expression are {} and {}", Describe(*literal), Describe(b)));
+                Variable result = into && into->type == type ? *into : Variable{ emit_.Temp(type), type };
+                Store(b, result, expr->falseExpr->location);
+                emit_.Jump(end);
+                emit_.Bind(otherwise);
+                Store(CoerceLiteral(*literal, type, expr->trueExpr->location), result, expr->trueExpr->location);
+                emit_.Bind(end);
+                return Value::OfSlot(result.slot, type);
+            }
+            CompileCondition(expr->condition, otherwise);
             Value a = CompileExpr(expr->trueExpr, hint, into);
             const Type* type = hint ? hint : NaturalType(a);
             if (!type) Fail(expr->trueExpr->location, "cannot infer the type of this if-expression; add a type assertion");
@@ -5074,6 +5108,7 @@ namespace UdonLuau {
                 const Type* arrayType = nullptr;
                 if (typeArg) arrayType = typeArg->kind == TypeKind::Array ? typeArg : types_.ArrayOf(typeArg);
                 else if (into && into->type && into->type->kind == TypeKind::Array) arrayType = into->type;
+                else if (expectedCall_ && expectedCall_->kind == TypeKind::Array) arrayType = expectedCall_;
                 else if (args.size() == 2 && NaturalType(args[1])) arrayType = types_.ArrayOf(NaturalType(args[1]));
                 if (!arrayType) Fail(location, "table.create needs the element type: annotate the variable ('local xs: {int} = table.create(8)') or pass a value");
                 Value count = hold(args[0], types_.Int32);
